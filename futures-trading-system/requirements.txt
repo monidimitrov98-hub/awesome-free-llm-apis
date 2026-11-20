@@ -1,0 +1,6 @@
+# Sprint 1 runtime + test dependencies.
+# plotly, streamlit, scikit-learn (and SQLite usage) arrive in later sprints.
+pandas>=2.2,<4
+numpy>=1.26
+tzdata>=2024.1   # IANA timezone database; required on Windows
+pytest>=8.0

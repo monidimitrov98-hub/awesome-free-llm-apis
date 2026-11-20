@@ -1,0 +1,110 @@
+# Futures research system configuration (Sprint 1: market data engine).
+# All tunable values live here; the source code contains no hard-coded settings.
+# Copy this file (e.g. to config/settings.local.toml) and pass it with --config
+# to adapt it to your own data vendor without editing the defaults.
+
+[data]
+# Timezone of NAIVE timestamps in the CSV (timestamps that carry an explicit
+# offset such as "+00:00" or "Z" are converted directly and ignore this value).
+# Common choices: "America/New_York", "America/Chicago", "UTC".
+source_timezone = "America/New_York"
+
+# Optional strptime format for the timestamp column, e.g. "%Y%m%d %H%M%S".
+# Leave empty to let pandas infer it.
+timestamp_format = ""
+
+# Set to "s", "ms", "us" or "ns" when timestamps are integer epoch values (UTC).
+# Leave empty for text timestamps.
+timestamp_unit = ""
+
+# How to treat naive local times that are ambiguous (DST fall-back hour) or
+# nonexistent (DST spring-forward hour):
+#   ambiguous_time:   "raise" | "infer" | "NaT"
+#   nonexistent_time: "raise" | "NaT"
+# "NaT" marks the row as unparseable; it is reported and never fabricated.
+ambiguous_time = "raise"
+nonexistent_time = "raise"
+
+# Does the CSV timestamp mark the bar OPEN or the bar CLOSE?
+# Internally every bar is stamped at its open. With "close" (e.g. NinjaTrader
+# exports) one base_frequency is subtracted from each timestamp on load.
+timestamp_label = "open"
+
+# Frequency of the bars in the source file (pandas offset alias).
+base_frequency = "1min"
+
+delimiter = ","
+# Lines starting with this character are ignored (used to mark synthetic data).
+comment_char = "#"
+
+# Name of the column holding the contract symbol, or "" if the file has none.
+symbol_column = "symbol"
+# If the file contains several contracts (e.g. around a roll), keep only this one.
+symbol_filter = ""
+# Used only when neither the symbol column nor the file name identifies the contract.
+default_symbol = ""
+
+# What to do when validation finds errors (NaNs, broken OHLC, duplicates...):
+#   "raise" -> stop and show the report (safest, default)
+#   "drop"  -> remove the offending rows and record them in the report
+on_error = "raise"
+
+# Remove bars that fall outside the active session before resampling.
+drop_outside_session = true
+
+# Map canonical column names -> column names in YOUR csv file (case-insensitive).
+[data.columns]
+timestamp = "timestamp"
+open = "open"
+high = "high"
+low = "low"
+close = "close"
+volume = "volume"
+
+# Contract specifications. Only roots listed here are recognised.
+[contracts.MES]
+description = "Micro E-mini S&P 500"
+tick_size = 0.25
+point_value = 5.0
+listed_months = "HMUZ"
+
+[contracts.MNQ]
+description = "Micro E-mini Nasdaq-100"
+tick_size = 0.25
+point_value = 2.0
+listed_months = "HMUZ"
+
+# Trading sessions. Times are local to the session timezone; the end is exclusive.
+# A session whose start >= end crosses midnight; its session date is the
+# calendar date on which it ends (the CME "trade date").
+[session]
+active = "globex"
+
+[sessions.globex]
+start = "18:00"
+end = "17:00"
+timezone = "America/New_York"
+
+[sessions.rth]
+start = "09:30"
+end = "16:00"
+timezone = "America/New_York"
+
+[resample]
+# Timeframes produced by the pipeline (pandas offset aliases, multiples of base_frequency).
+timeframes = ["1min", "5min", "15min"]
+
+[indicators]
+ema_fast = 9
+ema_slow = 21
+rsi_period = 14
+atr_period = 14
+# VWAP price source per bar: "typical" = (high + low + close) / 3, or "close".
+vwap_price = "typical"
+
+[indicators.relative_volume]
+# "time_of_day": volume / mean volume of the same bar time over previous sessions.
+# "rolling":     volume / mean volume of the previous `lookback` bars.
+method = "time_of_day"
+lookback = 20
+min_periods = 5
