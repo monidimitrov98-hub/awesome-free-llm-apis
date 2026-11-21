@@ -46,6 +46,16 @@ class Reliability(StrEnum):
     SYNTHETIC = "synthetic"
 
 
+class Provenance(StrEnum):
+    """Where a record came from. Never present manual or synthetic data as verified live data."""
+
+    VERIFIED_LIVE = "verified_live"      # fetched from a live provider verified against its real endpoint
+    UNVERIFIED_LIVE = "unverified_live"  # fetched from a live provider that was not verified (should not happen)
+    MANUAL = "manual"                    # curated by hand (json_file provider)
+    SYNTHETIC = "synthetic"              # invented test data
+    UNKNOWN = "unknown"                  # historical record without provenance (treated as untrusted for operations)
+
+
 RELIABILITY_RANK = {Reliability.OFFICIAL: 3, Reliability.LICENSED: 2, Reliability.UNOFFICIAL: 1,
                     Reliability.SYNTHETIC: 0}
 NY = "America/New_York"
@@ -121,6 +131,7 @@ class EventRecord:
     previous: str | None = None
     forecast: str | None = None
     actual: str | None = None
+    provenance: Provenance = Provenance.UNKNOWN
 
     @property
     def time_known(self) -> bool:
@@ -137,24 +148,31 @@ class EventRecord:
         for k in ("scheduled_at", "known_at", "updated_at"):
             d[k] = None if d[k] is None else d[k].isoformat()
         d["event_date"] = None if self.event_date is None else self.event_date.isoformat()
-        for k in ("status", "impact", "reliability"):
+        for k in ("status", "impact", "reliability", "provenance"):
             d[k] = str(d[k])
         return d
 
 
 def canonical_id(category: str, event_date: date | None, name: str) -> str:
-    base = category if category != "unclassified" else re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:60]
+    """Same event from different sources -> same id. Unclassified names drop the reference period
+    ("..., November 2024", "(Advance Estimate)") so BEA and Census listings of a joint release match."""
+    if category == "unclassified":
+        core = re.sub(r"\(.*?\)", " ", name.lower())
+        core = re.split(r",| for | -- ", core)[0]
+        base = re.sub(r"[^a-z0-9]+", "_", core).strip("_")[:60]
+    else:
+        base = category
     return f"{base}:{event_date.isoformat() if event_date else 'undated'}"
 
 
 def parse_record(raw: Mapping[str, Any], *, source: str, reliability: Reliability, known_at: pd.Timestamp,
-                 classify, default_region: str = "US") -> EventRecord:
+                 classify, default_region: str = "US", provenance: Provenance | None = None) -> EventRecord:
     """Validate one untrusted event dict and normalise it. ``classify(name, region, category)``
     returns ``(category, impact)``. Raises :class:`EventDataError`."""
     if not isinstance(raw, Mapping):
         raise EventDataError("event must be an object")
     allowed = {"event_id", "name", "category", "region", "currency", "scheduled_at", "date", "timezone", "status",
-               "impact", "source_event_id", "known_at", "updated_at", "previous", "forecast", "actual"}
+               "impact", "source_event_id", "known_at", "updated_at", "previous", "forecast", "actual", "provenance"}
     extra = set(raw) - allowed
     if extra:
         raise EventDataError(f"unknown event fields {sorted(extra)}")
@@ -186,6 +204,13 @@ def parse_record(raw: Mapping[str, Any], *, source: str, reliability: Reliabilit
     category, impact = classify(name, region, clean_text(raw.get("category"), "category"),
                                 clean_text(raw.get("impact"), "impact"))
     sid = clean_text(raw.get("source_event_id"), "source_event_id") or ""
+    if provenance is None:
+        try:
+            provenance = Provenance(raw.get("provenance") or "unknown")
+        except ValueError as exc:
+            raise EventDataError(f"unknown provenance {raw.get('provenance')!r}") from exc
+    if reliability is Reliability.SYNTHETIC:
+        provenance = Provenance.SYNTHETIC  # synthetic data can never be labelled anything else
     eid = clean_text(raw.get("event_id"), "event_id")
     if eid is not None and not _ID.match(eid):
         raise EventDataError(f"invalid event_id {eid!r}")
@@ -196,7 +221,7 @@ def parse_record(raw: Mapping[str, Any], *, source: str, reliability: Reliabilit
         updated_at=parse_time(raw["updated_at"], "updated_at") if raw.get("updated_at") else None,
         previous=clean_text(raw.get("previous"), "previous", limit=40),
         forecast=clean_text(raw.get("forecast"), "forecast", limit=40),
-        actual=clean_text(raw.get("actual"), "actual", limit=40))
+        actual=clean_text(raw.get("actual"), "actual", limit=40), provenance=provenance)
     if rec.actual is not None and (rec.scheduled_at is None or rec.known_at < rec.scheduled_at):
         raise EventDataError(f"{name}: an actual value cannot be known before the release time")
     return rec

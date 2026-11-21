@@ -101,6 +101,9 @@ def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPu
         gate = RegimeGatedStrategy(strategy, RegimeEngine(regime, md.contract.root), regime, explainer)
     engine = BacktestEngine(bt, md.contract.spec, app.session)
     news_guard = news.guard(md.contract.root) if news is not None else None
+    if news_guard is not None and news_guard.store.is_synthetic and not md.is_synthetic:
+        raise ConfigError("a SYNTHETIC news calendar cannot be used with real market data: its events are invented "
+                          "and would be mistaken for real event protection")
     result = engine.run(gate or strategy, signal, execution, context_bars=context, news_guard=news_guard)
     news_out = None
     if news_guard is not None:

@@ -129,7 +129,8 @@ def test_model_identity_covers_everything():
     assert instrument_key("MES", True) == "MES:synthetic" and instrument_key("MES", False) == "MES"
 
 
-def test_ml_fit_is_reproducible_and_tamper_evident(tmp_path):
+def test_ml_fit_is_reproducible_and_tamper_evident(tmp_path, monkeypatch):
+    monkeypatch.setenv("FTS_MODEL_SIGNING_KEY", "k" * 40)
     ds, *_ = dataset()
     tr = ds[ds["label"].notna() & ds["rf_valid"]]
     x, y = ml.feature_matrix(tr), tr["label"].to_numpy(float)
@@ -148,7 +149,7 @@ def test_ml_fit_is_reproducible_and_tamper_evident(tmp_path):
     doc = json.loads((tmp_path / "m.json").read_text())
     doc["features"] = doc["features"][:-1]
     (tmp_path / "m.json").write_text(json.dumps(doc))
-    with pytest.raises(ConfigError, match="feature list"):
+    with pytest.raises(ConfigError, match="signature"):  # identity edits break the HMAC first
         ml.load_model(tmp_path / "m.pkl")
 
 

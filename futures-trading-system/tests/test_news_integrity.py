@@ -36,7 +36,13 @@ def test_reveal_replay_and_calendar_change_with_news_filter(tmp_path):
 def _cfg(tmp_path, manual_path):
     text = DEFAULT_NEWS_CONFIG_PATH.read_text().replace('path = "data/news/manual_calendar.json"',
                                                          f'path = "{manual_path.as_posix()}"')
-    text = text.replace("expected = false                          # true", "expected = true                          # true")
+    # no network in unit tests: live providers off; the manual file alone must cover the required categories
+    text = text.replace('type = "ics"\nenabled = true', 'type = "ics"\nenabled = false')
+    text = text.replace('type = "census_html"\nenabled = true', 'type = "census_html"\nenabled = false')
+    text = text.replace('type = "fomc_html"\nenabled = true', 'type = "fomc_html"\nenabled = false')
+    text = text.replace('required_categories = ["cpi", "nfp", "pce", "gdp", "ppi", "retail_sales", "jobless_claims", '
+                        '"fomc_decision"]', 'required_categories = ["cpi", "nfp"]')
+    assert text.count("enabled = true") == 2  # [news] and the manual provider only
     p = tmp_path / "news.toml"
     p.write_text(text, encoding="utf-8")
     return p

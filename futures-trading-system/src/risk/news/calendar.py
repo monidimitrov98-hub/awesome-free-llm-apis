@@ -71,6 +71,8 @@ class CalendarStore:
         self.refreshes: list[RefreshRecord] = []
         self.expected_providers = set(expected_providers)
         self.priorities: dict[str, int] = {}
+        self.provider_coverage: dict[str, list[str]] = {}   # provider -> event categories it is trusted to cover
+        self.provider_class: dict[str, str] = {}            # provider -> verified_live | manual | synthetic | ...
         self.synthetic = synthetic
         self.note = note
         self.rejected: list[dict[str, Any]] = []
@@ -112,8 +114,9 @@ class CalendarStore:
         out = []
         for eid, recs in by_event.items():
             top = max(RELIABILITY_RANK[r.reliability] for r in recs)
+            # timed versions first: a timed official record REFINES a date-only one of the same day
             best = sorted((r for r in recs if RELIABILITY_RANK[r.reliability] == top),
-                          key=lambda r: (self.priorities.get(r.source, 99), r.source))
+                          key=lambda r: (r.scheduled_at is None, self.priorities.get(r.source, 99), r.source))
             conflicts = []
             for r in recs:
                 if RELIABILITY_RANK[r.reliability] < top and _differs(r, best[0]):
@@ -131,11 +134,20 @@ class CalendarStore:
             out.append(MergedEvent(eid, chosen, recs, conflicts))
         return out
 
+    def data_classes(self) -> dict[str, int]:
+        """Number of event versions per provenance (verified_live / manual / synthetic / unknown)."""
+        return _data_class(self)
+
+    @property
+    def is_synthetic(self) -> bool:
+        return self.synthetic or any(r.provenance.value == "synthetic" for r in self.records)
+
     # ------------------------------------------------------------------ persistence
     def to_json(self) -> str:
         return json.dumps({"schema": SCHEMA, "synthetic": self.synthetic, "note": self.note,
                            "expected_providers": sorted(self.expected_providers),
-                           "provider_priority": self.priorities,
+                           "provider_priority": self.priorities, "provider_coverage": self.provider_coverage,
+                           "provider_class": self.provider_class,
                            "refreshes": [r.to_dict() for r in self.refreshes],
                            "events": [dict(r.to_dict(), source=r.source) for r in self.records]}, indent=1)
 
@@ -167,6 +179,8 @@ class CalendarStore:
         store = cls(expected_providers=doc.get("expected_providers", []), synthetic=bool(doc.get("synthetic")),
                     note=str(doc.get("note", ""))[:500])
         store.priorities = {str(k): int(v) for k, v in (doc.get("provider_priority") or {}).items()}
+        store.provider_coverage = {str(k): [str(c) for c in v] for k, v in (doc.get("provider_coverage") or {}).items()}
+        store.provider_class = {str(k): str(v) for k, v in (doc.get("provider_class") or {}).items()}
         try:
             for r in doc.get("refreshes", []):
                 store.log_refresh(RefreshRecord(
@@ -178,6 +192,8 @@ class CalendarStore:
                 e = dict(e)
                 source = str(e.pop("source", ""))
                 rel = Reliability(e.pop("reliability", "unofficial"))
+                if store.synthetic and rel is not Reliability.SYNTHETIC:
+                    raise ValueError("a calendar marked synthetic may only contain synthetic events")
                 known = parse_time(e.get("known_at"), f"event #{i + 1} known_at")
                 if "event_date" in e:
                     e["date"] = e.pop("event_date")
@@ -205,12 +221,25 @@ class CalendarStore:
         if cursor < end:
             gaps.append((cursor, end))
         return {"start": start.isoformat(), "end": end.isoformat(), "synthetic_calendar": self.synthetic,
+                "data_classes": self.data_classes(),
                 "events": len(self.records), "gaps": [[a.isoformat(), b.isoformat()] for a, b in gaps if b > a]}
 
 
+def _data_class(store: "CalendarStore") -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in store.records:
+        out[r.provenance.value] = out.get(r.provenance.value, 0) + 1
+    return out
+
+
 def _differs(a: EventRecord, b: EventRecord) -> bool:
-    return (a.scheduled_at, a.event_date, a.status is EventStatus.CANCELLED) != \
-        (b.scheduled_at, b.event_date, b.status is EventStatus.CANCELLED)
+    """Disagreement about when (or whether) an event happens. A date-only record and a timed
+    record of the SAME day agree (the timed one is more precise)."""
+    if (a.status is EventStatus.CANCELLED) != (b.status is EventStatus.CANCELLED):
+        return True
+    if a.scheduled_at is None or b.scheduled_at is None:
+        return a.event_date != b.event_date
+    return a.scheduled_at != b.scheduled_at
 
 
 def _desc(r: EventRecord) -> str:

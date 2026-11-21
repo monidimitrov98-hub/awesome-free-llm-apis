@@ -48,6 +48,11 @@ def main() -> None:
     doc = {"schema": "news-calendar/1", "synthetic": True,
            "note": "SYNTHETIC calendar for the synthetic sample data; not real release times.",
            "expected_providers": ["synthetic_fixture"], "provider_priority": {"synthetic_fixture": 1},
+           "provider_class": {"synthetic_fixture": "synthetic"},
+           "provider_coverage": {"synthetic_fixture": ["cpi", "core_cpi", "pce", "core_pce", "nfp", "unemployment_rate",
+                                                       "fomc_decision", "fomc_statement", "fed_press_conference",
+                                                       "fed_chair_speech", "ppi", "gdp", "retail_sales", "jobless_claims",
+                                                       "ism_manufacturing", "ism_services", "treasury"]},
            "refreshes": refreshes, "events": events}
     OUT.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {OUT}")

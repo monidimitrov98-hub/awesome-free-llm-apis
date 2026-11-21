@@ -25,6 +25,8 @@ def refresh(store: CalendarStore, providers: list[Provider], cfg: NewsConfig, no
             *, force: bool = False, llm_assessments: dict | None = None) -> list[dict[str, Any]]:
     store.expected_providers |= expected_providers(cfg)
     store.priorities.update({p.name: p.pc.priority for p in providers})
+    store.provider_coverage.update({p.name: list(p.pc.covers) for p in providers})
+    store.provider_class.update({p.name: p.provenance.value for p in providers})
     report = []
     for p in providers:
         if not force and not p.due(now):

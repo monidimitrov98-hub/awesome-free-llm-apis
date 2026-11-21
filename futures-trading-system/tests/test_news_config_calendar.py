@@ -30,7 +30,10 @@ def test_defaults():
     assert CFG.window("MES", "fomc_decision") == (pd.Timedelta(minutes=60),) * 2
     assert CFG.window("MNQ", "cpi") == (pd.Timedelta(minutes=30),) * 2
     assert CFG.window("MES", "ppi") == (pd.Timedelta(minutes=15),) * 2
-    assert CFG.pre_event_policy == "keep" and not any(p.enabled for p in CFG.providers.values() if p.type != "json_file")
+    assert CFG.pre_event_policy == "keep"
+    live = [p for p in CFG.providers.values() if p.live]
+    assert all(p.verified and p.verified_on and p.documentation for p in live if p.enabled)  # only verified live sources
+    assert not CFG.providers["bls"].enabled and not CFG.providers["bls"].verified
 
 
 def write(tmp_path, text):
@@ -51,8 +54,10 @@ def write(tmp_path, text):
     ('on_integrity_failure = "block_entries"', 'on_integrity_failure = "allow_entries"', "block_entries"),
     ('mode = "enforce"', 'mode = "bypass"', "mode"),
     ("recovery_successes = 1", "recovery_successes = 0", "recovery"),
-    ('reliability = "official"\npriority = 1\nexpected = false                          # true',
-     'reliability = "official"\napi_key = "abc"\npriority = 1\nexpected = false                          # true', "provider"),
+    ('reliability = "official"\npriority = 2\nexpected = true', 'reliability = "official"\napi_key = "abc"\npriority = 2\nexpected = true',
+     "provider"),
+    ('enabled = false                           # NOT verified', 'enabled = true                           # NOT verified', "verif"),
+    ('required_categories = ["cpi"', 'required_categories = ["moon_phase", "cpi"', "required_categories"),
     ('windows = []', 'windows = [{start = "yesterday", end = "2025-01-01T00:00:00Z", reason = "x"}]', "emergency"),
 ])
 def test_invalid_config_rejected(tmp_path, old, new, match):
@@ -95,7 +100,9 @@ def test_normal_event_and_dst_conversion():
     ("Personal Income and Outlays", "pce", Impact.HIGH), ("Gross Domestic Product, 4th quarter", "gdp", Impact.MEDIUM),
     ("Initial Jobless Claims", "jobless_claims", Impact.MEDIUM), ("ISM Manufacturing PMI", "ism_manufacturing", Impact.MEDIUM),
     ("ISM Services PMI", "ism_services", Impact.MEDIUM), ("Treasury Quarterly Refunding", "treasury", Impact.MEDIUM),
-    ("Wholesale Inventories", "unclassified", Impact.UNKNOWN),
+    ("Wholesale Inventories", "wholesale_trade", Impact.LOW), ("Advance Monthly Sales for Retail and Food Services",
+                                                                 "retail_sales", Impact.MEDIUM),
+    ("Index of Unfamiliar Things", "unclassified", Impact.UNKNOWN),
 ])
 def test_classification(name, cat, impact):
     r = rec(name, "2025-03-12T08:30:00")

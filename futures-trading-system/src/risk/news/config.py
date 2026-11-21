@@ -21,7 +21,8 @@ from src.risk.news.event import EventDataError, Impact, Reliability, check_timez
 
 DEFAULT_NEWS_CONFIG_PATH = PROJECT_ROOT / "config" / "risk" / "news_filter.toml"
 MODES = ("observe", "enforce")
-PROVIDER_TYPES = ("json_file", "ics", "rss")
+PROVIDER_TYPES = ("json_file", "ics", "rss", "census_html", "fomc_html")
+LIVE_TYPES = ("ics", "rss", "census_html", "fomc_html")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 _ENV = re.compile(r"^[A-Z][A-Z0-9_]{0,60}$")
 
@@ -48,7 +49,18 @@ class ProviderConfig:
     url: str = ""
     api_key_env: str = ""
     api_key_param: str = ""
+    urls: tuple[str, ...] = ()
+    verified: bool = False
+    verified_on: str = ""
+    documentation: str = ""
+    covers: tuple[str, ...] = ()
 
+    @property
+    def live(self) -> bool:
+        return self.type in LIVE_TYPES
+
+    def all_urls(self) -> tuple[str, ...]:
+        return ((self.url,) if self.url else ()) + self.urls
 
 @dataclass(frozen=True)
 class EmergencyWindow:
@@ -90,6 +102,7 @@ class NewsConfig:
     unexpected_blackout: pd.Timedelta
     unexpected_max_age: pd.Timedelta
     explain: bool
+    required_categories: tuple[str, ...] = ()
     source_path: str = ""
 
     @property
@@ -125,6 +138,7 @@ SECTIONS = {
     "events": None, "instruments": None, "emergency": {"windows"}, "providers": None,
     "unexpected": {"enabled", "provider", "keywords", "blackout_minutes", "max_item_age_minutes"},
     "diagnostics": {"explain"},
+    "coverage": {"required_categories"},
 }
 
 
@@ -254,7 +268,8 @@ def load_news_config(path: str | Path | None = None) -> NewsConfig:
 
     providers: dict[str, ProviderConfig] = {}
     for name, sec in (raw.get("providers") or {}).items():
-        keys = {"type", "enabled", "path", "url", "reliability", "priority", "expected", "api_key_env", "api_key_param"}
+        keys = {"type", "enabled", "path", "url", "urls", "reliability", "priority", "expected", "api_key_env",
+                "api_key_param", "verified", "verified_on", "documentation", "covers"}
         if not _NAME.match(name) or not isinstance(sec, dict) or set(sec) - keys:
             raise ConfigError(f"invalid provider [providers.{name}] (allowed keys {sorted(keys)})")
         if any(k.lower() in ("api_key", "key", "token", "secret", "password") for k in sec):
@@ -265,17 +280,40 @@ def load_news_config(path: str | Path | None = None) -> NewsConfig:
         except ValueError as exc:
             raise ConfigError(f"[providers.{name}] reliability: {exc}") from exc
         url, path_ = sec.get("url", ""), sec.get("path", "")
-        if ptype in ("ics", "rss") and not (isinstance(url, str) and url.startswith("https://")):
-            raise ConfigError(f"[providers.{name}] url must use https://")
+        urls = sec.get("urls", [])
+        if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
+            raise ConfigError(f"[providers.{name}] urls must be a list of strings")
+        if ptype in LIVE_TYPES:
+            if not (url or urls) or not all(isinstance(u, str) and u.startswith("https://") for u in ([url] if url else []) + urls):
+                raise ConfigError(f"[providers.{name}] every url must use https://")
+        covers = sec.get("covers", [])
+        if not isinstance(covers, list) or not all(isinstance(c, str) for c in covers):
+            raise ConfigError(f"[providers.{name}] covers must be a list of event categories")
+        verified = sec.get("verified", False)
+        if not isinstance(verified, bool):
+            raise ConfigError(f"[providers.{name}] verified must be true or false")
+        enabled = _bool(sec, "enabled", f"providers.{name}")
+        if enabled and ptype in LIVE_TYPES and not (verified and sec.get("verified_on") and sec.get("documentation")):
+            raise ConfigError(f"[providers.{name}] is a live provider: it can only be enabled after verification "
+                              "against its real endpoint (verified = true, verified_on, documentation)")
         if ptype == "json_file" and not (isinstance(path_, str) and path_):
             raise ConfigError(f"[providers.{name}] json_file needs a path")
         env = sec.get("api_key_env", "")
         if env and not _ENV.match(env):
             raise ConfigError(f"[providers.{name}] api_key_env must be an environment variable NAME")
-        providers[name] = ProviderConfig(name, ptype, _bool(sec, "enabled", f"providers.{name}"), rel,
+        providers[name] = ProviderConfig(name, ptype, enabled, rel,
                                          int(_num(sec, "priority", f"providers.{name}", minimum=1, integer=True)),
                                          _bool(sec, "expected", f"providers.{name}"), path_, url, env,
-                                         str(sec.get("api_key_param", "")))
+                                         str(sec.get("api_key_param", "")), tuple(urls), verified,
+                                         str(sec.get("verified_on", "")), str(sec.get("documentation", "")),
+                                         tuple(covers))
+    for name, pc in providers.items():
+        unknown = [c for c in pc.covers if c not in events]
+        if unknown:
+            raise ConfigError(f"[providers.{name}] covers unknown categories {unknown}")
+    required = (raw.get("coverage") or {}).get("required_categories", [])
+    if not isinstance(required, list) or any(c not in events for c in required):
+        raise ConfigError("[coverage] required_categories must list known event categories")
     unexpected = raw.get("unexpected") or {"enabled": False}
     u_enabled = _bool(unexpected, "enabled", "unexpected")
     u_provider = unexpected.get("provider", "")
@@ -307,7 +345,8 @@ def load_news_config(path: str | Path | None = None) -> NewsConfig:
         unexpected_keywords=tuple(str(k).lower() for k in unexpected.get("keywords", [])),
         unexpected_blackout=_minutes(unexpected.get("blackout_minutes", 30), "[unexpected] blackout_minutes"),
         unexpected_max_age=_minutes(unexpected.get("max_item_age_minutes", 120), "[unexpected] max_item_age_minutes"),
-        explain=bool((raw.get("diagnostics") or {}).get("explain", True)), source_path=str(p))
+        explain=bool((raw.get("diagnostics") or {}).get("explain", True)), required_categories=tuple(required),
+        source_path=str(p))
 
 
 def _validate_block(impacts: tuple[Impact, ...]) -> tuple[Impact, ...]:

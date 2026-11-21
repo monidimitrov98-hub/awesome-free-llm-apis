@@ -74,6 +74,8 @@ def main(argv=None) -> int:
         rc = load_regime_config(args.regime_config)
         sc = load_strategy_config(args.strategy_config)
         code = code_identity()
+        if args.save_model:
+            ml._signing_key()  # fail early: model artifacts are only written signed (FTS_MODEL_SIGNING_KEY)
         args.output_dir.mkdir(parents=True, exist_ok=True)
         inputs: list[tuple[Path, pd.DataFrame | None]] = []
         if args.synthetic_sessions:

@@ -11,6 +11,7 @@ States (highest priority first):
 EMERGENCY_BLACKOUT     an operator emergency window or unexpected official announcement
 PROVIDER_UNAVAILABLE   an expected provider's latest refresh failed (or it never succeeded)
 CALENDAR_STALE         last successful refresh too old, or the calendar does not cover the next lookahead
+CALENDAR_INCOMPLETE    a required event category has no healthy provider covering it
 RECOVERY_PENDING       refreshes succeed again but not yet ``recovery_successes`` in a row
 DATA_CONFLICT          equally reliable sources disagree about an event in its window
 EVENT_UNKNOWN          an event with unknown time/impact covers ``now``
@@ -43,6 +44,7 @@ class NewsState(StrEnum):
     NORMAL = "NORMAL"
     BLACKOUT_ACTIVE = "BLACKOUT_ACTIVE"
     CALENDAR_STALE = "CALENDAR_STALE"
+    CALENDAR_INCOMPLETE = "CALENDAR_INCOMPLETE"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     DATA_CONFLICT = "DATA_CONFLICT"
     EVENT_UNKNOWN = "EVENT_UNKNOWN"
@@ -52,7 +54,7 @@ class NewsState(StrEnum):
 
 
 STATE_ORDER = [NewsState.EMERGENCY_BLACKOUT, NewsState.PROVIDER_UNAVAILABLE, NewsState.CALENDAR_STALE,
-               NewsState.RECOVERY_PENDING, NewsState.DATA_CONFLICT, NewsState.EVENT_UNKNOWN,
+               NewsState.RECOVERY_PENDING, NewsState.CALENDAR_INCOMPLETE, NewsState.DATA_CONFLICT, NewsState.EVENT_UNKNOWN,
                NewsState.BLACKOUT_ACTIVE, NewsState.NORMAL]
 KIND_STATE = {"emergency": NewsState.EMERGENCY_BLACKOUT, "unexpected": NewsState.EMERGENCY_BLACKOUT,
               "conflict": NewsState.DATA_CONFLICT, "unknown_time": NewsState.EVENT_UNKNOWN,
@@ -105,57 +107,78 @@ class NewsGuard:
         self._cache = (n, wins)
         return wins
 
+    def _provider_health(self, p: str, refreshes, now: pd.Timestamp) -> tuple[dict[str, Any], list[tuple[NewsState, str]], float | None]:
+        attempts = [r for r in refreshes if r.provider == p]
+        oks = [r for r in attempts if r.ok]
+        fails = [r for r in attempts if not r.ok]
+        problems: list[tuple[NewsState, str]] = []
+        cls = self.store.provider_class.get(p, "unknown")
+        h: dict[str, Any] = {"last_success": None, "last_failure": fails[-1].time.isoformat() if fails else None,
+                             "status": "ok", "data_class": cls, "consecutive_failures": 0}
+        for r in reversed(attempts):
+            if r.ok:
+                break
+            h["consecutive_failures"] += 1
+        if not oks:
+            h["status"] = "never_succeeded"
+            problems.append((NewsState.PROVIDER_UNAVAILABLE if fails else NewsState.CALENDAR_STALE,
+                             f"provider {p}: no successful refresh"))
+            return h, problems, None
+        last_ok = oks[-1]
+        h["last_success"] = last_ok.time.isoformat()
+        age = now - last_ok.time
+        if cls == "verified_live" and age > self.cfg.refresh_interval:
+            h["data_class"] = "cached_live"  # live data, but not refreshed within the refresh interval
+        if fails and fails[-1].time > last_ok.time:
+            if self.cfg.provider_failure_policy == "block_entries" or age > self.cfg.max_age:
+                h["status"] = "failing"
+                problems.append((NewsState.PROVIDER_UNAVAILABLE,
+                                 f"provider {p}: latest refresh failed ({fails[-1].error or 'error'})"))
+        elif fails:
+            streak = 0
+            for r in reversed(attempts):
+                if not r.ok:
+                    break
+                streak += 1
+            if streak < self.cfg.recovery_successes:
+                h["status"] = "recovering"
+                problems.append((NewsState.RECOVERY_PENDING, f"provider {p}: {streak}/{self.cfg.recovery_successes} "
+                                 "successful refreshes since the last failure"))
+        if age > self.cfg.max_age:
+            h["status"] = "stale"
+            problems.append((NewsState.CALENDAR_STALE, f"provider {p}: last successful refresh "
+                             f"{age.total_seconds() / 60:.0f} min ago (max {self.cfg.max_age.total_seconds() / 60:.0f})"))
+        cs, ce = last_ok.coverage_start, last_ok.coverage_end
+        if cs is None or ce is None or now < cs or now + self.cfg.lookahead > ce:
+            h["status"] = "no_coverage"
+            problems.append((NewsState.CALENDAR_STALE, f"provider {p}: calendar does not cover "
+                             f"{self.cfg.lookahead.total_seconds() / 60:.0f} min ahead"))
+        return h, problems, age.total_seconds() / 60
+
     def _integrity(self, now: pd.Timestamp) -> tuple[list[tuple[NewsState, str]], dict[str, Any], float | None]:
         refreshes = self.store.refreshes_until(now)
-        expected = sorted(self.store.expected_providers or {r.provider for r in refreshes})
+        expected = set(self.store.expected_providers or {r.provider for r in refreshes})
         problems: list[tuple[NewsState, str]] = []
         health: dict[str, Any] = {}
         ages = []
         if not expected:
             problems.append((NewsState.CALENDAR_STALE, "no calendar refresh recorded: event risk unknown"))
-        for p in expected:
-            attempts = [r for r in refreshes if r.provider == p]
-            oks = [r for r in attempts if r.ok]
-            h: dict[str, Any] = {"last_success": None, "last_failure": None, "status": "ok"}
-            fails = [r for r in attempts if not r.ok]
-            if fails:
-                h["last_failure"] = fails[-1].time.isoformat()
-            if not oks:
-                h["status"] = "never_succeeded"
-                problems.append((NewsState.PROVIDER_UNAVAILABLE if fails else NewsState.CALENDAR_STALE,
-                                 f"provider {p}: no successful refresh"))
-                health[p] = h
-                continue
-            last_ok = oks[-1]
-            h["last_success"] = last_ok.time.isoformat()
-            age = now - last_ok.time
-            ages.append(age.total_seconds() / 60)
-            if fails and fails[-1].time > last_ok.time:
-                if self.cfg.provider_failure_policy == "block_entries" or age > self.cfg.max_age:
-                    h["status"] = "failing"
-                    problems.append((NewsState.PROVIDER_UNAVAILABLE,
-                                     f"provider {p}: latest refresh failed ({fails[-1].error or 'error'})"))
-            elif fails:
-                streak = 0
-                for r in reversed(attempts):
-                    if not r.ok:
-                        break
-                    streak += 1
-                if streak < self.cfg.recovery_successes:
-                    h["status"] = "recovering"
-                    problems.append((NewsState.RECOVERY_PENDING,
-                                     f"provider {p}: {streak}/{self.cfg.recovery_successes} successful refreshes "
-                                     "since the last failure"))
-            if age > self.cfg.max_age:
-                h["status"] = "stale"
-                problems.append((NewsState.CALENDAR_STALE, f"provider {p}: last successful refresh "
-                                 f"{age.total_seconds() / 60:.0f} min ago (max {self.cfg.max_age.total_seconds() / 60:.0f})"))
-            cs, ce = last_ok.coverage_start, last_ok.coverage_end
-            if cs is None or ce is None or now < cs or now + self.cfg.lookahead > ce:
-                h["status"] = "no_coverage"
-                problems.append((NewsState.CALENDAR_STALE, f"provider {p}: calendar does not cover "
-                                 f"{self.cfg.lookahead.total_seconds() / 60:.0f} min ahead"))
+        healthy = set()
+        for p in sorted(expected | set(self.store.provider_coverage)):
+            h, probs, age = self._provider_health(p, refreshes, now)
             health[p] = h
+            if not probs:
+                healthy.add(p)
+            if p in expected:
+                problems += probs
+                if age is not None:
+                    ages.append(age)
+        for cat in self.cfg.required_categories:
+            providers = [p for p, cats in self.store.provider_coverage.items() if cat in cats]
+            if not any(p in healthy for p in providers):
+                problems.append((NewsState.CALENDAR_INCOMPLETE,
+                                 f"no healthy provider covers required category {cat!r}"
+                                 + (f" (providers: {', '.join(providers)})" if providers else "")))
         return problems, health, (max(ages) if ages else None)
 
     def status(self, now: pd.Timestamp) -> NewsStatus:
@@ -188,6 +211,7 @@ class NewsGuard:
             "scheduled_at": ";".join(str(e.scheduled_at) for e in w.events) if w else "",
             "blackout_start": w.start if w else None, "blackout_end": w.end if w else None,
             "calendar_age_minutes": st.calendar_age_minutes,
+            "data_classes": ";".join(sorted({h.get("data_class", "unknown") for h in st.provider_health.values()})),
             "provider_health": json.dumps(st.provider_health, sort_keys=True),
             "next_event": (st.next_window.events[0].name if st.next_window and st.next_window.events else ""),
             "next_window_start": st.next_window.start if st.next_window else None,
@@ -241,3 +265,28 @@ def explain(st: NewsStatus, cfg: NewsConfig) -> str:
         return f"BLOCKED: emergency blackout ({reason}) until {_fmt(w.end, cfg) if w else 'cleared'}."
     return f"BLOCKED: {st.state.value.replace('_', ' ').lower()} -- {st.reasons[0] if st.reasons else ''}. " \
            "New entries stay disabled until the calendar is refreshed and validated."
+
+
+def operational_readiness(cfg: NewsConfig, store: CalendarStore, now: pd.Timestamp,
+                          instrument: str = "MES") -> dict[str, Any]:
+    """Research mode (backtests on historical calendar files: manual or synthetic data allowed and
+    labelled) vs OPERATIONAL mode (paper/live trading): every required category must come from a
+    healthy VERIFIED-LIVE or MANUAL provider, no synthetic data, and NewsGuard must be enforcing."""
+    issues: list[str] = []
+    if not cfg.enabled or cfg.mode != "enforce":
+        issues.append("news filter must be enabled in enforce mode")
+    if store.is_synthetic:
+        issues.append("calendar contains SYNTHETIC data")
+    for name, pc in cfg.providers.items():
+        if pc.enabled and pc.live and not pc.verified:
+            issues.append(f"provider {name} is enabled but not verified")
+    g = NewsGuard(cfg, store, instrument)
+    _, health, _ = g._integrity(now)
+    for cat in cfg.required_categories:
+        ok = [p for p, cats in store.provider_coverage.items()
+              if cat in cats and health.get(p, {}).get("status") == "ok"
+              and store.provider_class.get(p) in ("verified_live", "manual")]
+        if not ok:
+            issues.append(f"required category {cat!r}: no healthy verified-live or manual provider")
+    return {"ready": not issues, "issues": issues, "provider_health": health,
+            "data_classes": store.data_classes()}

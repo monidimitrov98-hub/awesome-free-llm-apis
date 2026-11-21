@@ -6,16 +6,33 @@ labels {+1, -1, 0}; the probability of the predicted class is then calibrated on
 chronologically LATER validation fold (see validation.py). XGBoost is not used: it would
 add a heavy dependency without a demonstrated benefit on this feature set.
 
-Artifacts: the fitted model is stored with pickle ONLY next to an identity JSON holding
-the pickle's SHA-256, the feature list, label settings, hyperparameters, training-data
-hash and code hash. :func:`load_model` refuses a file whose hash or feature list differs.
-Never load model files from untrusted sources (pickle can execute code).
+Artifacts (Sprint 4.1 hardening): the fitted model is pickled next to an identity JSON
+(pickle SHA-256, feature list, label settings, hyperparameters, data and code hashes).
+
+A SHA-256 alone does NOT protect against an attacker who can replace BOTH files: they can
+write a malicious pickle and its matching hash, and ``pickle.loads`` would execute their
+code. Therefore:
+
+1. The identity is AUTHENTICATED with HMAC-SHA256 using a secret key from the environment
+   variable ``FTS_MODEL_SIGNING_KEY`` (>= 32 characters, never stored in the repository).
+   Saving needs the key; loading verifies the HMAC (constant time) and the pickle hash
+   BEFORE any byte is unpickled. Without the key, models are not loaded at all.
+2. Defence in depth: unpickling uses an allow-list (NumPy array/dtype/random reconstruction
+   helpers and scikit-learn CLASSES only); any other global (os.system, builtins.eval,
+   subprocess, ...) is refused even in a correctly signed file.
+
+Limits: whoever holds the signing key (or can run code as this user) can still forge a model;
+keep the key secret and separate from the artifacts. The default classifier ("rules") loads
+no pickle at all, and the calibration file is plain JSON.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
+import io
 import json
+import os
 import pickle
 from pathlib import Path
 from typing import Any
@@ -72,13 +89,53 @@ def predict(model, cfg: MLConfig, x: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return np.array([classes[i] for i in idx]), proba[np.arange(len(idx)), idx]
 
 
+SIGNING_KEY_ENV = "FTS_MODEL_SIGNING_KEY"
+_NUMPY_GLOBALS = {
+    ("numpy", "dtype"), ("numpy", "ndarray"),
+    ("numpy._core.multiarray", "_reconstruct"), ("numpy._core.multiarray", "scalar"),
+    ("numpy.core.multiarray", "_reconstruct"), ("numpy.core.multiarray", "scalar"),
+    ("numpy.random._pickle", "__bit_generator_ctor"), ("numpy.random._pickle", "__generator_ctor"),
+    ("numpy.random._pickle", "__randomstate_ctor"), ("numpy.random._pcg64", "PCG64"),
+    ("numpy.random._mt19937", "MT19937"), ("numpy.random.bit_generator", "SeedSequence"),
+    ("numpy.random.bit_generator", "__pyx_unpickle_SeedSequence"),
+}
+
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if (module, name) in _NUMPY_GLOBALS:
+            return super().find_class(module, name)
+        if module == "sklearn" or module.startswith("sklearn."):
+            obj = super().find_class(module, name)
+            if isinstance(obj, type) or name.startswith("__pyx_unpickle_"):
+                return obj
+        raise pickle.UnpicklingError(f"global {module}.{name} is not allowed in a model artifact")
+
+
+def _signing_key() -> bytes:
+    key = os.environ.get(SIGNING_KEY_ENV, "")
+    if len(key) < 32:
+        raise ConfigError(f"model artifacts need a secret signing key in the environment variable {SIGNING_KEY_ENV} "
+                          "(at least 32 characters, kept outside the repository)")
+    return key.encode("utf-8")
+
+
+def _signature(ident: dict[str, Any], key: bytes) -> str:
+    body = json.dumps({k: v for k, v in ident.items() if k != "hmac_sha256"}, sort_keys=True, default=str)
+    return hmac.new(key, body.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def save_model(model, path: str | Path, identity: dict[str, Any]) -> dict[str, Any]:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    key = _signing_key()
     blob = pickle.dumps(model)
-    p.write_bytes(blob)
+    _RestrictedUnpickler(io.BytesIO(blob)).load()  # refuse to write anything we would refuse to read
     ident = dict(identity, artifact_sha256=hashlib.sha256(blob).hexdigest(), features=list(ML_FEATURES))
-    p.with_suffix(".json").write_text(json.dumps(ident, indent=2, default=str), encoding="utf-8")
+    ident = json.loads(json.dumps(ident, default=str))
+    ident["hmac_sha256"] = _signature(ident, key)
+    p.write_bytes(blob)
+    p.with_suffix(".json").write_text(json.dumps(ident, indent=2), encoding="utf-8")
     return ident
 
 
@@ -89,8 +146,15 @@ def load_model(path: str | Path):
         blob = p.read_bytes()
     except (OSError, ValueError) as exc:
         raise ConfigError(f"Cannot read model artifact {p}: {exc}") from exc
+    if not isinstance(ident, dict) or not isinstance(ident.get("hmac_sha256"), str):
+        raise ConfigError(f"Model artifact {p} is not signed; refusing to load it")
+    if not hmac.compare_digest(_signature(ident, _signing_key()), ident["hmac_sha256"]):
+        raise ConfigError(f"Model artifact {p}: identity signature invalid (tampered or signed with another key)")
     if hashlib.sha256(blob).hexdigest() != ident.get("artifact_sha256"):
         raise ConfigError(f"Model artifact {p} does not match its identity hash; refusing to load it")
     if ident.get("features") != list(ML_FEATURES):
         raise ConfigError(f"Model artifact {p} was trained on a different feature list")
-    return pickle.loads(blob), ident  # noqa: S301 - integrity-checked local artifact
+    try:
+        return _RestrictedUnpickler(io.BytesIO(blob)).load(), ident
+    except (pickle.UnpicklingError, AttributeError, ImportError, ValueError, TypeError, EOFError) as exc:
+        raise ConfigError(f"Model artifact {p} refused: {exc}") from exc

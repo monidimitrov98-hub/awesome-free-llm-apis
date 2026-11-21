@@ -83,7 +83,7 @@ def test_cancelled_event_stops_blocking_only_once_known():
 
 
 def test_unknown_impact_and_unknown_time_are_never_safe():
-    g = guard(rec("Wholesale Inventories", "2025-03-12T10:00:00"))
+    g = guard(rec("Index of Unfamiliar Things", "2025-03-12T10:00:00"))
     assert state(g, "2025-03-12 09:45") is S.EVENT_UNKNOWN
     day = guard(rec("Fed Chair speech", date="2025-03-11"))
     assert state(day, "2025-03-11 00:00") is S.EVENT_UNKNOWN and state(day, "2025-03-11 23:59") is S.EVENT_UNKNOWN

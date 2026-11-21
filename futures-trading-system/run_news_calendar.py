@@ -24,7 +24,7 @@ from src.config import PROJECT_ROOT, ConfigError
 from src.risk.news.calendar import CalendarStore
 from src.risk.news.classifier import make_classifier
 from src.risk.news.config import DEFAULT_NEWS_CONFIG_PATH, load_news_config
-from src.risk.news.guard import NewsGuard, explain
+from src.risk.news.guard import NewsGuard, explain, operational_readiness
 from src.risk.news.providers import build_providers
 from src.risk.news.service import expected_providers, refresh
 
@@ -83,7 +83,8 @@ def main(argv=None) -> int:
                "entries_allowed": s.safe or not cfg.enforcing, "reasons": s.reasons,
                "explanation": explain(s, cfg), "calendar_age_minutes": s.calendar_age_minutes,
                "provider_health": s.provider_health, "active_windows": [w.to_dict() for w in s.active],
-               "upcoming_windows": [w.to_dict() for w in guard.windows_at(now) if w.start > now][:10]}
+               "upcoming_windows": [w.to_dict() for w in guard.windows_at(now) if w.start > now][:10],
+               "operational_readiness": operational_readiness(cfg, st, now, args.instrument)}
         print(json.dumps(doc, indent=2))
         if args.json:
             args.json.write_text(json.dumps(doc, indent=2), encoding="utf-8")

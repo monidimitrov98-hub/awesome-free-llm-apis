@@ -889,9 +889,16 @@ consistent.
 - LLM text is never parsed into actions. If the LLM is missing, raises, or returns empty or
   invalid output, the template explanation is used instead.
 - The regime config, and the SHA-256 of any calibration or model file it names, are part of
-  the backtest configuration identity. Replay refuses changed artifacts. Model files load
-  only when their hash and feature list match their identity JSON. Never load model files
-  from untrusted sources: they are pickles.
+  the backtest configuration identity. Replay refuses changed artifacts.
+- Model files are pickles. A SHA-256 alone does not stop an attacker who can replace both the
+  pickle and its identity file. Since Sprint 4.1 the identity is therefore signed with
+  HMAC-SHA256, using a secret key from `FTS_MODEL_SIGNING_KEY` (at least 32 characters, kept
+  outside the repository). The signature and the hash are verified **before** unpickling.
+  Unpickling then only accepts NumPy reconstruction helpers and scikit-learn classes;
+  `os.system`, `eval` and the like are refused even in a correctly signed file. Without the
+  key, models cannot be saved or loaded. Anyone who holds the key, or who can run code as your
+  user, can still forge a model, so protect the key. The default `rules` classifier loads no
+  pickle at all, and calibration files are JSON.
 
 ### Running
 
@@ -948,29 +955,59 @@ starts, with exit reason `news_event_flatten`.
 
 ### Data sources and provider setup
 
+The live verification on 2026-11-21 is documented in `docs/news_provider_verification.md`
+(evidence and procedure) and `docs/news_provider_verification.json` (raw results).
+
 | Provider | Source | Status |
 | --- | --- | --- |
-| `manual` (`json_file`) | A curated JSON file, `data/news/manual_calendar.json`, that you build from official schedules: the Federal Reserve FOMC calendar, BEA (GDP, PCE), Census (retail sales), DOL (jobless claims) and ISM | Enabled. Tested with fixtures only |
-| `bls` (`ics`) | Official BLS release calendar, `https://www.bls.gov/schedule/news_release/bls.ics` (CPI, PPI, Employment Situation) | **Disabled.** The endpoint was not reachable from the development sandbox, so it was tested with fixtures only. Verify it before enabling |
-| `fed_press` (`rss`) | Federal Reserve monetary-policy press-release RSS feed (URL inferred from federalreserve.gov/feeds) | **Disabled.** Not verified. Check the exact feed URL first |
+| `bea` (`ics`) | BEA release calendar iCalendar (GDP, PCE, trade), times in UTC | **Verified live**, enabled |
+| `census` (`census_html`) | Census economic-indicator list view, 2026 and 2027 pages (retail sales, durable goods, housing, trade) | **Verified live**, enabled. Times confirmed as ET by cross-checking BEA |
+| `fomc` (`fomc_html`) | Federal Reserve FOMC meeting calendar. Dates only, so decision days are blocked all day unless timed in the manual file | **Verified live**, enabled |
+| `fed_press` (`rss`) | Federal Reserve monetary-policy press releases (unexpected announcements) | Verified live, disabled until `[unexpected]` is enabled |
+| `bls` (`ics`) | BLS release calendar (CPI, NFP, PPI) | **Not verified**: BLS returned HTTP 403 under its bot policy. Disabled. See the doc for the procedure |
+| `manual` (`json_file`) | `data/news/manual_calendar.json`, curated by you from official schedules | Manual data. Required for CPI, NFP, PPI, jobless claims, ISM, Fed Chair speeches, Treasury |
+
+A live provider cannot be enabled unless the config records its verification
+(`verified = true`, `verified_on`, `documentation`). Every record carries its provenance:
+`verified_live`, `manual`, `synthetic` or `unknown`. Provider health additionally reports
+`cached_live` when live data has not been refreshed within `refresh_interval_minutes`.
+Synthetic data can never be labelled anything else. `[coverage] required_categories` must each
+be covered by a healthy provider; otherwise entries are blocked (`CALENDAR_INCOMPLETE`).
+When sources disagree, a timed official record refines a date-only one of the same day.
 
 Credentials, when a provider needs them, come only from the environment variable named by
-`api_key_env`. A key written in the config file is rejected, and keys are redacted from
-errors and logs. Only `https://` URLs are accepted. Responses are bounded in size and must be
-valid. Feed text is cleaned and never interpreted as instructions. XML with
-DOCTYPE/ENTITY declarations is refused.
+`api_key_env`; a key written in the config file is rejected, and keys are redacted from errors
+and logs. Set `FTS_HTTP_CONTACT` (for example an e-mail address) to identify the client in the
+User-Agent, which BLS requires for automated access. Transport rules: HTTPS only; redirects
+only to HTTPS on the same host, at most 3; timeouts; bounded response size; UTF-8 only.
+Parsing: XML with DOCTYPE/ENTITY declarations or a non-UTF-8 encoding is refused; HTML goes
+through the standard-library tokenizer; event and line counts are capped. Feed text is cleaned
+and never interpreted as instructions.
 
 ```
 python run_news_calendar.py --refresh                  # schedule daily (or hourly) with your OS scheduler
-python run_news_calendar.py --status --instrument MNQ  # state, active and next windows (exit 8 = entries blocked)
+python run_news_calendar.py --status --instrument MNQ  # state, windows, provider health, operational readiness (exit 8 = blocked)
 python run_news_calendar.py --validate data/news/history.json --start 2025-01-01 --end 2025-03-31
+python scripts/verify_news_providers.py --out verification.json   # re-verify the live endpoints
 ```
 
 Calendar JSON (`schema: news-calendar/1`): `refreshes` (time, provider, ok, coverage) and
 `events`. Each event has a name, `scheduled_at` with a `timezone` (or a `date` only), a
-status, an optional impact and category, a source, a reliability, and `known_at`: the time
-the version became available. A manual provider file only needs `coverage_start`,
-`coverage_end` and `events`.
+status, an optional impact and category, a source, a reliability, a provenance, and
+`known_at`: the time the version became available. A store also records `provider_coverage`
+and `provider_class`. A manual provider file only needs `coverage_start`, `coverage_end` and
+`events`.
+
+### Research mode vs operational mode
+
+- **Research mode (backtests).** A historical point-in-time calendar file is used. Manual,
+  synthetic or old (`unknown` provenance) data is allowed, but it is labelled in
+  `news_report.json`. A **synthetic** calendar is refused with non-synthetic price data. A
+  calendar without coverage metadata blocks every entry (`CALENDAR_INCOMPLETE`).
+- **Operational mode (paper/live, later sprints).** `run_news_calendar.py --status` reports
+  `operational_readiness`, which requires all of the following: the filter enabled in
+  `enforce` mode; no synthetic data; no enabled unverified live provider; and every required
+  category covered by a healthy `verified_live` or `manual` provider.
 
 ### Default blackout windows (starting values, not optimised)
 
@@ -1114,9 +1151,12 @@ verified yet.
   - The time-of-day volatility percentile needs about 34 earlier sessions before "extreme"
     can be detected at all.
 - **News filter:**
-  - No live provider has been verified from the development environment. BLS and Fed
-    feeds are disabled until you verify them. The manual calendar must be maintained by
-    hand from official schedules.
+  - BEA, Census, the FOMC calendar and the Fed press feed were verified live on 2026-11-21.
+    BLS was not: it blocks automated clients. CPI, NFP, PPI, jobless claims, ISM and Fed
+    Chair speeches therefore depend on the hand-maintained manual file. The HTML providers
+    (Census, FOMC) break if the agencies change their page layout; they then fail closed.
+  - FOMC times are not published on the calendar page, so decision days are blocked all day
+    unless the manual file gives the times.
   - Historical backtests need a point-in-time calendar. Without one, every entry is
     blocked (fail closed). Schedule changes published after the fact cannot be
     reconstructed unless their `known_at` was recorded.

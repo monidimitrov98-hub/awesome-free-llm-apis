@@ -118,7 +118,7 @@ before_minutes = 15
 after_minutes = 15
 
 [events.retail_sales]
-patterns = ["retail sales", "retail trade"]
+patterns = ["retail sales", "retail trade", "sales for retail"]
 impact = "medium"
 before_minutes = 15
 after_minutes = 15
@@ -147,6 +147,73 @@ impact = "medium"
 before_minutes = 15
 after_minutes = 15
 
+[events.trade_balance]
+patterns = ["international trade in goods", "advance economic indicators"]
+impact = "medium"
+before_minutes = 10
+after_minutes = 10
+
+[events.durable_goods]
+patterns = ["durable goods"]
+impact = "medium"
+before_minutes = 10
+after_minutes = 10
+
+[events.housing_starts]
+patterns = ["new residential construction", "housing starts"]
+impact = "medium"
+before_minutes = 10
+after_minutes = 10
+
+[events.new_home_sales]
+patterns = ["new residential sales", "new home sales"]
+impact = "medium"
+before_minutes = 10
+after_minutes = 10
+
+[events.jolts]
+patterns = ["job openings and labor turnover", "\\bjolts\\b"]
+impact = "medium"
+before_minutes = 10
+after_minutes = 10
+
+# Lower-impact releases: recorded, no window (impact "low" is not in [impact] block).
+[events.construction_spending]
+patterns = ["construction spending"]
+impact = "low"
+before_minutes = 0
+after_minutes = 0
+
+[events.wholesale_trade]
+patterns = ["wholesale trade", "wholesale inventories"]
+impact = "low"
+before_minutes = 0
+after_minutes = 0
+
+[events.factory_orders]
+patterns = ["manufacturers' shipments, inventories", "factory orders"]
+impact = "low"
+before_minutes = 0
+after_minutes = 0
+
+[events.business_formation]
+patterns = ["business formation"]
+impact = "low"
+before_minutes = 0
+after_minutes = 0
+
+[events.minor_statistics]              # structural / annual statistics listed in the BEA and Census calendars
+patterns = ["satellite account", "multinational enterprises", "direct investment by country",
+            "distribution of u\\.s\\. personal income", "experimental", "housing vacancies",
+            "quarterly services survey", "imports for consumption of steel", "manufacturing and trade: inventories",
+            "advance services report", "foreign direct investment", "trade in value added", "outdoor recreation",
+            "household production", "services supplied through affiliates", "production account",
+            "state personal income", "personal income by state", "consumer spending by state", "by county",
+            "quarterly financial report"]
+impact = "low"
+before_minutes = 0
+after_minutes = 0
+
 [events.unexpected]                    # unexpected official announcements (window starts when they become known)
 patterns = []
 impact = "high"
@@ -167,24 +234,86 @@ regions = ["US"]
 [emergency]
 windows = []
 
-# Calendar providers. Live providers are DISABLED until you verify them in your own
-# environment (their endpoints could not be reached from the development sandbox).
+# Calendar providers. A LIVE provider (ics, rss, census_html, fomc_html) can only be enabled
+# after it was verified against its real endpoint (verified = true, verified_on, documentation).
+# See docs/news_provider_verification.md and scripts/verify_news_providers.py.
 # Credentials are read from environment variables named by api_key_env; never put keys here.
+# Set FTS_HTTP_CONTACT (e.g. an e-mail address) to identify the client in the User-Agent, as
+# some agencies (BLS) require for automated access.
+
 [providers.manual]
 type = "json_file"
 enabled = true
-path = "data/news/manual_calendar.json"   # curated from official schedules (FOMC calendar, BEA, Census, ...)
+path = "data/news/manual_calendar.json"   # curated by hand from official schedules (see README)
+reliability = "official"
+priority = 2
+expected = true                           # its failure / staleness blocks entries
+covers = ["cpi", "core_cpi", "nfp", "unemployment_rate", "ppi", "jobless_claims", "ism_manufacturing",
+          "ism_services", "fed_chair_speech", "treasury", "jolts"]
+
+[providers.bea]
+type = "ics"
+enabled = true
+url = "https://www.bea.gov/news/schedule/ics/online-calendar-subscription.ics"
 reliability = "official"
 priority = 1
-expected = false                          # true: its failure / staleness blocks entries
+expected = true
+verified = true
+verified_on = "2026-11-21"
+documentation = "https://www.bea.gov/news/schedule"
+covers = ["gdp", "pce", "core_pce", "trade_balance"]
+
+[providers.census]
+type = "census_html"
+enabled = true
+url = "https://www.census.gov/economic-indicators/calendar-listview-2026.html"
+urls = ["https://www.census.gov/economic-indicators/calendar-listview.html"]
+reliability = "official"
+priority = 1
+expected = true
+verified = true
+verified_on = "2026-11-21"
+documentation = "https://www.census.gov/economic-indicators/calendar-listview.html"
+covers = ["retail_sales", "durable_goods", "housing_starts", "new_home_sales", "trade_balance",
+          "construction_spending", "wholesale_trade", "factory_orders", "business_formation"]
+
+[providers.fomc]
+type = "fomc_html"
+enabled = true
+url = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+reliability = "official"
+priority = 1
+expected = true
+verified = true
+verified_on = "2026-11-21"
+documentation = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+covers = ["fomc_decision", "fomc_statement", "fed_press_conference"]
 
 [providers.bls]
 type = "ics"
-enabled = false
+enabled = false                           # NOT verified: BLS refused automated access from the dev sandbox (403, bot policy)
 url = "https://www.bls.gov/schedule/news_release/bls.ics"   # official BLS release calendar (iCalendar)
 reliability = "official"
 priority = 1
 expected = true
+covers = ["cpi", "core_cpi", "nfp", "unemployment_rate", "ppi", "jolts"]
+
+[providers.fed_press]
+type = "rss"
+enabled = false                           # verified endpoint; enable together with [unexpected]
+url = "https://www.federalreserve.gov/feeds/press_monetary.xml"
+reliability = "official"
+priority = 1
+expected = false
+verified = true
+verified_on = "2026-11-21"
+documentation = "https://www.federalreserve.gov/feeds/feeds.htm"
+covers = ["unexpected"]
+
+[coverage]
+# Every category listed here must be covered by at least one expected, healthy provider,
+# otherwise new entries are blocked (CALENDAR_INCOMPLETE).
+required_categories = ["cpi", "nfp", "pce", "gdp", "ppi", "retail_sales", "jobless_claims", "fomc_decision"]
 
 [unexpected]
 enabled = false
@@ -192,14 +321,6 @@ provider = "fed_press"
 keywords = ["federal open market committee", "fomc", "discount rate", "emergency", "liquidity", "intermeeting"]
 blackout_minutes = 30
 max_item_age_minutes = 120
-
-[providers.fed_press]
-type = "rss"
-enabled = false
-url = "https://www.federalreserve.gov/feeds/press_monetary.xml"  # verify on federalreserve.gov/feeds before enabling
-reliability = "official"
-priority = 1
-expected = false
 
 [diagnostics]
 explain = true

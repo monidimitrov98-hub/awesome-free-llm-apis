@@ -29,8 +29,10 @@ def rec(name, when=None, *, known="2025-03-01 00:00", source="fixture", rel="off
     return parse_record(raw, source=source, reliability=Reliability(rel), known_at=T(known), classify=CLASSIFY)
 
 
-def store(*records, refreshes=None, expected=("fixture",), cfg=CFG) -> CalendarStore:
+def store(*records, refreshes=None, expected=("fixture",), cfg=CFG, coverage=None) -> CalendarStore:
     st = CalendarStore(expected_providers=expected)
+    # by default every expected provider is trusted to cover every category (tests of coverage override this)
+    st.provider_coverage = coverage if coverage is not None else {p: list(cfg.events) for p in expected}
     for r in records:
         st.add(r)
     for r in (refreshes if refreshes is not None else daily(expected)):
