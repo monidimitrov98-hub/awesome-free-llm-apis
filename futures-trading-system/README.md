@@ -1232,6 +1232,23 @@ python run_paper.py --verify
 - **Audit.** `docs/paper_audit_2026-11-21.md` lists the adversarial-audit findings, their fixes
   and their regression tests (`tests/test_paper_audit.py`).
 
+## Sprint 6: Live market data (read-only NinjaTrader 8 bridge)
+
+`src/marketdata/` receives real-time MES/MNQ level-1 data from NinjaTrader 8 through a small
+read-only Add On (`ninjatrader/FtsMarketDataBridge.cs`). The Add On connects to a loopback-only,
+authenticated backend. Every event passes the same EventValidator, DataHealth, journal, bars,
+strategy and protections as replay data. **Nothing in this path can send an order.**
+
+The Add On has not been compiled or run against a real NinjaTrader installation yet. See
+`docs/sprint6_live_market_data.md` for setup, security boundaries, timestamp conventions and the
+first-run checks.
+
+```
+python run_marketdata.py init-secret
+python run_marketdata.py monitor --mock --duration 30     # whole pipeline, SYNTHETIC mock data, no NinjaTrader
+python run_marketdata.py monitor                          # waits for the NinjaTrader add-on
+```
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.

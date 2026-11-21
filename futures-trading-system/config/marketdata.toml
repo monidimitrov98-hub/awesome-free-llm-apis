@@ -1,0 +1,21 @@
+# Live market data (Sprint 6): read-only NinjaTrader 8 bridge. MARKET DATA ONLY -- no order path.
+# The backend listens on LOOPBACK only; the NinjaTrader add-on (ninjatrader/FtsMarketDataBridge.cs)
+# connects to it and authenticates with the shared secret file (create it with
+#   python run_marketdata.py init-secret
+# and copy it to the add-on's folder; see docs/sprint6_live_market_data.md).
+
+[bridge]
+host = "127.0.0.1"                    # loopback only: any other address is refused
+port = 50555
+secret_file = "data/bridge/bridge_secret"   # 64 hex chars, owner-only file, never in Git
+max_message_bytes = 4096              # longer lines = protocol violation (connection dropped)
+queue_max_events = 20000              # bounded hand-over queue; overflow drops the connection (never silently)
+connect_timeout_seconds = 30          # wait this long for the bridge on each connect attempt
+heartbeat_timeout_seconds = 10        # no message for this long = dead bridge (it sends heartbeats every 1 s)
+handshake_timeout_seconds = 3
+max_pending_handshakes = 4            # unauthenticated connections allowed at the same time
+
+[instruments]
+# EXACT NinjaTrader contract names. Only these are accepted; update them at every roll
+# (MES/MNQ expire on the third Friday of Mar/Jun/Sep/Dec; volume moves about a week earlier).
+contracts = { MES = "MES 12-26", MNQ = "MNQ 12-26" }

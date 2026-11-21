@@ -16,6 +16,7 @@ reconnect_backoff_seconds = [1, 2, 5, 10, 30]
 max_price_jump_ticks = 400            # larger jumps between consecutive events are rejected
 max_spread_ticks = 40                 # wider quotes are rejected (never used for fills or marks)
 max_future_skew_seconds = 5           # real-time feeds: events stamped further ahead of the clock are rejected
+max_event_delay_seconds = 3           # live feeds: event received later than this after its time = delayed data (entries blocked)
 warmup_sessions = 25                  # completed sessions of history used for indicators
 
 [execution]

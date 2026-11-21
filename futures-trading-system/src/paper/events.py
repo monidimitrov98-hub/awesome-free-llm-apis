@@ -34,6 +34,15 @@ class MarketEvent:
     bar_high: float | None = None   # synthetic events only: the source bar's range (for worst-case rules)
     bar_low: float | None = None
     received_at: pd.Timestamp | None = field(default=None, compare=False)
+    # live-data provenance (Sprint 6). ``ts`` is the canonical event time; ``ts_source`` says where it
+    # came from ("exchange" | "provider" | "replay" | "synthetic"). A missing exchange time is never
+    # replaced by a local one: ``exchange_ts`` simply stays None.
+    ts_source: str = "replay"
+    exchange_ts: pd.Timestamp | None = field(default=None, compare=False)
+    provider_ts: pd.Timestamp | None = field(default=None, compare=False)
+    bridge_ts: pd.Timestamp | None = field(default=None, compare=False)
+    provider_seq: int | None = field(default=None, compare=False)
+    instrument: str | None = None   # exact provider contract name, e.g. "MES 12-26"
 
     @property
     def is_trade(self) -> bool:

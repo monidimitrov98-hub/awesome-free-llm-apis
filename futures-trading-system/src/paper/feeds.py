@@ -46,6 +46,14 @@ class MarketDataFeed(ABC):
     def poll(self, max_events: int = 1000) -> list[MarketEvent]:
         """Next available events (empty when none yet). Raises FeedError when disconnected."""
 
+    def health_updates(self) -> list:
+        """Data-health changes reported by the provider (connection, subscription, gaps). Replay
+        feeds have none."""
+        return []
+
+    def status(self) -> dict:
+        return {"feed": self.name, "kind": self.kind, "connected": self.connected}
+
     @property
     @abstractmethod
     def exhausted(self) -> bool:

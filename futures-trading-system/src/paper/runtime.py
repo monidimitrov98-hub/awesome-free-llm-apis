@@ -29,6 +29,7 @@ which the restart happened (strategy state cannot be verified). No price is rest
 
 from __future__ import annotations
 
+import collections
 import math
 import time
 from typing import Any, Callable
@@ -130,6 +131,11 @@ class PaperSession:
         self._gate_pos = {r: 0 for r in self.roots}
         self._events_since_snapshot = 0
         self._journaled_peaks: tuple[float, float] | None = None
+        self.latency = collections.deque(maxlen=2000)       # processing latency (s): processed - received
+        self.feed_delay = collections.deque(maxlen=2000)    # data delay (s): received - event time
+        self._delayed: dict[str, bool] = {}
+        self.last_tick: dict[str, dict[str, Any]] = {}
+        self.feed_updates_applied = 0
         self.stopped_reason: str | None = None
         self.clean_shutdown = False
         self._recover_or_init()
@@ -165,6 +171,12 @@ class PaperSession:
         if not math.isfinite(self.account.equity()):
             return False, "account_equity_unknown"
         return True, ""
+
+    def status(self) -> dict[str, Any]:
+        """Read-only status snapshot for the Sprint 7 GUI (see src/marketdata/status.py)."""
+        from src.marketdata.status import build_status
+
+        return build_status(self)
 
     def _journal(self, kind: str, payload: dict[str, Any], ts: pd.Timestamp | None = None) -> None:
         self.journal.append(kind, ts or self.now(), payload)
@@ -379,8 +391,10 @@ class PaperSession:
         self._events_since_snapshot = 0
 
     # ------------------------------------------------------------------ main loop
-    def connect(self) -> bool:
+    def connect(self, should_stop: Callable[[], bool] | None = None) -> bool:
         for attempt, wait in enumerate([0.0, *self.pcfg.reconnect_backoff][: self.pcfg.reconnect_max_attempts + 1]):
+            if should_stop is not None and should_stop():
+                return False
             if wait:
                 self.sleeper(wait)
             try:
@@ -393,31 +407,46 @@ class PaperSession:
             return True
         return False
 
-    def run(self, *, max_batches: int | None = None, idle_sleep: float = 0.5, stop_when_exhausted: bool = True) -> str:
+    def run(self, *, max_batches: int | None = None, idle_sleep: float = 0.5, stop_when_exhausted: bool = True,
+            should_stop: Callable[[], bool] | None = None, on_cycle: Callable[["PaperSession"], None] | None = None
+            ) -> str:
         """Main loop. ANY unexpected exception (feed, strategy, clock-driven bars, shutdown) ends in
-        :meth:`_fatal` -- a journaled, fail-closed safe shutdown -- never in an unhandled crash."""
+        :meth:`_fatal` -- a journaled, fail-closed safe shutdown -- never in an unhandled crash.
+        ``should_stop`` ends the loop with a safe shutdown; ``on_cycle`` is called after every loop
+        cycle (e.g. to write the GUI status file) -- it must not raise."""
         try:
-            return self._run(max_batches=max_batches, idle_sleep=idle_sleep, stop_when_exhausted=stop_when_exhausted)
+            return self._run(max_batches=max_batches, idle_sleep=idle_sleep, stop_when_exhausted=stop_when_exhausted,
+                             should_stop=should_stop, on_cycle=on_cycle)
         except Exception as exc:  # noqa: BLE001
             return self._fatal(exc, None)
 
-    def _run(self, *, max_batches: int | None, idle_sleep: float, stop_when_exhausted: bool) -> str:
-        if not self.connect():
-            self.shutdown("feed_unavailable")
-            return "feed_unavailable"
+    def _run(self, *, max_batches: int | None, idle_sleep: float, stop_when_exhausted: bool,
+             should_stop: Callable[[], bool] | None = None, on_cycle: Callable[["PaperSession"], None] | None = None
+             ) -> str:
+        if not self.connect(should_stop):
+            self.shutdown("stopped" if should_stop is not None and should_stop() else "feed_unavailable")
+            return self.stopped_reason or "feed_unavailable"
         batches = 0
-        while max_batches is None or batches < max_batches:
+        while (max_batches is None or batches < max_batches) and not (should_stop is not None and should_stop()):
+            if on_cycle is not None:
+                on_cycle(self)
             try:
                 batch = self.feed.poll(1000)
             except FeedError as exc:
                 self.health.on_disconnect(self.now(), str(exc))
                 self._journal("feed_disconnected", {"error": str(exc)[:200]})
                 self._commit()
-                if not self.connect():
+                if should_stop is not None and should_stop():
+                    break  # stop requested: shut down safely instead of reconnecting
+                if not self.connect(should_stop):
                     self.shutdown("feed_unavailable")
                     return "feed_unavailable"
                 continue
+            applied = self._apply_feed_updates()
             if not batch:
+                if applied:
+                    self._commit()
+                    continue  # more data may be right behind the update: no idle sleep
                 if self.feed.exhausted and stop_when_exhausted:
                     break
                 now = self.now()
@@ -502,6 +531,8 @@ class PaperSession:
             # wait for fresh events again (protective orders keep working on the new prices)
             self.health.flag(ev.root, "price_level_reset", ev.ts)
             self._journal("price_level_reset", {**ev.ref(), "note": "jump confirmed by consecutive events"}, ev.ts)
+        if ev.received_at is not None:
+            self._check_delay(ev)
         self.health.on_event(ev.root, ev.ts)
         self._journal("market_event", {**ev.ref(), "seq": self.seq, "warnings": v.warnings,
                                        "synthetic": ev.synthetic_from_bars}, ev.ts)
@@ -517,6 +548,50 @@ class PaperSession:
         for minute in done:
             self._bar_completed(ev.root, minute, ev)
         self._events_since_snapshot += 1
+        t = self.last_tick.setdefault(ev.root, {})
+        t["time"] = ev.ts
+        if ev.kind == "quote":
+            t["bid"], t["ask"], t["quote_time"] = ev.bid, ev.ask, ev.ts
+        else:
+            t["last"], t["last_time"] = ev.last, ev.ts
+        if ev.received_at is not None:
+            self.latency.append((self._wall() - ev.received_at).total_seconds())
+
+    def _wall(self) -> pd.Timestamp:
+        return self.clock() if self.clock is not None else pd.Timestamp.now(tz="UTC")
+
+    def _check_delay(self, ev: MarketEvent) -> None:
+        """Live data: an event received long after its own time is DELAYED data. It is still used
+        (marks, protective orders: it is real data) but entries are blocked until data is timely
+        again for ``resume_after_events`` events. A negative delay is impossible clock skew."""
+        delay = ev.received_at - ev.ts
+        self.feed_delay.append(delay.total_seconds())
+        late = delay > self.pcfg.max_event_delay or delay < -self.pcfg.max_future_skew
+        if late and not self._delayed.get(ev.root):
+            self._journal("data_delayed", {"root": ev.root, "delay_seconds": delay.total_seconds(),
+                                           "limit_seconds": self.pcfg.max_event_delay.total_seconds()}, ev.ts)
+        if late:
+            self.health.flag(ev.root, "data_delayed", ev.ts)
+        self._delayed[ev.root] = late
+
+    def _apply_feed_updates(self) -> int:
+        """Provider-reported data-health changes (subscriptions, provider connection, dropped events,
+        book resets) -> DataHealth, journaled. Blocks hold until explicitly cleared; every clearing
+        still requires fresh validated events before entries are authorized again."""
+        n = 0
+        for u in self.feed.health_updates():
+            roots = self.roots if u.root is None else [u.root] if u.root in self.roots else []
+            for r in roots:
+                if u.action == "block":
+                    self.health.block(r, u.reason, u.time)
+                elif u.action == "unblock":
+                    self.health.unblock(r, u.reason, u.time)
+                elif u.action == "flag":
+                    self.health.flag(r, u.reason, u.time)
+            self.feed_updates_applied += 1
+            n += 1
+            self._journal("feed_health", {"root": u.root, "action": u.action, "reason": u.reason}, u.time)
+        return n
 
     def _mark(self, ev: MarketEvent) -> None:
         pos = self.account.position_qty(ev.root)

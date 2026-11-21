@@ -76,7 +76,8 @@ class BarBuilder:
 
     def on_trade(self, ev: MarketEvent) -> list[pd.Timestamp]:
         done = self.advance(ev.ts)
-        minute = ev.ts.floor("min")
+        c = self._cur
+        minute = c.start if c is not None and c.start <= ev.ts < c.start + MINUTE else ev.ts.floor("min")
         if self.last_complete is not None and minute <= self.last_complete:
             return done  # trade for an already completed minute (late): not applied
         if self._cur is None:

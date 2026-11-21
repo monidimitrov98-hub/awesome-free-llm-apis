@@ -9,6 +9,7 @@ against the processing clock by :class:`DataHealth`.
 
 from __future__ import annotations
 
+import collections
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -29,27 +30,34 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
 
 
+_MISSING = object()
+
+
 class SessionCalendar:
     """Session date of a timestamp (New York session rules, DST-aware), cached per minute."""
 
     def __init__(self, session: SessionConfig, cache_size: int = 20_000) -> None:
         self.session = session
-        self._cache: OrderedDict[pd.Timestamp, pd.Timestamp | None] = OrderedDict()
+        self._cache: OrderedDict[int, pd.Timestamp | None] = OrderedDict()
         self.cache_size = cache_size
         # session bounds and DST changes fall on bucket edges: 15-minute buckets when the session
         # starts/ends on a quarter hour (always true for the CME Globex session), else 1 minute
         quarter = session.start.minute % 15 == 0 and session.end.minute % 15 == 0 \
             and session.start.second == 0 and session.end.second == 0
         self._bucket = "15min" if quarter else "1min"
+        self._bucket_ns = (15 if quarter else 1) * 60 * 1_000_000_000
 
     def __call__(self, ts: pd.Timestamp) -> pd.Timestamp | None:
-        key = ts.floor(self._bucket)
-        if key not in self._cache:
+        # integer floor of the UTC epoch value == ts.floor(bucket) for tz-aware timestamps, much faster
+        k = ts.value - ts.value % self._bucket_ns
+        hit = self._cache.get(k, _MISSING)
+        if hit is _MISSING:
+            key = pd.Timestamp(k, tz="UTC")
             sd = assign_session_dates(pd.DatetimeIndex([key]), self.session).iloc[0]
-            self._cache[key] = None if pd.isna(sd) else pd.Timestamp(sd)
+            hit = self._cache[k] = None if pd.isna(sd) else pd.Timestamp(sd)
             if len(self._cache) > self.cache_size:
                 self._cache.popitem(last=False)
-        return self._cache[key]
+        return hit
 
 
 def _on_grid(price: float, tick: float) -> bool:
@@ -178,7 +186,10 @@ class DataHealth:
         self.last_event: dict[str, pd.Timestamp] = {}
         self.fresh_since_problem: dict[str, int] = {r: 0 for r in roots}
         self.problem: dict[str, str] = {r: "no_data_yet" for r in roots}
-        self.history: list[dict[str, Any]] = []
+        # persistent blockers (e.g. not subscribed, provider disconnected): entries stay blocked while
+        # any is set, whatever data arrives; clearing one still requires fresh events afterwards
+        self.blocks: dict[str, set[str]] = {r: set() for r in roots}
+        self.history: collections.deque[dict[str, Any]] = collections.deque(maxlen=5000)
 
     def _set(self, root: str, problem: str, now: pd.Timestamp) -> None:
         if self.problem.get(root) != problem:
@@ -205,7 +216,7 @@ class DataHealth:
             self._set(root, "data_gap", ts)
         if self.problem.get(root):
             self.fresh_since_problem[root] = self.fresh_since_problem.get(root, 0) + 1
-            if self.connected and self.fresh_since_problem[root] >= self.resume_after:
+            if self.connected and not self.blocks.get(root) and self.fresh_since_problem[root] >= self.resume_after:
                 self._set(root, "", ts)
 
     def check_stale(self, now: pd.Timestamp) -> None:
@@ -214,6 +225,18 @@ class DataHealth:
             if last is not None and now - last > self.stale_after and not self.problem.get(r):
                 self.fresh_since_problem[r] = 0
                 self._set(r, "stale", now)
+
+    def block(self, root: str, reason: str, now: pd.Timestamp) -> None:
+        self.blocks.setdefault(root, set()).add(reason)
+        self.fresh_since_problem[root] = 0
+        self._set(root, reason, now)
+
+    def unblock(self, root: str, reason: str, now: pd.Timestamp) -> None:
+        """Remove a blocker. Entries still wait for ``resume_after_events`` fresh events."""
+        if reason in self.blocks.get(root, set()):
+            self.blocks[root].discard(reason)
+            self.fresh_since_problem[root] = 0
+            self._set(root, f"recovering:{reason}", now)
 
     def flag(self, root: str, problem: str, now: pd.Timestamp) -> None:
         """An external data problem (e.g. a price level reset): recovery pending again."""
@@ -228,6 +251,8 @@ class DataHealth:
             return False, "no_market_data"
         if now - last > self.stale_after:
             return False, "market_data_stale"
+        if self.blocks.get(root):
+            return False, f"data_blocked:{sorted(self.blocks[root])[0]}"
         p = self.problem.get(root)
         if p:
             return False, f"data_recovery_pending:{p}"

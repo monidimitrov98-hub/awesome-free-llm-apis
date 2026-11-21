@@ -59,6 +59,10 @@ def parse_args(argv=None):
     p.add_argument("--news-calendar", type=Path, default=None, help="historical calendar (replay mode)")
     p.add_argument("--report", type=Path, default=None)
     p.add_argument("--verify", action="store_true")
+    p.add_argument("--feed", choices=("auto", "bridge"), default="auto",
+                   help="bridge: live market data from the read-only market-data bridge configured in "
+                        "config/marketdata.toml (paper mode only; with --bars the bars are warm-up history only)")
+    p.add_argument("--marketdata-config", type=Path, default=None)
     return p.parse_args(argv)
 
 
@@ -124,7 +128,14 @@ def main(argv=None) -> int:
                 warm[root.upper()], live[root.upper()] = b[(sd < start).to_numpy()], b[(sd >= start).to_numpy()]
             else:
                 live[root.upper()] = b
-        if pcfg.mode == "paper" and not a.realtime_speed:
+        if a.feed == "bridge":
+            if pcfg.mode != "paper":
+                raise ConfigError("--feed bridge needs --mode paper (shadow/paper trading on live data)")
+            from src.marketdata.factory import bridge_feed
+
+            feed = bridge_feed(pcfg.instruments, app.contracts, a.marketdata_config)
+            warm = {**warm, **{r: b for r, b in live.items() if r not in warm}}  # bars = history only
+        elif pcfg.mode == "paper" and not a.realtime_speed:
             feed = UnconfiguredLiveFeed()
         elif a.ticks:
             feed = TickReplayFeed(a.ticks)
@@ -132,7 +143,7 @@ def main(argv=None) -> int:
             if not live:
                 raise ConfigError("no market data: pass --bars ROOT=CSV (or --ticks)")
             feed = BarReplayFeed(live)
-        if a.realtime_speed:
+        if a.realtime_speed and a.feed != "bridge":
             feed = SimulatedRealtimeFeed(feed, lambda: pd.Timestamp.now(tz="UTC"), speed=a.realtime_speed)
         guards, readiness = news_guards(pcfg.mode, pcfg.instruments, ncfg, a.news_calendar)
         journal = Journal(db, create=a.new_account)
@@ -152,7 +163,7 @@ def main(argv=None) -> int:
     if readiness.get("mode") == "operational":
         print(f"NewsGuard readiness: {readiness['verdict']}" +
               ("" if readiness["verdict"] == "OPERATIONAL READY" else " -> new entries will be BLOCKED"))
-    outcome = session.run()
+    outcome = session.run(idle_sleep=0.005 if a.feed == "bridge" else 0.5)  # live data: poll promptly
     rep = paper_report(session)
     print(f"stopped: {outcome}; events {session.seq}; signals {rep['signals']}")
     if rep["trading"]:

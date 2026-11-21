@@ -1,0 +1,5 @@
+# Copy to Documents\FtsBridge\bridge.cfg (next to bridge_secret). Plain key=value lines.
+# port must match [bridge] port in config/marketdata.toml. The host is ALWAYS 127.0.0.1 (not configurable).
+port=50555
+# Exact NinjaTrader contract names, separated by ';' -- must match [instruments] contracts.
+contracts=MES 12-26;MNQ 12-26
