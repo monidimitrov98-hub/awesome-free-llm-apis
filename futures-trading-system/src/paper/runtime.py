@@ -1,0 +1,649 @@
+"""Paper trading runtime: market events -> validation -> health -> execution -> account/risk
+-> bars -> strategy (+ regime gate) -> entry authorization -> paper broker. SIMULATION ONLY.
+
+Data flow per validated event (one SQLite transaction per batch of events):
+
+    feed.poll() --> EventValidator --rejected--> journal "data_rejected"
+                         | ok
+                         v
+                    DataHealth.on_event --> journal "market_event"
+                         v
+    PaperBroker.on_event (working orders vs this event; entry fills re-authorized) --> executions
+                         v
+    PaperAccount.apply (positions, PnL, costs) --> AccountGuard / RiskManager / session checks
+                         |   (flatten: cancel entries + market exits; exits are never blocked)
+                         v
+    BarBuilder (completed 1m bars) --> signal boundary? --> build_frames --> StrategyContext
+                         v
+    strategy.on_bar (wrapped by RegimeGatedStrategy) --> OrderRequests
+                         v
+    EntryAuthorizer (mode, system, data, request, position, NewsGuard, sizing, session,
+                     AccountGuard, RiskManager) --> PaperBroker.submit or rejection record
+
+Recovery: the journal hash chain is verified, the latest snapshot restored (AccountGuard peak,
+locks and breach, RiskManager daily state, positions, orders), executions are reconciled against
+the account; any mismatch blocks new entries. Working ENTRY orders are cancelled at restart,
+protective orders stay working, and new entries stay blocked for the rest of the session in
+which the restart happened (strategy state cannot be verified). No price is restored as live.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from typing import Any, Callable
+
+import pandas as pd
+
+from src.backtest.orders import Fill, OrderEvent, OrderRequest, OrderRole, OrderType, Side
+from src.config import AppConfig, ConfigError
+from src.data.sessions import session_bounds
+from src.paper.account import AccountStateError, PaperAccount
+from src.paper.authorization import EntryAuthorizer
+from src.paper.bars import BarBuilder, build_frames
+from src.paper.broker import FillDecision, PaperBroker
+from src.paper.config import PaperConfig
+from src.paper.events import MarketEvent
+from src.paper.feeds import FeedError, MarketDataFeed
+from src.paper.journal import Journal, JournalError
+from src.paper.orders import Execution, PaperOrder
+from src.paper.validation import DataHealth, EventValidator
+from src.strategy.base import PositionSnapshot, StrategyContext
+from src.strategy.vwap_pullback import VwapTrendPullbackStrategy
+
+RUN_KINDS = ("infrastructure_validation", "replay", "simulated_realtime", "paper")
+
+
+class RecoveryError(RuntimeError):
+    """Persisted state cannot be recovered; trading must not start on it."""
+
+
+def run_kind_for(mode: str, feed: MarketDataFeed) -> str:
+    if mode == "infrastructure_validation":
+        return "infrastructure_validation"
+    if mode == "replay":
+        if feed.kind != "replay":
+            raise ConfigError("replay mode needs a replay feed")
+        return "replay"
+    if feed.kind == "replay":
+        raise ConfigError("paper mode needs a live or simulated real-time feed; use replay mode for replays")
+    return "paper" if feed.kind == "live" else "simulated_realtime"
+
+
+class PaperSession:
+    def __init__(self, pcfg: PaperConfig, app: AppConfig, bt, strat_cfg, regime_cfg, news_guards: dict[str, Any],
+                 feed: MarketDataFeed, journal: Journal, *, warmup: dict[str, pd.DataFrame] | None = None,
+                 clock: Callable[[], pd.Timestamp] | None = None, sleeper: Callable[[float], None] | None = None,
+                 news_readiness: dict[str, Any] | None = None,
+                 strategy_factory: Callable[[str], Any] | None = None) -> None:
+        """``strategy_factory`` exists for TESTS that need deterministic requests to exercise the
+        execution engine; production uses the existing VWAP Trend Pullback strategy."""
+        self.pcfg, self.app, self.bt, self.scfg, self.regime = pcfg, app, bt, strat_cfg, regime_cfg
+        self.feed, self.journal = feed, journal
+        self.run_kind = run_kind_for(pcfg.mode, feed)
+        self.roots = list(pcfg.instruments)
+        missing = [r for r in self.roots if r not in news_guards]
+        if missing:
+            raise ConfigError(f"no NewsGuard for {missing}: entries could not be authorized")
+        self.specs = {r: app.contracts[r] for r in self.roots}
+        self.session = app.session
+        self.clock = clock
+        self._flatten_cache: dict[pd.Timestamp, pd.Timestamp] = {}
+        self.sleeper = sleeper or time.sleep
+        self.validator = EventValidator(self.specs, self.session, max_jump_ticks=pcfg.max_price_jump_ticks)
+        self.health = DataHealth(self.roots, pcfg.stale_after, pcfg.resume_after_events)
+        self.account = PaperAccount(bt, self.specs, self.session)
+        self.broker = PaperBroker(bt, self.specs, participation=pcfg.limit_participation)
+        self.news = news_guards
+        self.news_readiness = news_readiness
+        self.authorizer = EntryAuthorizer(mode=pcfg.mode, bt=bt, specs=self.specs, account=self.account,
+                                          broker=self.broker, news_guards=news_guards, system_state=self.system_state,
+                                          flatten_time=self.flatten_time, allow_reversal=pcfg.allow_reversal)
+        self.strategies, self.inner = {}, {}
+        for r in self.roots:
+            inner = strategy_factory(r) if strategy_factory else VwapTrendPullbackStrategy(strat_cfg,
+                                                                                           self.session.timezone)
+            strat = inner
+            if regime_cfg is not None and regime_cfg.enabled:
+                from src.ai.market_regime.filters import RegimeGatedStrategy
+                from src.ai.market_regime.regime import RegimeEngine
+
+                strat = RegimeGatedStrategy(inner, RegimeEngine(regime_cfg, r), regime_cfg)
+            strat.on_start(self.specs[r])
+            self.strategies[r], self.inner[r] = strat, inner
+        self.builders = {r: BarBuilder(r) for r in self.roots}
+        self._warmup = warmup or {}
+        self.seq = 0
+        self.accepting_entries = True
+        self.reconciliation_ok = True
+        self.persistence_ok = True
+        self.restart_block_session: pd.Timestamp | None = None
+        self.account_session: pd.Timestamp | None = None
+        self.last_event_ts: pd.Timestamp | None = None
+        self.entry_meta: dict[str, dict[str, Any]] = {}
+        self.decisions: list[dict[str, Any]] = []
+        self.signals_seen = 0
+        self._diag_pos = {r: 0 for r in self.roots}
+        self._gate_pos = {r: 0 for r in self.roots}
+        self._events_since_snapshot = 0
+        self.stopped_reason: str | None = None
+        self.clean_shutdown = False
+        self._recover_or_init()
+
+    # ------------------------------------------------------------------ time / state helpers
+    def now(self) -> pd.Timestamp:
+        if self.clock is not None and self.feed.kind != "replay":
+            return self.clock()
+        return self.last_event_ts if self.last_event_ts is not None else pd.Timestamp(0, tz="UTC")
+
+    def flatten_time(self, session_date: pd.Timestamp) -> pd.Timestamp:
+        if session_date not in self._flatten_cache:
+            end = session_bounds([session_date], self.session).iloc[0]["end"]
+            self._flatten_cache[session_date] = end - self.bt.execution.flatten_before_session_end
+        return self._flatten_cache[session_date]
+
+    def session_of(self, ts: pd.Timestamp) -> pd.Timestamp | None:
+        return self.validator.calendar(ts)
+
+    def system_state(self, root: str, ts: pd.Timestamp) -> tuple[bool, str]:
+        if not self.accepting_entries:
+            return False, "shutting_down"
+        if not self.reconciliation_ok:
+            return False, "reconciliation_failed"
+        if not self.persistence_ok:
+            return False, "persistence_unhealthy"
+        sd = self.session_of(ts)
+        if self.restart_block_session is not None and sd == self.restart_block_session:
+            return False, "restart_strategy_state_unverified"
+        ok, why = self.health.healthy(root, ts if self.feed.kind == "replay" else self.now())
+        if not ok:
+            return False, why
+        if not math.isfinite(self.account.equity()):
+            return False, "account_equity_unknown"
+        return True, ""
+
+    def _journal(self, kind: str, payload: dict[str, Any], ts: pd.Timestamp | None = None) -> None:
+        self.journal.append(kind, ts or self.now(), payload)
+
+    # ------------------------------------------------------------------ recovery
+    def state(self) -> dict[str, Any]:
+        return {"account": self.account.state(), "broker": self.broker.state(), "validator": self.validator.state(),
+                "session": {"run_kind": self.run_kind, "seq": self.seq,
+                            "last_event_ts": self.last_event_ts.isoformat() if self.last_event_ts is not None else None,
+                            "account_session": str(self.account_session) if self.account_session is not None else None,
+                            "clean_shutdown": self.clean_shutdown, "entry_meta": self.entry_meta,
+                            "signals_seen": self.signals_seen}}
+
+    def _recover_or_init(self) -> None:
+        n = self.journal.verify()
+        snap = self.journal.latest_snapshot()
+        if n == 0 and snap is None:
+            for r in self.roots:
+                self.builders[r] = BarBuilder(r, self._warmup.get(r))
+            self._journal("session_created", {"run_kind": self.run_kind, "instruments": self.roots,
+                                              "initial_balance": self.account.initial_balance,
+                                              "news_readiness": self.news_readiness}, pd.Timestamp.now(tz="UTC"))
+            self._snapshot(pd.Timestamp.now(tz="UTC"))
+            self.journal.commit()
+            return
+        if snap is None:
+            raise RecoveryError("journal has entries but no snapshot: state cannot be verified")
+        seq, st = snap
+        if seq != self.journal.seq:
+            raise RecoveryError(f"snapshot (journal seq {seq}) does not match the journal end ({self.journal.seq})")
+        try:
+            self.account.restore(st["account"])
+            self.broker.restore(st["broker"])
+            self.validator.restore(st["validator"])
+        except (KeyError, ValueError, TypeError, AccountStateError) as exc:
+            raise RecoveryError(f"stored state invalid: {exc}") from exc
+        s = st["session"]
+        if s["run_kind"] != self.run_kind:
+            raise RecoveryError(f"stored account belongs to a {s['run_kind']} run, not {self.run_kind}")
+        self.seq = int(s["seq"])
+        self.last_event_ts = pd.Timestamp(s["last_event_ts"]) if s["last_event_ts"] else None
+        self.account_session = pd.Timestamp(s["account_session"]) if s["account_session"] else None
+        self.entry_meta, self.signals_seen = dict(s["entry_meta"]), int(s["signals_seen"])
+        was_clean = bool(s["clean_shutdown"])
+        for r in self.roots:
+            hist = self._warmup.get(r)
+            stored = self.journal.bars(r)
+            if hist is not None and len(stored):
+                hist = hist[hist.index < stored.index[0]]
+            base = pd.concat([h for h in (hist, stored) if h is not None and len(h)]) if (
+                hist is not None and len(hist)) or len(stored) else None
+            self.builders[r] = BarBuilder(r, base)
+        problems = self._reconcile()
+        self.reconciliation_ok = not problems
+        self.restart_block_session = self.account_session  # strategy state of that session is not verifiable
+        now = self.last_event_ts or pd.Timestamp.now(tz="UTC")
+        for o in self.broker.working(roles=("entry",)):
+            self.broker.cancel(o.order_id, now, "restart_cancel_pending_entry")
+        self._flush_broker_log()
+        self.clean_shutdown = False
+        self._journal("recovered", {"clean_shutdown_before": was_clean, "reconciliation_problems": problems,
+                                    "journal_entries": n, "restart_block_session": str(self.restart_block_session)},
+                      pd.Timestamp.now(tz="UTC"))
+        self._snapshot(now)
+        self.journal.commit()
+
+    def _reconcile(self) -> list[str]:
+        """Recompute positions and costs from the journal's executions and compare."""
+        from src.backtest.position import Position
+
+        pos = {r: Position(point_value=self.specs[r].point_value) for r in self.roots}
+        gross = comm = 0.0
+        ids = set()
+        per_order: dict[str, int] = {}
+        for e in self.journal.entries("execution"):
+            ex = Execution.from_dict(e["payload"])
+            if ex.root not in pos:
+                return [f"execution {ex.exec_id} for unknown instrument {ex.root}"]
+            gross += pos[ex.root].apply_fill(ex.is_buy, ex.quantity, ex.fill_price)
+            comm += ex.commission
+            ids.add(ex.exec_id)
+            per_order[ex.order_id] = per_order.get(ex.order_id, 0) + ex.quantity
+        problems = []
+        a = self.account
+        for r in self.roots:
+            if pos[r].quantity != a.positions[r].quantity or abs(pos[r].avg_price - a.positions[r].avg_price) > 1e-6:
+                problems.append(f"{r}: position {a.positions[r].quantity}@{a.positions[r].avg_price} != executions "
+                                f"{pos[r].quantity}@{pos[r].avg_price}")
+        if abs(gross - a.realized_gross) > 1e-6 or abs(comm - a.commissions) > 1e-6:
+            problems.append(f"realized {a.realized_gross}/{a.commissions} != executions {gross}/{comm}")
+        if ids != a.applied_exec_ids:
+            problems.append("set of booked executions differs from the journal")
+        for oid, o in self.broker.orders.items():
+            if o.filled_qty != per_order.get(oid, 0):
+                problems.append(f"order {oid}: filled {o.filled_qty} but executions show {per_order.get(oid, 0)}")
+        for r, t in a.open_trades.items():
+            if a.positions[r].quantity == 0:
+                problems.append(f"{r}: open trade record without a position")
+        for r in self.roots:
+            if a.positions[r].quantity != 0 and not self.broker.working(r, ("stop_loss",)):
+                problems.append(f"{r}: open position without a working stop-loss")
+        if a.guard.enabled and a.guard.peak < a.initial_balance - 1e-9:
+            problems.append("drawdown peak below the initial balance")
+        return problems
+
+    def _snapshot(self, ts: pd.Timestamp) -> None:
+        self.journal.set_snapshot(ts, self.state())
+        self._events_since_snapshot = 0
+
+    # ------------------------------------------------------------------ main loop
+    def connect(self) -> bool:
+        for attempt, wait in enumerate([0.0, *self.pcfg.reconnect_backoff][: self.pcfg.reconnect_max_attempts + 1]):
+            if wait:
+                self.sleeper(wait)
+            try:
+                self.feed.connect()
+            except FeedError as exc:
+                self._journal("feed_connect_failed", {"attempt": attempt, "error": str(exc)[:200]})
+                continue
+            self.health.on_connect(self.now())
+            self._journal("feed_connected", {"attempt": attempt, "feed": self.feed.name, "kind": self.feed.kind})
+            return True
+        return False
+
+    def run(self, *, max_batches: int | None = None, idle_sleep: float = 0.5, stop_when_exhausted: bool = True) -> str:
+        if not self.connect():
+            self.shutdown("feed_unavailable")
+            return "feed_unavailable"
+        batches = 0
+        while max_batches is None or batches < max_batches:
+            try:
+                batch = self.feed.poll(1000)
+            except FeedError as exc:
+                self.health.on_disconnect(self.now(), str(exc))
+                self._journal("feed_disconnected", {"error": str(exc)[:200]})
+                self._commit()
+                if not self.connect():
+                    self.shutdown("feed_unavailable")
+                    return "feed_unavailable"
+                continue
+            if not batch:
+                if self.feed.exhausted and stop_when_exhausted:
+                    break
+                now = self.now()
+                self.health.check_stale(now)
+                if self.feed.kind != "replay":  # time passing completes bars even without trades
+                    for r in self.roots:
+                        for minute in self.builders[r].advance(now):
+                            self._bar_completed_by_clock(r, minute, now)
+                    self._commit()
+                self.sleeper(idle_sleep)
+                continue
+            for ev in batch:
+                self.process_event(ev)
+            batches += 1
+            self._commit()
+        self.shutdown("end_of_data" if self.feed.exhausted else "stopped")
+        return self.stopped_reason or "stopped"
+
+    def _commit(self) -> None:
+        self._snapshot(self.now())
+        try:
+            self.journal.commit()
+            if not self.persistence_ok:
+                self.persistence_ok = True
+                self._journal("persistence_recovered", {})
+                self._snapshot(self.now())
+                self.journal.commit()
+        except JournalError as exc:
+            self.persistence_ok = False  # new entries blocked until a commit succeeds
+            self.journal._pending_snapshot = None
+            self.journal.append("persistence_failure", self.now(), {"error": str(exc)[:300]})
+
+    # ------------------------------------------------------------------ per event
+    def process_event(self, ev: MarketEvent) -> None:
+        v = self.validator.check(ev)
+        if not v.ok:
+            self._journal("data_rejected", {"reason": v.reason, **ev.ref()}, ev.ts if ev.ts is not None else None)
+            return
+        self.seq += 1
+        self.last_event_ts = ev.ts if self.last_event_ts is None else max(self.last_event_ts, ev.ts)
+        self.health.on_event(ev.root, ev.ts)
+        self._journal("market_event", {**ev.ref(), "seq": self.seq, "warnings": v.warnings,
+                                       "synthetic": ev.synthetic_from_bars}, ev.ts)
+        sd = v.session_date
+        self._session_rollover(sd, ev.ts)
+        self._mark(ev)
+        execs = self.broker.on_event(ev, self.seq, self.account.position_qty, self._authorize_fill)
+        for ex in execs:
+            self._book(ex, sd)
+        self._flush_broker_log()
+        self._risk_checks(ev, sd)
+        done = self.builders[ev.root].on_trade(ev) if ev.is_trade else self.builders[ev.root].advance(ev.ts)
+        for minute in done:
+            self._bar_completed(ev.root, minute, ev)
+        self._events_since_snapshot += 1
+
+    def _mark(self, ev: MarketEvent) -> None:
+        pos = self.account.position_qty(ev.root)
+        if ev.kind == "quote":
+            px = ev.bid if pos > 0 else ev.ask if pos < 0 else (ev.bid + ev.ask) / 2
+        else:
+            px = ev.last
+        self.account.mark(ev.root, px)
+
+    def _session_rollover(self, sd: pd.Timestamp | None, ts: pd.Timestamp) -> None:
+        if sd is not None and sd != self.account_session:
+            if self.account_session is not None:
+                eq = self.account.equity()
+                if math.isfinite(eq):
+                    self.account.guard.on_session_end(eq, sd)
+                self._journal("session_change", {"from": str(self.account_session), "to": str(sd), "equity": eq}, ts)
+            self.account_session = sd
+
+    def _authorize_fill(self, o: PaperOrder, base: float, qty: int, ev: MarketEvent) -> FillDecision:
+        d, q = self.authorizer.authorize_fill(o, base, qty, ev)
+        self._journal("fill_authorization", {"order_id": o.order_id, "root": o.root, "allowed": d.allowed,
+                                             "reason": d.reason, "stages": d.stages, "event_id": ev.event_id}, ev.ts)
+        if not d.allowed and o.client_id:
+            self.strategies[o.root].on_order_event(OrderEvent(o.client_id, _num(o.order_id), "rejected", ev.ts,
+                                                              "fill", d.reason))
+        return FillDecision(d.allowed, d.reason, q)
+
+    def _book(self, ex: Execution, sd: pd.Timestamp | None) -> None:
+        o = self.broker.orders[ex.order_id]
+        first_fill = o.role == "entry" and o.filled_qty == ex.quantity
+        closed = self.account.apply(ex, sd if o.role != "entry" else (o.session_date or sd),
+                                    self.entry_meta.get(ex.order_id))
+        self._journal("execution", ex.to_dict(), ex.ts)
+        self._journal("account_update", {"exec_id": ex.exec_id, **{k: v for k, v in self.account.summary().items()
+                                                                     if k != "daily_net"}}, ex.ts)
+        if closed:
+            self._journal("trade_closed", closed, ex.ts)
+        self.broker.on_execution(ex, self.account.position_qty(ex.root), ex.ts)
+        strat = self.strategies[ex.root]
+        role = OrderRole(ex.role) if ex.role in OrderRole._value2member_map_ else OrderRole.EXIT
+        strat.on_fill(Fill(_num(ex.order_id), role, ex.is_buy, ex.quantity, ex.fill_price, ex.ts, False, ex.commission,
+                           ex.slippage_cost, True, ex.reference_price))
+        if first_fill and o.client_id:
+            strat.on_order_event(OrderEvent(o.client_id, _num(o.order_id), "filled", ex.ts))
+
+    def _flush_broker_log(self) -> None:
+        for item in self.broker.log:
+            o = self.broker.orders.get(item["order_id"])
+            if item["kind"] in ("cancelled", "expired") and o is not None and o.role == "entry" and o.client_id \
+                    and o.filled_qty == 0:
+                self.strategies[o.root].on_order_event(OrderEvent(o.client_id, _num(o.order_id), "cancelled",
+                                                                  pd.Timestamp(item["time"]), "pending", o.reason))
+            self._journal("order_" + item["kind"], item, pd.Timestamp(item["time"]))
+        self.broker.log.clear()
+
+    # ------------------------------------------------------------------ protection
+    def _risk_checks(self, ev: MarketEvent, sd: pd.Timestamp | None) -> None:
+        a = self.account
+        eq = a.equity()
+        a.update_drawdown()
+        any_pos = any(a.position_qty(r) != 0 for r in self.roots)
+        reason = None
+        if math.isfinite(eq) and a.guard.enabled:
+            a.guard.observe_intraday(eq, favorable=False)
+            state = a.guard.evaluate(eq, ev.ts, sd, position_open=any_pos)
+            if state:
+                self._journal("account_guard", {"state": state, "equity": eq, "floor": a.guard.floor}, ev.ts)
+                reason = "account_protection"
+        if a.risk.emergency_active:
+            reason = reason or "emergency_stop"
+        if sd is not None and a.risk.config.tracks_unrealized_loss and any_pos and math.isfinite(eq):
+            open_pnl = a.unrealized() - sum(t.commission for t in a.open_trades.values())  # entry costs paid
+            if a.risk.check_daily_loss(sd, open_pnl) and a.risk.config.daily_loss_action == "flatten":
+                reason = reason or "daily_loss_limit"
+        if reason:
+            self.flatten_all(reason, ev.ts)
+        # session end: cancel entries and flatten before the session closes
+        for r in self.roots:
+            osd = None
+            open_t = a.open_trades.get(r)
+            if open_t is not None:
+                osd = open_t.session_date
+            if (sd is not None and ev.ts >= self.flatten_time(sd)) or (osd is not None and sd is not None and sd != osd):
+                for o in self.broker.working(r, ("entry",)):
+                    self.broker.cancel(o.order_id, ev.ts, "session_end")
+                if a.position_qty(r) != 0:
+                    self.flatten(r, "session_end", ev.ts)
+        self._flush_broker_log()
+
+    def flatten(self, root: str, reason: str, ts: pd.Timestamp) -> None:
+        """Market exit for one instrument (protective: never authorization-gated)."""
+        qty = self.account.position_qty(root)
+        if qty == 0 or self.broker.working(root, ("exit",)):
+            return
+        for o in self.broker.working(root, ("entry", "stop_loss", "take_profit")):
+            self.broker.cancel(o.order_id, ts, reason)
+        o = PaperOrder(self.broker.new_id("E"), root, "exit", "market", qty < 0, abs(qty), ts, self.seq, tag=reason,
+                       session_date=self.session_of(ts))
+        self.broker.submit(o, ts)
+        self._journal("flatten_requested", {"root": root, "reason": reason, "quantity": abs(qty),
+                                            "note": "simulated exit; a real market exit can fill worse"}, ts)
+
+    def flatten_all(self, reason: str, ts: pd.Timestamp) -> None:
+        for r in self.roots:
+            for o in self.broker.working(r, ("entry",)):
+                self.broker.cancel(o.order_id, ts, reason)
+            self.flatten(r, reason, ts)
+
+    # ------------------------------------------------------------------ signals
+    def _bar_completed(self, root: str, minute: pd.Timestamp, ev: MarketEvent) -> None:
+        b = self.builders[root]
+        self.journal.add_bar(root, minute, tuple(float(x) for x in b._rows[-1]))
+        end = minute + pd.Timedelta(minutes=1)
+        tf = pd.Timedelta(self.scfg.signal_timeframe)
+        if (end - end.normalize()) % tf != pd.Timedelta(0):
+            return
+        self._signal(root, end, ev)
+
+    def _bar_completed_by_clock(self, root: str, minute: pd.Timestamp, now: pd.Timestamp) -> None:
+        """A minute completed because the clock passed its end (no later trade). The decision uses
+        the clock time; any order still fills only on a later real market event."""
+        from src.paper.events import MarketEvent as _E
+
+        self._bar_completed(root, minute, _E(f"clock-{now.isoformat()}", root, "clock", now, source="clock"))
+
+    def _signal(self, root: str, boundary: pd.Timestamp, ev: MarketEvent) -> None:
+        signal, context = build_frames(self.builders[root].frame(), self.app, self.scfg, self.regime)
+        avail = pd.DatetimeIndex(signal["available_at"])
+        hits = (avail == boundary).nonzero()[0]
+        if not len(hits):
+            return
+        k = int(hits[0])
+        bar = signal.iloc[k]
+        sd = bar["session_date"] if pd.notna(bar["session_date"]) else None
+        if not bool(bar["is_complete"]):
+            self._journal("signal_bar_skipped", {"root": root, "bar_time": str(signal.index[k]),
+                                                 "reason": "incomplete_signal_bar"}, ev.ts)
+            return
+        ctx_frames = {}
+        for name, f in context.items():
+            a = pd.DatetimeIndex(f["available_at"])
+            ctx_frames[name] = f.iloc[: int(a.searchsorted(boundary, side="right"))]
+        pos = self.account.positions[root]
+        snap = PositionSnapshot(None if pos.is_flat else (Side.LONG if pos.quantity > 0 else Side.SHORT),
+                                abs(pos.quantity), pos.avg_price,
+                                pos.unrealized_pnl(self.account.marks.get(root, pos.avg_price)) if not pos.is_flat else 0.0)
+        ctx = StrategyContext(now=boundary, bar=bar, history=signal.iloc[: k + 1], bar_is_complete=True,
+                              session_date=sd, position=snap,
+                              has_pending_entry=bool(self.broker.working(root, ("entry",))),
+                              contract=self.specs[root], context=ctx_frames)
+        strat = self.strategies[root]
+        requests = list(strat.on_bar(ctx) or [])
+        inner = self.inner[root]
+        for row in getattr(inner, "diagnostics", [])[self._diag_pos[root]:]:
+            if row.get("decision") == "signal":
+                self.signals_seen += 1
+            self._journal("strategy_decision", {"root": root, **{k2: _jsonable(v) for k2, v in row.items()}}, ev.ts)
+        self._diag_pos[root] = len(getattr(inner, "diagnostics", []))
+        gate_records = []
+        if hasattr(strat, "decisions"):
+            gate_records = strat.decisions[self._gate_pos[root]:]
+            for rec in gate_records:
+                self._journal("regime_decision", {"root": root, **{k2: _jsonable(v) for k2, v in rec.items()}}, ev.ts)
+            self._gate_pos[root] = len(strat.decisions)
+            for rec in gate_records:
+                if not rec.get("allowed"):
+                    self._record_decision(root, ev.ts, rec.get("signal_id"), rec.get("side"), False,
+                                          f"regime_{str(rec.get('suitability')).lower()}",
+                                          [{"stage": "regime", "ok": False, "reason": rec.get("block_reason")}], rec)
+        regime_by_signal = {rec.get("signal_id"): rec for rec in gate_records}
+        entry_seen = False
+        for req in requests:
+            if req.action == "exit":
+                self.flatten(root, req.tag or "strategy_exit", ev.ts)
+                continue
+            if req.action == "cancel_entry":
+                for o in self.broker.working(root, ("entry",)):
+                    self.broker.cancel(o.order_id, ev.ts, "cancelled_by_strategy")
+                continue
+            if req.action != "entry":
+                continue
+            if entry_seen:
+                self._reject_request(root, req, ev.ts, "duplicate_signal", [], None)
+                continue
+            entry_seen = True
+            self._entry(root, req, ev, sd, float(bar["close"]), regime_by_signal.get(req.client_id))
+        self._flush_broker_log()
+
+    def _record_decision(self, root, ts, signal_id, side, allowed, reason, stages, regime_rec) -> None:
+        rec = {"time": ts.isoformat(), "root": root, "signal_id": signal_id, "side": side, "allowed": allowed,
+               "reason": reason, "stages": stages, "run_kind": self.run_kind,
+               "regime": None if regime_rec is None else {k: _jsonable(regime_rec.get(k)) for k in (
+                   "trend", "suitability", "confidence_level", "volatility", "range")}}
+        self.decisions.append(rec)
+        self._journal("entry_decision", rec, ts)
+
+    def _reject_request(self, root, req: OrderRequest, ts, reason, stages, regime_rec) -> None:
+        self._record_decision(root, ts, req.client_id, req.side.value if req.side else None, False, reason, stages,
+                              regime_rec)
+        if req.client_id:
+            self.strategies[root].on_order_event(OrderEvent(req.client_id, None, "rejected", ts, "authorization",
+                                                            reason))
+
+    def _entry(self, root: str, req: OrderRequest, ev: MarketEvent, sd, ref_close: float, regime_rec) -> None:
+        d, info = self.authorizer.authorize_signal(req, root, ev.ts, sd, ref_close)
+        if not d.allowed:
+            self._reject_request(root, req, ev.ts, d.reason, d.stages, regime_rec)
+            return
+        if info.get("reverse_first"):
+            self.flatten(root, "reversal", ev.ts)
+        otype = req.order_type.value
+        expire = ev.ts + self.bt.execution.max_fill_delay if req.order_type is OrderType.MARKET else self.flatten_time(sd)
+        o = PaperOrder(self.broker.new_id("N"), root, "entry", otype, req.side is Side.LONG, info["quantity"], ev.ts,
+                       self.seq, limit_price=info["price"] if otype == "limit" else None,
+                       stop_price=info["price"] if otype == "stop" else None, expire_at=expire, client_id=req.client_id,
+                       tag=req.tag, stop_loss=info["stop"], take_profit=info["target"],
+                       reference_price=info["reference"], max_stop_distance=req.max_stop_distance,
+                       min_stop_distance=req.min_stop_distance, min_reward_risk=req.min_reward_risk,
+                       risk_budget=info["risk_budget"], session_date=sd, signal_time=ev.ts)
+        self.broker.submit(o, ev.ts)
+        self.entry_meta[o.order_id] = {"stop_loss": info["stop"], "signal_id": req.client_id,
+                                       "context": {k: _jsonable((regime_rec or {}).get(k)) for k in (
+                                           "trend", "suitability", "confidence_level")}}
+        self._record_decision(root, ev.ts, req.client_id, req.side.value, True, "", d.stages, regime_rec)
+        if req.client_id:
+            self.strategies[root].on_order_event(OrderEvent(req.client_id, _num(o.order_id), "accepted", ev.ts,
+                                                            "signal"))
+
+    # ------------------------------------------------------------------ shutdown
+    def shutdown(self, reason: str) -> None:
+        """Safe shutdown: no new entries, pending entries cancelled, positions either kept with their
+        protective orders (default) or flattened on the next available market event, state persisted."""
+        self.accepting_entries = False
+        ts = self.now()
+        for o in self.broker.working(roles=("entry",)):
+            self.broker.cancel(o.order_id, ts, f"shutdown:{reason}")
+        open_pos = {r: self.account.position_qty(r) for r in self.roots if self.account.position_qty(r)}
+        if self.pcfg.shutdown_policy == "flatten" and open_pos and self.feed.connected:
+            self.flatten_all("shutdown", ts)
+            for _ in range(50):  # only real (feed) prices can fill the exits -- never a fabricated price
+                try:
+                    batch = self.feed.poll(100)
+                except FeedError:
+                    break
+                if not batch:
+                    break
+                for ev in batch:
+                    self.process_event(ev)
+                if not any(self.account.position_qty(r) for r in self.roots):
+                    break
+        self._flush_broker_log()
+        remaining = {r: self.account.position_qty(r) for r in self.roots if self.account.position_qty(r)}
+        self.stopped_reason = reason
+        self.clean_shutdown = True
+        self._journal("shutdown", {"reason": reason, "policy": self.pcfg.shutdown_policy,
+                                   "open_positions_at_shutdown": remaining,
+                                   "working_protective_orders": [o.order_id for o in self.broker.working()]}, ts)
+        self._commit()
+        try:
+            self.feed.disconnect()
+        except FeedError:
+            pass
+
+    def emergency_stop(self, reason: str) -> None:
+        """Operator emergency: block entries and flatten on the next market events."""
+        self.account.risk.activate_emergency_stop(reason)
+        self._journal("emergency_stop", {"reason": reason}, self.now())
+        self.flatten_all("emergency_stop", self.now())
+        self._flush_broker_log()
+        self._commit()
+
+
+def _num(order_id: str) -> int:
+    digits = "".join(ch for ch in order_id if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _jsonable(v: Any) -> Any:
+    if isinstance(v, pd.Timestamp):
+        return v.isoformat()
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except (ValueError, AttributeError):
+            return str(v)
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    return str(v)

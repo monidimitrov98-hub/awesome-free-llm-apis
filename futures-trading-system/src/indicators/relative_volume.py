@@ -62,10 +62,11 @@ def relative_volume_time_of_day(
     if not volume.index.is_monotonic_increasing:
         raise ValueError("volume index must be sorted ascending")
     tod = time_of_day_seconds(volume.index, timezone).to_numpy()
-    frame = pd.DataFrame({"v": v, "tod": tod})
+    # one vectorized grouped rolling mean (bitwise identical to a per-group shift+rolling, much faster)
+    s = pd.Series(v)
+    shifted = s.groupby(tod, sort=False).shift(1)
     baseline = (
-        frame.groupby("tod", sort=False)["v"]
-        .transform(lambda s: s.shift(1).rolling(lookback, min_periods=min_periods).mean())
-        .to_numpy()
+        shifted.groupby(tod, sort=False).rolling(lookback, min_periods=min_periods).mean()
+        .reset_index(level=0, drop=True).sort_index().to_numpy()
     )
     return pd.Series(_ratio(v, baseline), index=volume.index, name="rvol")

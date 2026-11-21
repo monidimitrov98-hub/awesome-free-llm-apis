@@ -1205,6 +1205,31 @@ is an invented calendar for the synthetic sample prices. It only exercises the c
 protection against unscheduled news is only as good as a tested live source, and none is
 verified yet.
 
+## Sprint 5: Paper trading infrastructure (simulation only)
+
+`src/paper/` runs the existing strategy, regime gate, NewsGuard, AccountGuard and RiskManager
+on market events. Fills are simulated with bid/ask, slippage, commissions, trade-through limits
+and partial fills, OCO brackets and a full order lifecycle. Everything is recorded in a
+hash-chained SQLite journal with atomic snapshots, and the state is reconciled on restart.
+**No code path can send a real order; there is no broker or NinjaTrader connection.** See
+`docs/sprint5_paper_trading.md` for the architecture, data flow, authorization sequence, fill
+rules, recovery design and limitations.
+
+```
+python run_paper.py --new-account --mode infrastructure_validation --bars MNQ=data/samples/SYNTHETIC_MNQ_1m.csv --replay-start 2025-03-18
+python run_paper.py --new-account --mode replay --bars MES=... MNQ=... --replay-start 2025-03-17 --news-calendar data/samples/SYNTHETIC_news_calendar.json --report output/paper/report.json
+python run_paper.py --verify
+```
+
+- **Modes.** `infrastructure_validation` never authorizes entries. `replay` uses historical
+  data and the research NewsGuard. `paper` uses the operational NewsGuard and needs a live or
+  simulated real-time feed; there is no live provider yet.
+- **NewsGuard.** While the manual calendar is unresolved, the operational NewsGuard blocks every
+  paper entry.
+- **Reports.** They are separated by run kind and never mix rejected opportunities or
+  infrastructure runs into trading statistics.
+- **Results.** Nothing here is evidence of profitability or readiness for funded trading.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.
@@ -1287,3 +1312,7 @@ verified yet.
     blocked (fail closed). Schedule changes published after the fact cannot be
     reconstructed unless their `known_at` was recorded.
   - The windows are starting values. Nothing shows that the filter improves results.
+- **Paper trading:** there is no live market data provider (interface only). Bar replay uses an
+  approximate intrabar trade path without quotes, and paper fills happen on the next event
+  rather than the next bar open. Strategy memory is not persisted, so entries are blocked for
+  the rest of a session after a restart. See `docs/sprint5_paper_trading.md`.

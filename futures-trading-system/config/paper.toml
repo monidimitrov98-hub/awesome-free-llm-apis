@@ -1,0 +1,26 @@
+# Paper trading (Sprint 5). SIMULATION ONLY: nothing here can send an order to a broker.
+# Costs, slippage, sizing, risk limits and account protection come from config/backtest.toml
+# (and its account profile) -- the same rules as backtests; this file cannot override them.
+
+[paper]
+mode = "infrastructure_validation"   # "infrastructure_validation" | "replay" | "paper"
+instruments = ["MES", "MNQ"]
+state_dir = "data/paper"              # SQLite journal + snapshots (gitignored)
+allow_reversal = false                # an opposite entry while a position is open is rejected
+
+[data]
+stale_after_seconds = 180             # no valid event for this long (in session) = stale
+resume_after_events = 3               # fresh valid events needed after a disconnect/stale period
+reconnect_max_attempts = 5
+reconnect_backoff_seconds = [1, 2, 5, 10, 30]
+max_price_jump_ticks = 400            # larger jumps between consecutive events are rejected
+warmup_sessions = 25                  # completed sessions of history used for indicators
+
+[execution]
+limit_participation = 1.0             # share of trade-through volume a resting limit may take (0..1]
+
+[persistence]
+snapshot_every_events = 2000          # plus after every execution and at every safe shutdown
+
+[shutdown]
+policy = "keep_protected"             # "keep_protected" (positions keep their stop/target) | "flatten"
