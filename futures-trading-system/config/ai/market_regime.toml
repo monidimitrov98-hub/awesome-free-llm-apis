@@ -1,0 +1,102 @@
+# AI Market Regime Analysis Engine (Sprint 4).
+#
+# The regime engine is ADVISORY. It can only BLOCK entries produced by the deterministic
+# strategy; it can never create, enlarge or modify orders. The risk engine and AccountGuard
+# (config/backtest.toml + account profile) keep final authority and cannot be configured here:
+# unknown sections or keys are rejected.
+#
+# ALL THRESHOLDS ARE UNVALIDATED RESEARCH HYPOTHESES (documented starting points, not
+# optimised values). Judge any change with run_regime_validation.py on chronological,
+# out-of-sample data. Distances are in multiples of ATR of the same timeframe.
+
+[regime]
+enabled = true
+model_version = "regime-rules-0.1"
+classifier = "rules"            # "rules" (Layer 1) | "ml" (Layer 2 artifact, see [ml])
+# How suitability is enforced on the strategy's entries:
+#   "observe"            record only, never block
+#   "block_no_trade"     block NO_TRADE
+#   "block_unfavorable"  block NO_TRADE and UNFAVORABLE (default)
+#   "require_favorable"  allow only FAVORABLE
+enforcement = "block_unfavorable"
+signal_timeframe = "5min"
+context_timeframe = "15min"     # "" disables the higher-timeframe regime
+fast_timeframe = "1min"         # "" disables the 1-minute volatility-shock feature
+calibration_path = ""           # JSON written by run_regime_validation.py; "" = uncalibrated (treated as LOW)
+ml_model_path = ""              # model artifact (.pkl + .json identity) when classifier = "ml"
+
+[features]
+efficiency_window = 12          # bars for the efficiency ratio |net move| / path length
+range_window = 24               # bars for range width and breakout reference
+slope_bars = 3                  # EMA-slow slope lookback
+# Volatility percentile reference. "time_of_day": the current ATR vs the ATR at the same
+# local time in previous sessions (handles the strong intraday seasonality: RTH >> overnight).
+# "rolling": vs the previous atr_history bars (mixes overnight and RTH; biased at the open).
+volatility_reference = "time_of_day"
+atr_history_sessions = 60
+atr_history_sessions_min = 5    # earlier sessions needed before volatility can be classified
+atr_history = 200               # rolling mode: bars of ATR history
+atr_history_min = 60            # rolling mode: minimum history
+atr_ratio_window = 48           # ATR / mean(previous ATR) for expansion / contraction
+failed_break_bars = 3           # a break that reverses within this many bars is "failed"
+body_window = 12                # bars for average candle body / wick proportions
+swing_left = 2
+swing_right = 2                 # confirmed pivots only (non-repainting)
+shock_window = 5                # 1-minute bars for the volatility-shock ratio
+
+[classification]
+strong_trend_spread_atr = 0.75  # |EMA9 - EMA21| / ATR
+moderate_trend_spread_atr = 0.30
+strong_trend_efficiency = 0.50
+trend_efficiency = 0.30
+chop_efficiency = 0.20
+chop_direction_changes = 0.60   # share of bar-to-bar direction changes
+tight_range_atr = 3.0           # range width over range_window, in ATR
+wide_range_atr = 8.0
+vol_very_low_pct = 0.10         # ATR percentile vs atr_history
+vol_high_pct = 0.80
+vol_extreme_pct = 0.97
+expansion_ratio = 1.5           # ATR / mean(previous ATR)
+contraction_ratio = 0.70
+transition_rvol = 1.5           # breakout from compression with RVOL >= this = possible transition
+
+[confidence]
+high = 0.65                     # calibrated probability for HIGH
+medium = 0.50                   # calibrated probability for MEDIUM (else LOW)
+min_bin_samples = 30            # calibration bins with fewer samples count as LOW
+
+[suitability]
+max_vwap_distance_atr = 2.0
+block_extreme_volatility = true
+shock_ratio_no_trade = 3.0      # 1m true range / 1m ATR over the last shock_window bars
+expansion_unfavorable_ratio = 2.0
+max_recent_stopouts = 2         # stop-loss exits within the window -> NO_TRADE
+stopout_window_minutes = 60
+require_context_alignment = true
+min_confidence_for_favorable = "MEDIUM"   # "HIGH" | "MEDIUM" | "LOW"
+
+[staleness]
+max_context_staleness_minutes = 15
+max_fast_staleness_minutes = 2
+
+[labels]                        # forward-looking labels: VALIDATION/TRAINING ONLY, never features
+horizon_bars = 12               # 12 x 5m = 1 hour
+trend_efficiency = 0.40
+trend_move_atr = 1.0
+
+[ml]
+model = "hist_gradient_boosting"  # "hist_gradient_boosting" | "random_forest"
+random_state = 7
+max_depth = 4
+n_estimators = 200
+learning_rate = 0.05
+min_train_samples = 500
+
+[validation]
+purge_bars = 12                 # >= labels.horizon_bars (label horizon overlap)
+embargo_bars = 12
+train_sessions = 20
+test_sessions = 5
+
+[diagnostics]
+max_transitions = 20

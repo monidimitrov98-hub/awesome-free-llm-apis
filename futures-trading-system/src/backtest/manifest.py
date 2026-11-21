@@ -131,16 +131,37 @@ def config_hash(config_texts: dict[str, str]) -> str:
     return text_sha256(json.dumps(config_texts, sort_keys=True))
 
 
-def read_config_texts(settings_path: Path, backtest_path: Path, strategy_path: Path) -> dict[str, str]:
+def read_config_texts(settings_path: Path, backtest_path: Path, strategy_path: Path,
+                      regime_path: Path | None = None) -> dict[str, str]:
     texts = {"settings": settings_path.read_text(encoding="utf-8"),
              "backtest": backtest_path.read_text(encoding="utf-8"),
              "strategy": strategy_path.read_text(encoding="utf-8")}
+    if regime_path is not None and Path(regime_path).is_file():
+        texts["regime"] = Path(regime_path).read_text(encoding="utf-8")
+        texts["regime_artifacts"] = json.dumps(regime_artifact_hashes(regime_path), sort_keys=True)
     m = re.search(r'^\s*protection_profile\s*=\s*"([^"]*)"', texts["backtest"], flags=re.M)
     if m and m.group(1).strip():
         prof = Path(m.group(1))
         prof = prof if prof.is_absolute() else PROJECT_ROOT / prof
         texts["account_profile"] = prof.read_text(encoding="utf-8")
     return texts
+
+
+def regime_artifact_hashes(regime_path: str | Path) -> dict[str, str]:
+    """SHA-256 of the calibration / model files a regime config refers to (they are part of
+    the configuration identity: changing them changes the validation fingerprint)."""
+    import tomllib
+
+    raw = tomllib.loads(Path(regime_path).read_text(encoding="utf-8")).get("regime", {})
+    out = {}
+    for key in ("calibration_path", "ml_model_path"):
+        value = str(raw.get(key, "") or "").strip()
+        if value:
+            p = Path(value) if Path(value).is_absolute() else PROJECT_ROOT / value
+            if not p.is_file():
+                raise ConfigError(f"regime {key} {p} not found")
+            out[key] = file_sha256(p)
+    return out
 
 
 def build_manifest(**kw: Any) -> dict[str, Any]:
@@ -184,6 +205,7 @@ def build_manifest(**kw: Any) -> dict[str, Any]:
             "stops/limits per src/backtest/execution.py; same-bar stop/target ambiguity resolved worst case",
         },
         "account_rules": snapshot(bt.account_rules),
+        "regime": kw.get("regime_info"),
         "config_texts": kw["config_texts"],
         "config_hash": config_hash(kw["config_texts"]),
         "git": git_info(),
@@ -257,13 +279,21 @@ def replay(manifest_path: str | Path, csv_override: str | Path | None = None) ->
                                    lambda mm: f'{mm.group(1)}"{(d / "account.toml").as_posix()}"',
                                    backtest_text, flags=re.M)
         (d / "backtest.toml").write_text(backtest_text, encoding="utf-8")
+        regime_cfg = None
+        if "regime" in texts:
+            from src.ai.market_regime.config import load_regime_config
+
+            (d / "regime.toml").write_text(texts["regime"], encoding="utf-8")
+            if regime_artifact_hashes(d / "regime.toml") != json.loads(texts.get("regime_artifacts", "{}")):
+                raise ConfigError("regime calibration/model artifacts changed since the manifest was written")
+            regime_cfg = load_regime_config(d / "regime.toml")
         app = load_config(d / "settings.toml")
         bt = load_backtest_config(d / "backtest.toml")
         strat = load_strategy_config(d / "strategy.toml").with_r_multiple(m["strategy"]["target"]["r_multiple"])
     md = build_market_data(csv, app)
     p = m["period"]
     period = Period(p["label"], p["kind"], parse_date(p["start"]), parse_date(p["end"]), p["fold"])
-    run = run_strategy(md, app, bt, strat, label=m["label"], period=period)
+    run = run_strategy(md, app, bt, strat, label=m["label"], period=period, regime=regime_cfg)
     actual = results_fingerprint(run.result.trades, run.result.equity)
     expected = m["results"]["fingerprint"]
     env_then, env_now = m.get("environment", {}), environment_info()

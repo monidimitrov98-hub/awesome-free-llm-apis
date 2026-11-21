@@ -1,1 +1,1 @@
-"""Placeholder for a later sprint. Intentionally empty in Sprint 1."""
+"""AI modules. Advisory only: they can never place, size or approve orders."""

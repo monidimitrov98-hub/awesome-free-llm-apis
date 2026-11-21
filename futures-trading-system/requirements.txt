@@ -1,6 +1,7 @@
-# Sprint 1 runtime + test dependencies.
-# plotly, streamlit, scikit-learn (and SQLite usage) arrive in later sprints.
+# Runtime + test dependencies.
+# scikit-learn: Sprint 4 regime models (Layer 2). plotly / streamlit arrive with the dashboard.
 pandas>=2.2,<4
 numpy>=1.26
 tzdata>=2024.1   # IANA timezone database; required on Windows
+scikit-learn>=1.4
 pytest>=8.0

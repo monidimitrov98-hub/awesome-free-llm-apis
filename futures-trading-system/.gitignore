@@ -8,3 +8,4 @@ config/*.local.toml
 data/*
 !data/samples/
 validation_history/
+models/

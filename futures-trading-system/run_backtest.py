@@ -57,6 +57,8 @@ from src.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
 from src.data.errors import DataError, DataValidationError
 from src.pipeline import build_market_data
 from src.strategy.vwap_pullback_config import DEFAULT_STRATEGY_CONFIG_PATH, load_strategy_config
+from src.ai.market_regime.config import DEFAULT_REGIME_CONFIG_PATH, load_regime_config
+from src.ai.market_regime.identity import instrument_key
 
 DISCLAIMER = ("No result here is evidence of profitability. In-sample results are descriptive only; "
               "judge the strategy on untouched out-of-sample data.")
@@ -70,6 +72,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--settings", type=Path, default=DEFAULT_CONFIG_PATH, help="data config")
     p.add_argument("--backtest-config", type=Path, default=DEFAULT_BACKTEST_CONFIG_PATH)
     p.add_argument("--strategy-config", type=Path, default=DEFAULT_STRATEGY_CONFIG_PATH)
+    p.add_argument("--regime-config", type=Path, default=DEFAULT_REGIME_CONFIG_PATH,
+                   help="AI market regime config (advisory gate; its [regime] enabled flag switches it)")
     p.add_argument("--r-multiples", type=float, nargs="+", default=None,
                    help="in-sample only: one run per take-profit R (side by side, never ranked)")
     p.add_argument("--output-dir", type=Path, default=Path("output"))
@@ -147,7 +151,9 @@ def main(argv: list[str] | None = None) -> int:
         app = load_config(args.settings)
         bt = load_backtest_config(args.backtest_config)
         strat = load_strategy_config(args.strategy_config)
-        texts = read_config_texts(Path(args.settings), Path(args.backtest_config), Path(args.strategy_config))
+        regime = load_regime_config(args.regime_config)
+        texts = read_config_texts(Path(args.settings), Path(args.backtest_config), Path(args.strategy_config),
+                                  Path(args.regime_config))
         md = build_market_data(args.csv, app)
         data_hash = file_sha256(args.csv)
         code = code_identity()
@@ -189,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
           f"account protection: {bt.account_rules.profile if bt.account_rules.enabled else 'disabled'}; "
           f"code {'trusted' if code['trusted'] else 'UNTRUSTED (' + ', '.join(code['untrusted_reasons']) + ')'}")
     command_line = sys.argv if argv is None else ["run_backtest.py", *argv]
-    root = md.contract.root
+    root = instrument_key(md.contract.root, md.is_synthetic)
+    print(f"Regime engine: {'enabled (' + regime.enforcement + ', ' + regime.model_version + ')' if regime.enabled else 'disabled'}")
     for period in periods:
         if period.is_out_of_sample and not args.reveal_oos:
             print(f"\n=== {period.label} {period.to_dict()['start']}..{period.to_dict()['end']}: SEALED "
@@ -221,7 +228,8 @@ def main(argv: list[str] | None = None) -> int:
                                      "reuse_acknowledged": bool(conflicts)})
                 oos = {"revealed": True, "ledger_seq": rec["seq"], "reuse_acknowledged": bool(conflicts)}
             try:
-                run = run_strategy(md, app, bt, cfg, period=None if period.kind == "full" else period)
+                run = run_strategy(md, app, bt, cfg, period=None if period.kind == "full" else period,
+                                   regime=regime)
             except ConfigError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
@@ -232,7 +240,11 @@ def main(argv: list[str] | None = None) -> int:
             out = args.output_dir if period.kind == "full" else args.output_dir / period.label
             folder = write_outputs(run, md, app, bt, out, manifest={
                 "csv_path": args.csv, "data_sha256": data_hash, "config_texts": texts, "code": code,
-                "validation": validation, "command_line": command_line, "oos": oos})
+                "validation": validation, "command_line": command_line, "oos": oos,
+                "regime_info": None if run.regime is None else {
+                    "model_version": regime.model_version, "enforcement": regime.enforcement,
+                    "artifacts": run.regime["artifacts"], "errors": run.regime["errors"],
+                    "gate": run.regime["performance"].get("gate")}})
             runs.append(run)
             d = run.diagnostics
             print(f"\n=== {period.label} [{period.to_dict()['start'] or 'start'}..{period.to_dict()['end'] or 'end'}]"
@@ -243,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
                 print("  submitted signals by engine outcome:", run.signals["status"].value_counts().to_dict())
             if not run.result.rejections.empty:
                 print("  engine/risk rejections:", run.result.rejections["reason"].value_counts().to_dict())
+            if run.regime is not None and not run.regime["decisions"].empty:
+                dec = run.regime["decisions"]
+                print("  regime gate:", dec["suitability"].value_counts().to_dict(),
+                      f"blocked {int((~dec['allowed'].astype(bool)).sum())}/{len(dec)}")
             acct = run.result.account
             if acct.get("enabled"):
                 print(f"  account: floor {acct['final_floor']:.2f}, min buffer {acct['min_remaining_buffer']:.2f}, "

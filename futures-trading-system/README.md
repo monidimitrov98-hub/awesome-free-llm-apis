@@ -827,6 +827,92 @@ These are estimates. A bar-based backtest cannot guarantee real-world fill price
 reserve covers every gap. Whenever simulated equity reaches or falls below the floor, including
 through gaps or a final forced exit, it is recorded as a breach.
 
+## Sprint 4: AI market regime analysis
+
+The regime engine describes the market at each strategy decision and decides whether the
+VWAP Trend Pullback strategy is suitable *right now*. It is an **advisory gate**: it can only
+block entries. It never creates, enlarges, re-prices or re-sizes an order. It never touches
+exits, and it cannot reach the risk manager or AccountGuard. Every entry it lets through still
+passes every engine, risk and account check.
+
+### Architecture (`src/ai/market_regime/`)
+
+| Module | Role |
+| --- | --- |
+| `config.py` | Loads `config/ai/market_regime.toml`, rejects unknown sections/keys (no account or risk settings can live there) |
+| `features.py` | Causal `rf_*` features per completed bar (trend, range, volatility, candles, structure) |
+| `labels.py` | Forward labels for **training and validation only** (never features) |
+| `classifier.py` | Layer 1: transparent rules (trend, range, volatility, structure) |
+| `ml.py` | Layer 2: scikit-learn HistGradientBoosting (default) or RandomForest, with integrity-checked artifacts |
+| `confidence.py` | Binned calibration of the predicted class on history, mapped to HIGH / MEDIUM / LOW / INSUFFICIENT |
+| `suitability.py` | FAVORABLE / NEUTRAL / UNFAVORABLE / NO_TRADE for a long or short entry |
+| `regime.py` | `RegimeEngine`: one snapshot per decision, from the strategy context only, with staleness checks |
+| `filters.py` | `RegimeGatedStrategy`: wraps the strategy and removes blocked entries (fail closed) |
+| `explain.py` | Layer 3: template explanation, optional LLM wrapper with fallback (text only) |
+| `diagnostics.py`, `performance.py` | Dashboard JSON, per-trade regime records, per-regime statistics with sample-size warnings |
+| `validation.py`, `identity.py`, `synthetic.py` | Walk-forward validation, model fingerprint, synthetic data with ground truth |
+
+### Regimes
+
+- **Trend:** strong / moderate bullish or bearish, weak or deteriorating, none. The evidence
+  is the EMA spread and EMA slope in ATR, the efficiency ratio, the side of VWAP and the
+  swing structure.
+- **Range:** tight consolidation, wide range, choppy, failed breakout, range-to-trend.
+- **Volatility:** very low / normal / high / extreme, plus expansion / contraction. The ATR
+  percentile is measured against the **same time of day in earlier sessions**, so the quiet
+  overnight hours are not compared with the cash open. "Extreme" needs at least 34
+  observations and "very low" at least 10. Fewer observations cannot resolve those
+  percentiles.
+- **Structure:** HH/HL, LH/LL, break of structure, change of character, failed break,
+  compression. It uses the confirmed pivots from Sprint 3.
+- **Environment / suitability:** NO_TRADE for an invalid, stale or errored snapshot, extreme
+  volatility, a 1-minute volatility shock, or repeated recent stop-outs. UNFAVORABLE for no
+  trend, a trend against the entry, a range, price far from VWAP, a sudden expansion or a
+  higher-timeframe context against the entry. FAVORABLE needs an aligned strong or moderate
+  trend, aligned context and calibrated confidence of at least MEDIUM. Everything else is
+  NEUTRAL. All thresholds are documented, unvalidated hypotheses.
+
+`enforcement` selects what is blocked. `observe` blocks nothing. `block_no_trade` blocks
+NO_TRADE. `block_unfavorable` (the default) blocks NO_TRADE and UNFAVORABLE.
+`require_favorable` blocks everything that is not FAVORABLE. A blocked entry is reported to
+the strategy as a `rejected` order event (stage `regime_gate`), so its lifecycle stays
+consistent.
+
+### Safety properties
+
+- If the engine raises, returns invalid model output, or has missing, stale, incomplete or
+  other-session inputs, the snapshot is invalid and entries are blocked (fail closed). Exits
+  always pass.
+- Features use only completed bars with `available_at <= now`, and they are checked to be
+  invariant to truncating or perturbing later data. Context and 1-minute rows are cut by the
+  engine and checked again in the regime engine.
+- LLM text is never parsed into actions. If the LLM is missing, raises, or returns empty or
+  invalid output, the template explanation is used instead.
+- The regime config, and the SHA-256 of any calibration or model file it names, are part of
+  the backtest configuration identity. Replay refuses changed artifacts. Model files load
+  only when their hash and feature list match their identity JSON. Never load model files
+  from untrusted sources: they are pickles.
+
+### Running
+
+```
+python run_backtest.py --csv data\MNQ.csv                       # regime gate on (config [regime] enabled)
+python run_regime_validation.py --csv data\MES.csv data\MNQ.csv --oos-sessions 20
+python run_regime_validation.py --synthetic-sessions 60          # SYNTHETIC method check only
+python run_regime_validation.py --csv ... --reveal-oos           # final OOS, recorded in the ledger
+python run_regime_validation.py --csv ... --save-model models/regime
+```
+
+Backtests write `regime_decisions.csv`, `regime_snapshots.csv`, `regime_trades.csv`,
+`regime_performance.json` and `regime_dashboard.json`. Validation runs walk forward
+chronologically over sessions. Training rows are purged when their label window reaches the
+test period, plus an embargo. Each instrument is evaluated separately. The report gives
+accuracy against the majority-class baseline, per-class precision and recall, the confusion
+matrix, calibration (Brier, ECE), transition detection, per-session stability and results by
+volatility. The last `--oos-sessions` stay sealed until `--reveal-oos`, which needs committed
+code and the validation ledger, like Sprint 3. Synthetic data is keyed `ROOT:synthetic` in
+the ledger.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.
@@ -885,3 +971,12 @@ through gaps or a final forced exit, it is recorded as a breach.
     the extreme came before or after a take-profit, so it assumes the worst case.
   - The exit commission and exit slippage are not part of the trigger, so the realized loss
     can slightly exceed the limit.
+- **Regime engine:**
+  - All thresholds are unvalidated hypotheses. Results on synthetic data only check the
+    method. Nothing here shows that the gate improves the strategy, or that any regime is
+    profitable.
+  - Per-regime trade statistics with fewer than 30 trades are flagged and support no
+    conclusion. The outcomes of blocked signals are unknown; use `enforcement = "observe"`
+    to study them.
+  - The time-of-day volatility percentile needs about 34 earlier sessions before "extreme"
+    can be detected at all.

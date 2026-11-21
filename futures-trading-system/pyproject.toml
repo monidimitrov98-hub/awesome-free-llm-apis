@@ -3,7 +3,7 @@ name = "futures-trading-system"
 version = "0.1.0"
 description = "Research and paper-trading toolkit for MES/MNQ intraday futures (Sprint 1: market data engine)"
 requires-python = ">=3.12"
-dependencies = ["pandas>=2.2,<4", "numpy>=1.26", "tzdata>=2024.1"]
+dependencies = ["pandas>=2.2,<4", "numpy>=1.26", "tzdata>=2024.1", "scikit-learn>=1.4"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

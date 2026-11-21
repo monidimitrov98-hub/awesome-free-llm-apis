@@ -34,6 +34,7 @@ class StrategyRun:
     diagnostics: pd.DataFrame
     signals: pd.DataFrame | None = None
     period: Period | None = None
+    regime: dict[str, Any] | None = None  # decisions, snapshots, trades, performance, dashboard, artifacts
 
 
 def _frames(md: MarketData, cfg: VwapPullbackConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
@@ -46,8 +47,31 @@ def _frames(md: MarketData, cfg: VwapPullbackConfig) -> tuple[pd.DataFrame, pd.D
     return md.frames[cfg.signal_timeframe], md.frames[cfg.execution_timeframe], context
 
 
+def _regime_frames(md: MarketData, app: AppConfig, cfg: VwapPullbackConfig, regime) -> tuple[pd.DataFrame, dict]:
+    """Signal frame and context frames with causal regime features (computed on the whole
+    file before any period slicing; features are causal, earlier data is warm-up only)."""
+    from src.ai.market_regime.features import add_regime_features, add_shock_features
+
+    if regime.signal_timeframe != cfg.signal_timeframe:
+        raise ConfigError(f"regime signal_timeframe {regime.signal_timeframe} != strategy {cfg.signal_timeframe}")
+    if regime.context_timeframe and regime.context_timeframe != cfg.context_timeframe:
+        raise ConfigError(f"regime context_timeframe {regime.context_timeframe} != strategy {cfg.context_timeframe}")
+    kw = dict(ema_fast=cfg.ema_fast_col, ema_slow=cfg.ema_slow_col, atr_col=cfg.atr_col, rsi_col=cfg.rsi_col)
+    signal = add_regime_features(md.frames[cfg.signal_timeframe], regime.features, app.session, **kw)
+    context = {}
+    if cfg.context_timeframe:
+        context[cfg.context_timeframe] = add_regime_features(md.frames[cfg.context_timeframe], regime.features,
+                                                             app.session, **kw)
+    if regime.fast_timeframe:
+        if regime.fast_timeframe not in md.frames:
+            raise ConfigError(f"regime fast_timeframe {regime.fast_timeframe} is not produced by the pipeline")
+        context[regime.fast_timeframe] = add_shock_features(md.frames[regime.fast_timeframe], regime.features,
+                                                            atr_col=cfg.atr_col)
+    return signal, context
+
+
 def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,
-                 label: str = "", period: Period | None = None) -> StrategyRun:
+                 label: str = "", period: Period | None = None, regime=None, explainer=None) -> StrategyRun:
     """Backtest the VWAP Trend Pullback strategy on already-built market data.
 
     With ``period`` only sessions inside it are traded (indicators were computed on the
@@ -57,16 +81,36 @@ def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPu
     if md.contract.spec is None:
         raise ConfigError(f"No contract specification for {md.contract.root}")
     signal, execution, context = _frames(md, cfg)
+    use_regime = regime is not None and regime.enabled
+    if use_regime:
+        signal, regime_context = _regime_frames(md, app, cfg, regime)
+        context = {**context, **regime_context}
     if period is not None:
         signal, execution = slice_frame(signal, period), slice_frame(execution, period)
         context = {k: slice_frame(v, period) for k, v in context.items()}
         if signal.empty or execution.empty:
             raise ConfigError(f"No data inside period {period.to_dict()}")
     strategy = VwapTrendPullbackStrategy(cfg, app.session.timezone)
+    gate = None
+    if use_regime:
+        from src.ai.market_regime.filters import RegimeGatedStrategy
+        from src.ai.market_regime.regime import RegimeEngine
+
+        gate = RegimeGatedStrategy(strategy, RegimeEngine(regime, md.contract.root), regime, explainer)
     engine = BacktestEngine(bt, md.contract.spec, app.session)
-    result = engine.run(strategy, signal, execution, context_bars=context)
+    result = engine.run(gate or strategy, signal, execution, context_bars=context)
+    regime_out = None
+    if gate is not None:
+        from src.ai.market_regime.performance import add_excursions, enrich_trades, regime_performance
+
+        decisions = gate.decisions_frame()
+        trades = add_excursions(enrich_trades(result.trades, decisions), execution, md.contract.spec.point_value)
+        regime_out = {"decisions": decisions, "snapshots": gate.snapshots_frame(), "trades": trades,
+                      "performance": regime_performance(trades, decisions),
+                      "dashboard": gate.dashboard.current, "artifacts": dict(gate.engine.artifacts),
+                      "config": regime.to_dict(), "errors": gate.errors}
     return StrategyRun(label or f"r_{cfg.target.r_multiple:g}", cfg, result, strategy.diagnostics_frame(),
-                       strategy.signals_frame(), period)
+                       strategy.signals_frame(), period, regime_out)
 
 
 def run_from_csv(csv_path: str | Path, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,
@@ -132,6 +176,15 @@ def write_outputs(run: StrategyRun, md: MarketData, app: AppConfig, bt: Backtest
                                              encoding="utf-8")
     (folder / "warnings.txt").write_text("\n".join(r.warnings) + "\n", encoding="utf-8")
     (folder / "data_quality.txt").write_text(md.report.summary() + "\n", encoding="utf-8")
+    if run.regime is not None:
+        rg = run.regime
+        rg["decisions"].to_csv(folder / "regime_decisions.csv", index=False)
+        rg["snapshots"].to_csv(folder / "regime_snapshots.csv", index=False)
+        rg["trades"].to_csv(folder / "regime_trades.csv", index=False)
+        (folder / "regime_performance.json").write_text(json.dumps(_jsonable(rg["performance"]), indent=2,
+                                                                   default=str), encoding="utf-8")
+        (folder / "regime_dashboard.json").write_text(json.dumps(_jsonable(rg["dashboard"]), indent=2, default=str),
+                                                      encoding="utf-8")
     if manifest is not None:
         period = run.period.to_dict() if run.period else {"label": "full", "kind": "full", "fold": None,
                                                            "start": None, "end": None}

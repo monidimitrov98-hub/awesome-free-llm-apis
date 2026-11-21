@@ -32,7 +32,9 @@ def full_run(tmp_path_factory):
 def test_manifest_contents(full_run):
     m = json.loads((full_run / "manifest.json").read_text())
     assert m["data"]["sha256"] == file_sha256(CSV) and m["data"]["synthetic"] is True
-    assert set(m["config_texts"]) == {"settings", "backtest", "strategy", "account_profile"}
+    # Sprint 4: the regime configuration (and its artifact hashes) is part of the configuration identity.
+    assert set(m["config_texts"]) == {"settings", "backtest", "strategy", "account_profile", "regime",
+                                      "regime_artifacts"}
     assert m["instrument"]["specification"]["point_value"] == 2.0 and m["instrument"]["contract"] == "MNQH25"
     ds = m["data_settings"]
     assert ds["source_timezone"] == "America/New_York" and ds["column_mapping"]["close"] == "close"
