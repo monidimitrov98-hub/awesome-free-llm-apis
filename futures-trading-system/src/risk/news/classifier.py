@@ -16,8 +16,13 @@ PRECEDENCE = ("core_cpi", "core_pce", "fomc_statement", "fed_press_conference", 
 
 
 def _order(cfg: NewsConfig) -> list[str]:
+    """Mandatory categories are always tried before any other configured category, so a new
+    "alias" category can never capture a mandatory release (and its weaker window)."""
+    from src.risk.news.config import MANDATORY_CATEGORIES
+
     first = [c for c in PRECEDENCE if c in cfg.events]
-    return first + [c for c in cfg.events if c not in first]
+    mandatory = [c for c in cfg.events if c in MANDATORY_CATEGORIES and c not in first]
+    return first + mandatory + [c for c in cfg.events if c not in first and c not in mandatory]
 
 
 def make_classifier(cfg: NewsConfig):

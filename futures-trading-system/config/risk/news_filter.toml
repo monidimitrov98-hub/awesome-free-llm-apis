@@ -40,11 +40,15 @@ flatten_impacts = ["high"]
 [impact]
 block = ["high", "medium", "unknown"]  # impacts that open a blackout window ("low" is recorded only)
 
-[unknown_impact]                       # relevant-region events that cannot be classified
+[unknown_impact]                       # relevant-region events that cannot be classified (floor 30/30)
 before_minutes = 30
 after_minutes = 30
 
 # Event categories: patterns are case-insensitive regular expressions on the event name.
+# Mandatory categories have non-negotiable MINIMUM windows (src/risk/news/config.py
+# MANDATORY_WINDOWS): values here may widen them, never narrow them; a release carrying several
+# categories (CPI/Core CPI, PCE/Core PCE, NFP/Unemployment, FOMC decision/statement) gets the
+# widest window of the group.
 [events.cpi]
 patterns = ["consumer price index", "\\bcpi\\b"]
 impact = "high"
@@ -174,8 +178,8 @@ after_minutes = 10
 [events.jolts]
 patterns = ["job openings and labor turnover", "\\bjolts\\b"]
 impact = "medium"
-before_minutes = 10
-after_minutes = 10
+before_minutes = 15
+after_minutes = 15
 
 # Lower-impact releases: recorded, no window (impact "low" is not in [impact] block).
 [events.construction_spending]
@@ -316,7 +320,8 @@ covers = ["unexpected"]
 # otherwise new entries are blocked (CALENDAR_INCOMPLETE).
 required_categories = ["cpi", "core_cpi", "nfp", "unemployment_rate", "ppi", "jobless_claims",
                        "ism_manufacturing", "ism_services", "fomc_decision", "fomc_statement",
-                       "fed_press_conference", "fed_chair_speech", "treasury", "pce", "gdp", "retail_sales"]
+                       "fed_press_conference", "fed_chair_speech", "treasury", "pce", "core_pce", "gdp",
+                       "retail_sales", "jolts"]
 
 [manual]
 # data/news/manual_calendar.json: a category counts as covered only when it is "verified",

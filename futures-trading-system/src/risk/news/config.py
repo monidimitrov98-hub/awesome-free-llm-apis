@@ -26,15 +26,51 @@ PROVIDER_EVIDENCE_PATH = PROJECT_ROOT / "config" / "risk" / "provider_verificati
 # (audit 2026-11-21) The configuration may TIGHTEN the filter but can never remove a critical
 # US release, downgrade it below its minimum impact, shrink its window to nothing, drop the US
 # region, accept unofficial sources or relax freshness beyond these bounds.
+_M = lambda m: pd.Timedelta(minutes=m)  # noqa: E731
+# Category-specific MINIMUM blackout windows (before, after). Configuration may only widen them.
+MANDATORY_WINDOWS: dict[str, tuple[pd.Timedelta, pd.Timedelta]] = {
+    "cpi": (_M(30), _M(30)), "core_cpi": (_M(30), _M(30)),
+    "pce": (_M(30), _M(30)), "core_pce": (_M(30), _M(30)),
+    "nfp": (_M(30), _M(30)), "unemployment_rate": (_M(30), _M(30)),
+    "fomc_decision": (_M(60), _M(60)), "fomc_statement": (_M(60), _M(60)),
+    "fed_press_conference": (_M(30), _M(30)),
+    "ppi": (_M(15), _M(15)), "gdp": (_M(15), _M(15)), "retail_sales": (_M(15), _M(15)),
+    "treasury": (_M(15), _M(15)),
+    "ism_manufacturing": (_M(10), _M(15)), "ism_services": (_M(10), _M(15)),
+    "jobless_claims": (_M(5), _M(10)),
+    "jolts": (_M(15), _M(15)),
+    "fed_chair_speech": (_M(15), _M(45)),
+}
 MANDATORY_CATEGORIES = {
     "cpi": Impact.HIGH, "core_cpi": Impact.HIGH, "nfp": Impact.HIGH, "unemployment_rate": Impact.HIGH,
-    "pce": Impact.HIGH, "fomc_decision": Impact.HIGH, "fomc_statement": Impact.HIGH,
+    "pce": Impact.HIGH, "core_pce": Impact.HIGH, "fomc_decision": Impact.HIGH, "fomc_statement": Impact.HIGH,
     "fed_press_conference": Impact.HIGH, "fed_chair_speech": Impact.HIGH,
     "ppi": Impact.MEDIUM, "jobless_claims": Impact.MEDIUM, "ism_manufacturing": Impact.MEDIUM,
     "ism_services": Impact.MEDIUM, "treasury": Impact.MEDIUM, "gdp": Impact.MEDIUM, "retail_sales": Impact.MEDIUM,
+    "jolts": Impact.MEDIUM,
 }
-MIN_WINDOW = pd.Timedelta(minutes=5)          # each side, mandatory categories (overrides included)
-MIN_UNKNOWN_WINDOW = pd.Timedelta(minutes=15)  # each side, unclassified relevant events
+assert set(MANDATORY_WINDOWS) == set(MANDATORY_CATEGORIES)  # every mandatory category has an explicit floor
+# One official release carries several categories: every member gets the widest window of its group.
+RELEASE_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"cpi", "core_cpi"}), frozenset({"pce", "core_pce"}), frozenset({"nfp", "unemployment_rate"}),
+    frozenset({"fomc_decision", "fomc_statement"}), frozenset({"ism_manufacturing"}), frozenset({"ism_services"}),
+)
+# Canonical release names: after loading, each must still classify into its mandatory category
+# (no pattern removed, no new alias capturing it).
+CANONICAL_NAMES = {
+    "cpi": ("Consumer Price Index", "CPI"), "core_cpi": ("Core CPI",),
+    "pce": ("Personal Income and Outlays", "PCE Price Index"), "core_pce": ("Core PCE Price Index",),
+    "nfp": ("Employment Situation", "Nonfarm Payrolls"), "unemployment_rate": ("Unemployment Rate",),
+    "fomc_decision": ("FOMC rate decision", "Federal Funds Rate"), "fomc_statement": ("FOMC Statement",),
+    "fed_press_conference": ("FOMC Press Conference",), "fed_chair_speech": ("Fed Chair speech",),
+    "ppi": ("Producer Price Index", "PPI"), "gdp": ("Gross Domestic Product", "GDP"),
+    "retail_sales": ("Retail Sales", "Advance Monthly Sales for Retail and Food Services"),
+    "treasury": ("Treasury Quarterly Refunding",),
+    "ism_manufacturing": ("ISM Manufacturing PMI",), "ism_services": ("ISM Services PMI",),
+    "jobless_claims": ("Unemployment Insurance Weekly Claims", "Initial Jobless Claims"),
+    "jolts": ("Job Openings and Labor Turnover Survey", "JOLTS"),
+}
+UNKNOWN_FLOOR = (_M(30), _M(30))  # documented conservative fallback for relevant unclassified events
 MAX_CALENDAR_AGE = pd.Timedelta(days=3)
 MIN_LOOKAHEAD = pd.Timedelta(minutes=60)
 MAX_MANUAL_AGE = pd.Timedelta(days=14)
@@ -143,7 +179,7 @@ class NewsConfig:
                               "every traded instrument needs explicit news rules")
         return tuple(inst["regions"])
 
-    def window(self, root: str, category: str) -> tuple[pd.Timedelta, pd.Timedelta]:
+    def _configured(self, root: str, category: str) -> tuple[pd.Timedelta, pd.Timedelta]:
         over = self.instruments.get(root.split(":")[0], {}).get("overrides", {}).get(category)
         if over is not None:
             return over
@@ -151,6 +187,23 @@ class NewsConfig:
         if rule is None:
             return self.unknown_before, self.unknown_after
         return rule.before, rule.after
+
+    def window(self, root: str, category: str) -> tuple[pd.Timedelta, pd.Timedelta]:
+        """Effective (before, after) blackout: the configured window, never below the category's
+        mandatory floor, widened to the widest member of its release group. Enforced here at
+        runtime as well as at load time, so a programmatically built config cannot weaken it."""
+        group = next((g for g in RELEASE_GROUPS if category in g), frozenset({category}))
+        before = after = pd.Timedelta(0)
+        for cat in group:
+            b, a = self._configured(root, cat)  # unclassified/undefined -> [unknown_impact] windows
+            if cat in MANDATORY_WINDOWS:
+                floor = MANDATORY_WINDOWS[cat]
+            elif cat in self.events:
+                floor = (pd.Timedelta(0), pd.Timedelta(0))  # optional category: its configured window
+            else:
+                floor = UNKNOWN_FLOOR  # no definition: conservative documented fallback, never weaker
+            before, after = max(before, b, floor[0]), max(after, a, floor[1])
+        return before, after
 
 
 SECTIONS = {
@@ -407,16 +460,20 @@ def _safety_floors(c: NewsConfig) -> None:
             raise ConfigError(f"[events.{cat}] impact cannot be lower than {floor.value!r}")
         if rule.impact not in c.block_impacts:
             raise ConfigError(f"[impact] block must include {rule.impact.value!r} (used by mandatory {cat!r})")
-        if rule.before < MIN_WINDOW or rule.after < MIN_WINDOW:
-            raise ConfigError(f"[events.{cat}] before/after must each be >= {MIN_WINDOW.total_seconds() / 60:.0f} min")
+        fb, fa = MANDATORY_WINDOWS[cat]
+        if rule.before < fb or rule.after < fa:
+            raise ConfigError(f"[events.{cat}] window {_mins(rule.before)}/{_mins(rule.after)} min is below the mandatory "
+                              f"minimum {_mins(fb)} min before / {_mins(fa)} min after")
     for root, inst in c.instruments.items():
         if "US" not in inst["regions"]:
             raise ConfigError(f"[instruments.{root}] regions must include 'US' (US index futures)")
         for cat, (b, a) in inst["overrides"].items():
-            if cat in MANDATORY_CATEGORIES and (b < MIN_WINDOW or a < MIN_WINDOW):
-                raise ConfigError(f"[instruments.{root}.overrides] {cat} window below the minimum")
-    if c.unknown_before < MIN_UNKNOWN_WINDOW or c.unknown_after < MIN_UNKNOWN_WINDOW:
-        raise ConfigError("[unknown_impact] before/after must each be >= 15 min")
+            if cat in MANDATORY_WINDOWS and (b < MANDATORY_WINDOWS[cat][0] or a < MANDATORY_WINDOWS[cat][1]):
+                raise ConfigError(f"[instruments.{root}.overrides] {cat} window {_mins(b)}/{_mins(a)} min is below the "
+                                  f"mandatory minimum {_mins(MANDATORY_WINDOWS[cat][0])}/{_mins(MANDATORY_WINDOWS[cat][1])}")
+    if c.unknown_before < UNKNOWN_FLOOR[0] or c.unknown_after < UNKNOWN_FLOOR[1]:
+        raise ConfigError("[unknown_impact] before/after must each be >= 30 min")
+    _check_classification(c)
     if c.max_age > MAX_CALENDAR_AGE:
         raise ConfigError("[calendar] max_age_minutes cannot exceed 4320 (3 days)")
     if c.lookahead < MIN_LOOKAHEAD:
@@ -454,3 +511,21 @@ def _check_evidence(c: NewsConfig) -> dict[str, str]:
                               f"{PROVIDER_EVIDENCE_PATH.name} (run scripts/verify_news_providers.py)")
         out[p.name] = when
     return out
+
+
+def _mins(t: pd.Timedelta) -> str:
+    return f"{t.total_seconds() / 60:g}"
+
+
+def _check_classification(c: NewsConfig) -> None:
+    """Every canonical name of a mandatory release must still classify into its category: a
+    removed pattern or a new alias category capturing it (with weaker windows) is refused."""
+    from src.risk.news.classifier import make_classifier
+
+    classify = make_classifier(c)
+    for cat, names in CANONICAL_NAMES.items():
+        for name in names:
+            got, _ = classify(name, "US")
+            if got != cat:
+                raise ConfigError(f"event name {name!r} must classify as mandatory category {cat!r} but classifies as "
+                                  f"{got!r}: mandatory patterns cannot be removed or captured by another category")

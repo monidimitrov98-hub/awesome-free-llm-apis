@@ -1075,13 +1075,23 @@ fail, so NewsGuard blocks entries too.
 After the adversarial audit of 2026-11-21 (`docs/news_audit_2026-11-21.md`), the news config
 can tighten the filter but not weaken it:
 
-- **Mandatory categories.** The 16 mandatory categories (CPI, Core CPI, NFP, unemployment
-  rate, PCE, FOMC decision, statement and press conference, Fed Chair, PPI, jobless claims,
-  ISM manufacturing and services, Treasury refunding, GDP, retail sales) stay required.
+- **Mandatory categories.** The 18 mandatory categories (CPI, Core CPI, NFP, unemployment
+  rate, PCE, Core PCE, FOMC decision, statement and press conference, Fed Chair, PPI, jobless
+  claims, ISM manufacturing and services, Treasury refunding, GDP, retail sales, JOLTS) stay
+  required, and each must keep an explicit definition.
 - **Impact.** Their impact cannot be lowered below high or medium, and that impact must be
   in `[impact] block`.
-- **Windows.** At least 5 minutes on each side, including instrument overrides. Unclassified
-  events get at least 15 minutes on each side.
+- **Windows.** Each mandatory category has a minimum window (table below), checked for both
+  the before and after side, including instrument overrides. The minimum is enforced when the
+  config loads (weaker values are refused) and again whenever a window is computed (a config
+  built in code is clamped up to it). The members of one release (CPI/Core CPI, PCE/Core PCE,
+  NFP/unemployment rate, FOMC decision/statement) all get the widest window in the group. An
+  unclassified relevant event, or a category without a definition, falls back to at least
+  30/30 minutes.
+- **Classification.** Mandatory categories are classified before any other category, and every
+  canonical release name ("Consumer Price Index", "Employment Situation", "FOMC Statement", ...)
+  must still classify into its mandatory category. Removed patterns or alias categories that
+  would capture a mandatory release are refused.
 - **Instruments.** Every instrument must include the `US` region.
 - **Freshness.** `max_age_minutes` at most 3 days, `lookahead_minutes` at least 60, manual
   `max_verification_age_days` at most 14, `operational_horizon_days` at least 7.
@@ -1107,18 +1117,21 @@ execution bar.
   `enforce` mode; no synthetic data; no enabled unverified live provider; and every required
   category covered by a healthy `verified_live` or `manual` provider.
 
-### Default blackout windows (starting values, not optimised)
+### Blackout windows: mandatory minimums (config may widen, never narrow)
 
-| Event | Before | After | Impact |
+| Event | Minimum before | Minimum after | Impact (minimum) |
 | --- | --- | --- | --- |
 | CPI / Core CPI, PCE / Core PCE, NFP, Unemployment rate | 30 min | 30 min | high |
 | FOMC rate decision, FOMC statement | 60 min | 60 min | high |
 | Fed press conference | 30 min | 30 min | high |
 | Fed Chair speech | 15 min | 45 min | high |
-| PPI, GDP, Retail sales, Treasury refunding | 15 min | 15 min | medium |
+| PPI, GDP, Retail sales, Treasury refunding, JOLTS | 15 min | 15 min | medium |
 | ISM manufacturing / services | 10 min | 15 min | medium |
 | Initial jobless claims | 5 min | 10 min | medium |
 | Unclassified relevant event (unknown impact) | 30 min | 30 min | unknown |
+
+The shipped configuration uses exactly these minimums. They are conservative policy floors,
+not optimised or proven values; widening them is allowed.
 | Event without a confirmed time | whole New York day | | |
 | Unexpected official announcement | from when it became known | 30 min | high |
 

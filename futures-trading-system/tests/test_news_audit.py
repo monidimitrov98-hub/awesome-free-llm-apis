@@ -61,7 +61,7 @@ def test_h1_release_group_counts_once_and_long_spans_fail(tmp_path):
     (r"required_categories = \[[^\]]*\]", 'required_categories = ["cpi"]', "mandatory"),
     (r'(\[events\.cpi\]\npatterns = [^\n]*\n)impact = "high"', r'\1impact = "low"', "impact"),
     (r'(\[events\.ppi\]\npatterns = [^\n]*\nimpact = "medium"\n)before_minutes = 15\nafter_minutes = 15',
-     r"\1before_minutes = 0\nafter_minutes = 0", "before/after"),
+     r"\1before_minutes = 0\nafter_minutes = 0", "mandatory minimum"),
     (r'block = \["high", "medium", "unknown"\]', 'block = ["high", "unknown"]', "block"),
     (r'(\[unknown_impact\][^\n]*\n)before_minutes = 30', r"\1before_minutes = 0", "unknown_impact"),
     (r'\[instruments\.MNQ\]\nregions = \["US"\]', '[instruments.MNQ]\nregions = ["EU"]', "US"),

@@ -29,7 +29,8 @@
    "jobless_claims",
    "ism_manufacturing",
    "ism_services",
-   "treasury"
+   "treasury",
+   "jolts"
   ]
  },
  "refreshes": [

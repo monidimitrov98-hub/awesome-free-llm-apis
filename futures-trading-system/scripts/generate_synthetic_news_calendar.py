@@ -52,7 +52,7 @@ def main() -> None:
            "provider_coverage": {"synthetic_fixture": ["cpi", "core_cpi", "pce", "core_pce", "nfp", "unemployment_rate",
                                                        "fomc_decision", "fomc_statement", "fed_press_conference",
                                                        "fed_chair_speech", "ppi", "gdp", "retail_sales", "jobless_claims",
-                                                       "ism_manufacturing", "ism_services", "treasury"]},
+                                                       "ism_manufacturing", "ism_services", "treasury", "jolts"]},
            "refreshes": refreshes, "events": events}
     OUT.write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {OUT}")
