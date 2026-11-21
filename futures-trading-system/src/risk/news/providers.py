@@ -55,6 +55,7 @@ class FetchResult:
     coverage_end: pd.Timestamp | None
     invalid: list[str] = field(default_factory=list)
     items: list[dict[str, Any]] = field(default_factory=list)  # rss items (unexpected news)
+    category_coverage: dict[str, dict[str, str]] | None = None  # manual calendar: per-category coverage
 
 
 Transport = Callable[[str, dict[str, str], float, int], bytes]
@@ -181,6 +182,15 @@ class JsonFileProvider(Provider):
                 doc = json.loads(decode_utf8(fh.read(self.cfg.max_response_bytes + 1), self.cfg.max_response_bytes))
         except (OSError, ValueError) as exc:
             raise ProviderError(f"cannot read {self.pc.path}: {type(exc).__name__}") from None
+        if isinstance(doc, dict) and doc.get("schema") == "manual-calendar/1":
+            from src.risk.news.manual import validate_manual
+
+            rep = validate_manual(doc, self.cfg, now, self.classify)
+            if not rep.valid:
+                raise ProviderError(f"manual calendar invalid ({len(rep.errors)} errors): {rep.errors[0][:200]}")
+            recs, invalid = self._records(rep.events, now)
+            ends = [pd.Timestamp(v["through"]) for v in rep.coverage.values()]
+            return FetchResult(recs, now, max(ends) if ends else None, invalid, category_coverage=rep.coverage)
         if not isinstance(doc, dict) or not isinstance(doc.get("events"), list):
             raise ProviderError("calendar file needs an 'events' list")
         recs, invalid = self._records(doc["events"], now)

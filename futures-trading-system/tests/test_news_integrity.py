@@ -2,6 +2,7 @@
 calendar maintenance CLI. CLI runs use an isolated committed copy of the project."""
 
 import json
+import re
 
 import pytest
 
@@ -40,8 +41,8 @@ def _cfg(tmp_path, manual_path):
     text = text.replace('type = "ics"\nenabled = true', 'type = "ics"\nenabled = false')
     text = text.replace('type = "census_html"\nenabled = true', 'type = "census_html"\nenabled = false')
     text = text.replace('type = "fomc_html"\nenabled = true', 'type = "fomc_html"\nenabled = false')
-    text = text.replace('required_categories = ["cpi", "nfp", "pce", "gdp", "ppi", "retail_sales", "jobless_claims", '
-                        '"fomc_decision"]', 'required_categories = ["cpi", "nfp"]')
+    text, n = re.subn(r"required_categories = \[[^\]]*\]", 'required_categories = ["cpi", "nfp"]', text)
+    assert n == 1
     assert text.count("enabled = true") == 2  # [news] and the manual provider only
     p = tmp_path / "news.toml"
     p.write_text(text, encoding="utf-8")

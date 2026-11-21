@@ -249,7 +249,8 @@ reliability = "official"
 priority = 2
 expected = true                           # its failure / staleness blocks entries
 covers = ["cpi", "core_cpi", "nfp", "unemployment_rate", "ppi", "jobless_claims", "ism_manufacturing",
-          "ism_services", "fed_chair_speech", "treasury", "jolts"]
+          "ism_services", "fed_chair_speech", "treasury", "jolts", "fomc_decision", "fomc_statement",
+          "fed_press_conference"]
 
 [providers.bea]
 type = "ics"
@@ -313,7 +314,18 @@ covers = ["unexpected"]
 [coverage]
 # Every category listed here must be covered by at least one expected, healthy provider,
 # otherwise new entries are blocked (CALENDAR_INCOMPLETE).
-required_categories = ["cpi", "nfp", "pce", "gdp", "ppi", "retail_sales", "jobless_claims", "fomc_decision"]
+required_categories = ["cpi", "core_cpi", "nfp", "unemployment_rate", "ppi", "jobless_claims",
+                       "ism_manufacturing", "ism_services", "fomc_decision", "fomc_statement",
+                       "fed_press_conference", "fed_chair_speech", "treasury", "pce", "gdp", "retail_sales"]
+
+[manual]
+# data/news/manual_calendar.json: a category counts as covered only when it is "verified",
+# was re-checked against its official source within max_verification_age_days, and is
+# verified through at least operational_horizon_days ahead.
+max_verification_age_days = 7
+operational_horizon_days = 14
+official_domains = ["bls.gov", "dol.gov", "doleta.gov", "federalreserve.gov", "treasury.gov", "ismworld.org", "bea.gov",
+                    "census.gov"]
 
 [unexpected]
 enabled = false

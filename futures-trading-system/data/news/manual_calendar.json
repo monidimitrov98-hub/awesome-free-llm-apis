@@ -1,0 +1,112 @@
+{
+  "schema": "manual-calendar/1",
+  "note": "Manual economic calendar: TEMPLATE. Every category is UNRESOLVED, so NewsGuard keeps new entries blocked (CALENDAR_INCOMPLETE) until you verify the schedules against the official sources below. No date or time in this file may be guessed or copied from unofficial sites.",
+  "instructions": [
+    "1. Open the category's official_source and read the upcoming releases.",
+    "2. Add one event per release: name, category, scheduled_at (local time, e.g. 2027-01-13T08:30:00) with timezone America/New_York, source (the official page), provenance 'manual', verification_status 'verified', last_verified (UTC, e.g. 2026-11-23T14:00:00Z).",
+    "3. If only the date is confirmed use verification_status 'date_only' with 'date' (the whole day is blocked); if even the date is not confirmed add the event as 'unresolved' (no date): the category then stays uncovered.",
+    "4. Set the category to status 'verified', verified_through = the last date up to which you checked that EVERY release of the category is listed (also when there are none, e.g. no Fed Chair speech scheduled), and last_verified = now (UTC).",
+    "5. Re-check at least every [manual] max_verification_age_days (7) and keep verified_through at least operational_horizon_days (14) ahead. Run: python run_news_calendar.py --validate-manual, then --readiness."
+  ],
+  "categories": {
+    "cpi": {
+      "official_source": "https://www.bls.gov/schedule/news_release/cpi.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "BLS Consumer Price Index release schedule (usually 08:30 ET)."
+    },
+    "core_cpi": {
+      "official_source": "https://www.bls.gov/schedule/news_release/cpi.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "Core CPI is published in the same BLS CPI release."
+    },
+    "nfp": {
+      "official_source": "https://www.bls.gov/schedule/news_release/empsit.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "BLS Employment Situation (nonfarm payrolls)."
+    },
+    "unemployment_rate": {
+      "official_source": "https://www.bls.gov/schedule/news_release/empsit.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "Published in the Employment Situation release."
+    },
+    "ppi": {
+      "official_source": "https://www.bls.gov/schedule/news_release/ppi.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "BLS Producer Price Index release schedule."
+    },
+    "jolts": {
+      "official_source": "https://www.bls.gov/schedule/news_release/jolts.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "BLS Job Openings and Labor Turnover Survey."
+    },
+    "jobless_claims": {
+      "official_source": "https://oui.doleta.gov/unemploy/claims_arch.asp",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "DOL/ETA weekly claims: normally Thursday 08:30 ET, moved when Thursday is a federal holiday. Record every week explicitly; do not assume the pattern. Latest report: https://www.dol.gov/ui/data.pdf"
+    },
+    "ism_manufacturing": {
+      "official_source": "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "ISM PMI release calendar (manufacturing)."
+    },
+    "ism_services": {
+      "official_source": "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "ISM PMI release calendar (services)."
+    },
+    "fed_chair_speech": {
+      "official_source": "https://www.federalreserve.gov/newsevents/calendar.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "Federal Reserve Board calendar of speeches and testimony. verified_through means you checked that no other Chair appearance is scheduled up to that date."
+    },
+    "treasury": {
+      "official_source": "https://home.treasury.gov/policy-issues/financing-the-government/quarterly-refunding",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "Treasury quarterly refunding: each refunding statement announces the next refunding date."
+    },
+    "fomc_decision": {
+      "official_source": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "Dates come from the verified live 'fomc' provider; add exact times here only when confirmed (the calendar page publishes no times)."
+    },
+    "fomc_statement": {
+      "official_source": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "As fomc_decision."
+    },
+    "fed_press_conference": {
+      "official_source": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+      "status": "unresolved",
+      "verified_through": null,
+      "last_verified": null,
+      "notes": "As fomc_decision."
+    }
+  },
+  "events": []
+}

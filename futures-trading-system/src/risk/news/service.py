@@ -49,6 +49,7 @@ def refresh(store: CalendarStore, providers: list[Provider], cfg: NewsConfig, no
             recs = items_to_events(res.items, cfg, p.name, now, llm_assessments)
             res.coverage_start, res.coverage_end = now, now + cfg.lookahead
         added = sum(store.add(r) for r in recs)
-        store.log_refresh(RefreshRecord(now, p.name, True, res.coverage_start, res.coverage_end, n_events=added))
+        store.log_refresh(RefreshRecord(now, p.name, True, res.coverage_start, res.coverage_end, n_events=added,
+                                        category_coverage=res.category_coverage))
         report.append({"provider": p.name, "status": "ok", "new_versions": added})
     return report

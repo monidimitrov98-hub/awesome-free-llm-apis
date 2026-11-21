@@ -4,11 +4,14 @@ Examples:
     python run_news_calendar.py --refresh                  (query enabled providers; schedule daily or hourly)
     python run_news_calendar.py --status --instrument MES  (current state, active/next windows; --json for a dashboard file)
     python run_news_calendar.py --validate data/news/history.json --start 2025-01-01 --end 2025-03-31
+    python run_news_calendar.py --validate-manual                 (check data/news/manual_calendar.json)
+    python run_news_calendar.py --readiness --refresh-first       (OPERATIONAL READY or why not)
 
 The store is a point-in-time JSON file ([calendar] store_path). A failed or malformed
 provider refresh is recorded and keeps new entries blocked until a later refresh succeeds.
 Credentials come only from the environment variables named in the config (api_key_env).
-Exit codes: 0 ok / calendar safe, 1 configuration or data error, 8 NewsGuard would block entries now.
+Exit codes: 0 ok / calendar safe / operational ready, 1 configuration error, 8 NewsGuard would block
+entries now / not operationally ready, 9 manual calendar invalid.
 """
 
 from __future__ import annotations
@@ -36,6 +39,9 @@ def parse_args(argv=None):
     g.add_argument("--refresh", action="store_true")
     g.add_argument("--status", action="store_true")
     g.add_argument("--validate", type=Path)
+    g.add_argument("--validate-manual", nargs="?", const="", default=None, metavar="PATH")
+    g.add_argument("--readiness", action="store_true")
+    p.add_argument("--refresh-first", action="store_true", help="with --readiness: refresh all providers first")
     p.add_argument("--instrument", default="MES")
     p.add_argument("--store", type=Path, default=None)
     p.add_argument("--json", type=Path, default=None, help="write the status as dashboard JSON")
@@ -66,6 +72,37 @@ def main(argv=None) -> int:
             rep["unclassified"] = sorted({r.name for r in st.records if r.category == "unclassified"})
             print(json.dumps(rep, indent=2))
             return 0
+        if args.validate_manual is not None:
+            from src.risk.news.manual import validate_manual
+            from src.risk.news.readiness import load_manual
+
+            path, doc = load_manual(cfg)
+            if args.validate_manual:
+                path = args.validate_manual
+                try:
+                    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    doc = exc
+            if isinstance(doc, Exception) or doc is None:
+                print(json.dumps({"valid": False, "errors": [f"cannot read {path}: {doc}"]}, indent=2))
+                return 9
+            rep = validate_manual(doc, cfg, now, classify).to_dict()
+            print(json.dumps(rep, indent=2))
+            return 0 if rep["valid"] else 9
+        if args.readiness:
+            from src.risk.news.readiness import readiness_report
+
+            st = _store(cfg, store_path, classify)
+            if args.refresh_first:
+                refresh(st, build_providers(cfg, classify), cfg, now, force=True)
+                st.save(store_path)
+            rep = readiness_report(cfg, st, now, classify, instrument=args.instrument)
+            print(f"READINESS: {rep['verdict']}")
+            for f in rep["findings"]:
+                print(f"  [{f['verdict']}] {f['message']}")
+            if args.json:
+                args.json.write_text(json.dumps(rep, indent=2, default=str), encoding="utf-8")
+            return 0 if rep["ready"] else 8
         if args.refresh:
             st = _store(cfg, store_path, classify)
             report = refresh(st, build_providers(cfg, classify), cfg, now, force=True)

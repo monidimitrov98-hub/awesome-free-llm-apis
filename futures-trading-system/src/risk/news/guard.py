@@ -149,7 +149,10 @@ class NewsGuard:
             problems.append((NewsState.CALENDAR_STALE, f"provider {p}: last successful refresh "
                              f"{age.total_seconds() / 60:.0f} min ago (max {self.cfg.max_age.total_seconds() / 60:.0f})"))
         cs, ce = last_ok.coverage_start, last_ok.coverage_end
-        if cs is None or ce is None or now < cs or now + self.cfg.lookahead > ce:
+        h["category_coverage"] = last_ok.category_coverage
+        if last_ok.category_coverage is not None:
+            pass  # manual calendar: coverage is judged per category (see _category_problem)
+        elif cs is None or ce is None or now < cs or now + self.cfg.lookahead > ce:
             h["status"] = "no_coverage"
             problems.append((NewsState.CALENDAR_STALE, f"provider {p}: calendar does not cover "
                              f"{self.cfg.lookahead.total_seconds() / 60:.0f} min ahead"))
@@ -175,11 +178,39 @@ class NewsGuard:
                     ages.append(age)
         for cat in self.cfg.required_categories:
             providers = [p for p, cats in self.store.provider_coverage.items() if cat in cats]
-            if not any(p in healthy for p in providers):
-                problems.append((NewsState.CALENDAR_INCOMPLETE,
-                                 f"no healthy provider covers required category {cat!r}"
-                                 + (f" (providers: {', '.join(providers)})" if providers else "")))
+            why = []
+            for p in providers:
+                if p not in healthy:
+                    why.append((NewsState.CALENDAR_INCOMPLETE, f"{p} unhealthy"))
+                    continue
+                prob = self._category_problem(health[p].get("category_coverage"), cat, now, self.cfg.lookahead)
+                if prob is None:
+                    why = []
+                    break
+                why.append(prob)
+            else:
+                if not providers:
+                    why.append((NewsState.CALENDAR_INCOMPLETE, "no provider"))
+                # stale verification is reported as CALENDAR_STALE; anything else as CALENDAR_INCOMPLETE
+                state = NewsState.CALENDAR_STALE if any(s is NewsState.CALENDAR_STALE for s, _ in why) \
+                    else NewsState.CALENDAR_INCOMPLETE
+                problems.append((state, f"required category {cat!r} not covered: "
+                                 + "; ".join(r for _, r in why)))
         return problems, health, (max(ages) if ages else None)
+
+    def _category_problem(self, cc: dict[str, dict[str, str]] | None, cat: str, now: pd.Timestamp,
+                          horizon: pd.Timedelta) -> tuple[NewsState, str] | None:
+        """None when a healthy provider's per-category coverage covers ``cat`` for ``horizon`` ahead."""
+        if cc is None:
+            return None  # provider-level coverage already checked in _provider_health
+        entry = cc.get(cat)
+        if entry is None:
+            return NewsState.CALENDAR_INCOMPLETE, "manual category unresolved"
+        if now - pd.Timestamp(entry["verified_at"]) > self.cfg.manual_max_age:
+            return NewsState.CALENDAR_STALE, f"manual category last verified {entry['verified_at']}"
+        if pd.Timestamp(entry["through"]) < now + horizon:
+            return NewsState.CALENDAR_INCOMPLETE, f"manual category verified only through {entry['through']}"
+        return None
 
     def status(self, now: pd.Timestamp) -> NewsStatus:
         if not self.cfg.enabled:

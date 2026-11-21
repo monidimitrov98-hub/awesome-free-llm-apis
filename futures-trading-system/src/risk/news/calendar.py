@@ -43,9 +43,13 @@ class RefreshRecord:
     coverage_end: pd.Timestamp | None = None
     error: str = ""
     n_events: int = 0
+    # per-category coverage (manual calendar): category -> {"through": iso, "verified_at": iso}.
+    # None = the provider's coverage window applies to every category it covers.
+    category_coverage: dict[str, dict[str, str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"time": self.time.isoformat(), "provider": self.provider, "ok": self.ok,
+                "category_coverage": self.category_coverage,
                 "coverage_start": self.coverage_start.isoformat() if self.coverage_start is not None else None,
                 "coverage_end": self.coverage_end.isoformat() if self.coverage_end is not None else None,
                 "error": self.error, "n_events": self.n_events}
@@ -187,7 +191,8 @@ class CalendarStore:
                     parse_time(r["time"], "refresh time"), str(r["provider"]), bool(r["ok"]),
                     parse_time(r["coverage_start"], "coverage_start") if r.get("coverage_start") else None,
                     parse_time(r["coverage_end"], "coverage_end") if r.get("coverage_end") else None,
-                    str(r.get("error", ""))[:300], int(r.get("n_events", 0))))
+                    str(r.get("error", ""))[:300], int(r.get("n_events", 0)),
+                    _category_coverage(r.get("category_coverage"))))
             for i, e in enumerate(doc.get("events", [])):
                 e = dict(e)
                 source = str(e.pop("source", ""))
@@ -223,6 +228,18 @@ class CalendarStore:
         return {"start": start.isoformat(), "end": end.isoformat(), "synthetic_calendar": self.synthetic,
                 "data_classes": self.data_classes(),
                 "events": len(self.records), "gaps": [[a.isoformat(), b.isoformat()] for a, b in gaps if b > a]}
+
+
+def _category_coverage(raw: Any) -> dict[str, dict[str, str]] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("category_coverage must be an object")
+    out = {}
+    for c, v in raw.items():
+        out[str(c)] = {"through": parse_time(v["through"], "through").isoformat(),
+                       "verified_at": parse_time(v["verified_at"], "verified_at").isoformat()}
+    return out
 
 
 def _data_class(store: "CalendarStore") -> dict[str, int]:

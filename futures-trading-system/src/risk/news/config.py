@@ -103,6 +103,9 @@ class NewsConfig:
     unexpected_max_age: pd.Timedelta
     explain: bool
     required_categories: tuple[str, ...] = ()
+    manual_max_age: pd.Timedelta = pd.Timedelta(days=7)
+    manual_horizon: pd.Timedelta = pd.Timedelta(days=14)
+    official_domains: tuple[str, ...] = ()
     source_path: str = ""
 
     @property
@@ -139,6 +142,7 @@ SECTIONS = {
     "unexpected": {"enabled", "provider", "keywords", "blackout_minutes", "max_item_age_minutes"},
     "diagnostics": {"explain"},
     "coverage": {"required_categories"},
+    "manual": {"max_verification_age_days", "operational_horizon_days", "official_domains"},
 }
 
 
@@ -314,6 +318,13 @@ def load_news_config(path: str | Path | None = None) -> NewsConfig:
     required = (raw.get("coverage") or {}).get("required_categories", [])
     if not isinstance(required, list) or any(c not in events for c in required):
         raise ConfigError("[coverage] required_categories must list known event categories")
+    man = raw.get("manual") or {}
+    domains = man.get("official_domains", [])
+    if not isinstance(domains, list) or not domains or not all(
+            isinstance(d, str) and re.fullmatch(r"[a-z0-9.-]+\.(gov|org|com)", d) for d in domains):
+        raise ConfigError("[manual] official_domains must be a non-empty list of domain names")
+    man_age = _num(man, "max_verification_age_days", "manual", minimum=0, strict=True) if man else 7
+    man_horizon = _num(man, "operational_horizon_days", "manual", minimum=0, strict=True) if man else 14
     unexpected = raw.get("unexpected") or {"enabled": False}
     u_enabled = _bool(unexpected, "enabled", "unexpected")
     u_provider = unexpected.get("provider", "")
@@ -346,6 +357,8 @@ def load_news_config(path: str | Path | None = None) -> NewsConfig:
         unexpected_blackout=_minutes(unexpected.get("blackout_minutes", 30), "[unexpected] blackout_minutes"),
         unexpected_max_age=_minutes(unexpected.get("max_item_age_minutes", 120), "[unexpected] max_item_age_minutes"),
         explain=bool((raw.get("diagnostics") or {}).get("explain", True)), required_categories=tuple(required),
+        manual_max_age=pd.Timedelta(days=man_age), manual_horizon=pd.Timedelta(days=man_horizon),
+        official_domains=tuple(d.lower() for d in domains),
         source_path=str(p))
 
 

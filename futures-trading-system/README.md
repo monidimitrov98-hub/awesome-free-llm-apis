@@ -998,6 +998,72 @@ status, an optional impact and category, a source, a reliability, a provenance, 
 and `provider_class`. A manual provider file only needs `coverage_start`, `coverage_end` and
 `events`.
 
+### Maintaining the manual calendar (`data/news/manual_calendar.json`)
+
+The committed file is a **template**. Every category in it is `unresolved` and there are no
+events, so `--readiness` reports `CALENDAR INCOMPLETE` and NewsGuard blocks new entries until
+you complete it. Never copy dates from unofficial sites and never guess them.
+
+| Category | Official source |
+| --- | --- |
+| CPI, Core CPI | https://www.bls.gov/schedule/news_release/cpi.htm |
+| NFP, unemployment rate | https://www.bls.gov/schedule/news_release/empsit.htm |
+| PPI | https://www.bls.gov/schedule/news_release/ppi.htm |
+| JOLTS | https://www.bls.gov/schedule/news_release/jolts.htm |
+| Initial jobless claims | https://oui.doleta.gov/unemploy/claims_arch.asp (normally Thursday 08:30 ET; moved on federal holidays) |
+| ISM manufacturing / services | https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/ |
+| Fed Chair speeches and testimony | https://www.federalreserve.gov/newsevents/calendar.htm |
+| Treasury quarterly refunding | https://home.treasury.gov/policy-issues/financing-the-government/quarterly-refunding (each refunding statement announces the next date) |
+| FOMC decision, statement, press conference **times** | https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm. The dates come from the verified `fomc` provider; add times only when officially confirmed |
+
+PCE, GDP and retail sales come from the verified live BEA and Census providers.
+
+**Workflow** (at least weekly, and whenever an agency announces a change):
+
+1. Open the official page for the category.
+2. Add one event per release:
+   - `name`, `category`, `scheduled_at` (New York local time, e.g. `2027-01-13T08:30:00`) and
+     `"timezone": "America/New_York"`;
+   - `source` (the official page), `"provenance": "manual"`,
+     `"verification_status": "verified"` and `last_verified` (UTC).
+
+   If only the date is confirmed, use `"date_only"` with `date`: the whole day is blocked. If
+   not even the date is confirmed, add it as `"unresolved"` without a date: the category then
+   stays uncovered and trading stays blocked.
+3. Set the category to `"status": "verified"`, with `verified_through` and `last_verified`
+   (UTC, now). `verified_through` is the last date up to which you confirmed that every
+   release of the category is listed. This also applies when there are none: for example, no
+   Fed Chair appearance scheduled.
+4. Keep `verified_through` at least `operational_horizon_days` (14) ahead, and re-check within
+   `max_verification_age_days` (7). Otherwise the category becomes CALENDAR STALE or INCOMPLETE.
+5. Run the checks:
+
+```
+python run_news_calendar.py --validate-manual            # errors -> exit 9
+python run_news_calendar.py --readiness --refresh-first  # OPERATIONAL READY -> exit 0, otherwise 8
+```
+
+**What `--validate-manual` reports:** missing categories; verified events without a time and
+date-only events without a date; unknown or unofficial sources (only https URLs on the
+domains in `[manual] official_domains`); duplicate events or ids; invalid timezones and DST
+gaps; events not re-verified recently; the high-impact events in the next 14 days; and whether
+every category covers the operational horizon.
+
+**`--readiness` verdicts:**
+
+| Verdict | Meaning |
+| --- | --- |
+| `OPERATIONAL READY` | Every required category is covered by healthy verified-live or manual data for the whole horizon |
+| `CALENDAR INCOMPLETE` | A required category is unresolved, uncovered or too short |
+| `CALENDAR STALE` | Verification or data too old |
+| `PROVIDER UNAVAILABLE` | A provider failed or is recovering |
+| `EVENT DATA INVALID` | Malformed manual file, an old-format file, or synthetic data |
+| `CONFIGURATION NOT OPERATIONAL` | The filter is not enforcing, or an unverified live provider is enabled |
+
+The verdict is `READY` only when no finding applies, and an invariant re-checks every
+required category before it is returned. Invalid manual data also makes the provider refresh
+fail, so NewsGuard blocks entries too.
+
 ### Research mode vs operational mode
 
 - **Research mode (backtests).** A historical point-in-time calendar file is used. Manual,
@@ -1157,6 +1223,10 @@ verified yet.
     (Census, FOMC) break if the agencies change their page layout; they then fail closed.
   - FOMC times are not published on the calendar page, so decision days are blocked all day
     unless the manual file gives the times.
+  - The committed manual calendar is an unresolved template. Operational readiness needs you
+    to verify and record the BLS, DOL, ISM, Fed Chair and Treasury schedules by hand, at least
+    weekly. The system cannot check that you transcribed the dates correctly; it only checks
+    structure, sources, freshness and coverage.
   - Historical backtests need a point-in-time calendar. Without one, every entry is
     blocked (fail closed). Schedule changes published after the fact cannot be
     reconstructed unless their `known_at` was recorded.

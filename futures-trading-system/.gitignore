@@ -9,3 +9,7 @@ data/*
 !data/samples/
 validation_history/
 models/
+# the manual calendar is maintained in git; live stores are not
+!data/news/
+data/news/*
+!data/news/manual_calendar.json
