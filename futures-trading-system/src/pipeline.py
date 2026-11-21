@@ -12,7 +12,7 @@ from src.data.contracts import ContractInfo, identify_contract
 from src.data.errors import DataError, DataValidationError
 from src.data.loader import load_csv
 from src.data.report import DataQualityReport
-from src.data.resample import check_session_alignment, resample_ohlcv
+from src.data.resample import check_bin_alignment, check_session_alignment, resample_ohlcv
 from src.data.sessions import assign_session_dates
 from src.data.validation import validate_ohlcv
 from src.indicators.compute import add_indicators
@@ -135,6 +135,7 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
     frames: dict[str, pd.DataFrame] = {}
     for tf in config.timeframes:
         check_session_alignment(session, tf)
+        check_bin_alignment(base.index, session, tf)
         bars = resample_ohlcv(base, tf, dcfg.base_frequency)
         frames[tf] = add_indicators(bars, config.indicators, session)
         incomplete = int((~bars["is_complete"]).sum())
@@ -142,7 +143,8 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
             report.add(
                 "info",
                 "INCOMPLETE_BARS",
-                f"{tf}: bars built from fewer source bars than nominal (see is_complete column)",
+                f"{tf}: bars built from fewer source bars than nominal; is_complete=False. "
+                "Never generate signals from these bars",
                 count=incomplete,
             )
 

@@ -73,3 +73,22 @@ def test_explicit_format():
 def test_mixed_naive_and_offset_rejected():
     with pytest.raises(TimestampError):
         normalize_to_utc(pd.Series(["2025-01-15 09:30:00Z", "2025-01-15 09:31:00"]), NY)
+
+
+def test_utc_suffix_parsed_and_mixing_with_naive_rejected():
+    r = normalize_to_utc(pd.Series(["2025-01-15 14:30:00 UTC", "2025-01-15 14:31:00 UTC"]), NY)
+    assert list(r.utc) == [pd.Timestamp("2025-01-15 14:30", tz="UTC"), pd.Timestamp("2025-01-15 14:31", tz="UTC")]
+    # Previously the naive row silently became NaT; now the inconsistency is an explicit error.
+    with pytest.raises(TimestampError):
+        normalize_to_utc(pd.Series(["2025-01-15 14:30:00 UTC", "2025-01-15 09:31:00"]), NY)
+    # Lower-case zone names: pandas 2.x parses them, pandas 3.x does not. Either way
+    # the result is the correct instant, NaT (counted as unparseable) or a
+    # TimestampError -- never a wrong value and never a raw library exception.
+    for values in (["2025-01-15 14:30:00 utc"], ["2025-01-15 14:30:00 UTC", "2025-01-15 14:30:00 utc"]):
+        try:
+            r = normalize_to_utc(pd.Series(values), NY)
+        except TimestampError:
+            continue
+        for ts in r.utc:
+            assert pd.isna(ts) or ts == pd.Timestamp("2025-01-15 14:30", tz="UTC")
+        assert r.n_unparseable == int(r.utc.isna().sum())

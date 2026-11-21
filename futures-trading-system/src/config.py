@@ -53,7 +53,12 @@ class SessionConfig:
 
     @property
     def duration(self) -> pd.Timedelta:
-        """Nominal length of the session (ignores DST transitions and early closes)."""
+        """Nominal wall-clock length of the session.
+
+        Ignores DST transitions and early closes. Use
+        :func:`src.data.sessions.session_bounds` for the real elapsed length of a
+        specific session date (validation does).
+        """
         seconds = self.end_seconds - self.start_seconds
         if self.is_overnight:
             seconds += 24 * 3600

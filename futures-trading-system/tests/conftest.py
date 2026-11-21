@@ -45,3 +45,18 @@ def make_bars(start_utc: str, closes: list[float], freq: str = "1min", volume: f
 def write_csv(path: Path, text: str) -> Path:
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def full_session_bars(session: SessionConfig, session_dates: list[str], freq: str = "1min") -> pd.DataFrame:
+    """Every bar of each session's real (DST-aware) window, built from exact UTC bounds."""
+    from src.data.sessions import session_bounds
+
+    bounds = session_bounds(pd.to_datetime(session_dates), session)
+    parts = [
+        pd.date_range(b.start, b.end, freq=freq, inclusive="left", name="timestamp") for b in bounds.itertuples()
+    ]
+    idx = parts[0].append(parts[1:]) if len(parts) > 1 else parts[0]
+    n = len(idx)
+    return pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": np.full(n, 10.0)}, index=idx
+    )

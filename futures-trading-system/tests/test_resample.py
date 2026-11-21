@@ -66,3 +66,47 @@ def test_session_alignment_check(globex):
     odd = SessionConfig("odd", time(9, 35), time(16, 0), "America/New_York")
     with pytest.raises(DataError):
         check_session_alignment(odd, "15min")
+
+
+# --- correction pass: incomplete bars, availability time, alignment -------------
+
+def test_incomplete_bars_explicit_and_nothing_removed_or_fabricated():
+    df = make_bars("2025-03-10 13:30", [float(i) for i in range(1, 31)], volume=list(range(1, 31)))
+    df = df.drop(df.index[[3, 17, 18]])  # 27 real bars remain
+    for tf, expected_n in (("5min", 5), ("15min", 15)):
+        out = resample_ohlcv(df, tf, "1min")
+        assert out["n_source_bars"].sum() == len(df)  # every valid source bar used once
+        assert out["volume"].sum() == df["volume"].sum()  # no volume invented or lost
+        assert (out["is_complete"] == (out["n_source_bars"] == expected_n)).all()
+        assert out["is_complete"].dtype == bool and (~out["is_complete"]).sum() >= 1
+    five = resample_ohlcv(df, "5min", "1min")
+    assert five["is_complete"].tolist() == [False, True, True, False, True, True]
+
+
+def test_available_at_is_bar_close():
+    df = make_bars("2025-03-10 13:30", [1.0] * 15)
+    for tf, delta in (("1min", 1), ("5min", 5), ("15min", 15)):
+        out = resample_ohlcv(df, tf, "1min")
+        assert (out["available_at"] - out.index == pd.Timedelta(minutes=delta)).all()
+
+
+def test_bin_alignment_ok_for_new_york_across_dst(globex):
+    from src.data.resample import check_bin_alignment
+    from tests.conftest import full_session_bars
+
+    df = full_session_bars(globex, ["2025-03-07", "2025-03-10", "2025-10-31", "2025-11-03"])
+    for tf in ("1min", "5min", "15min"):
+        check_bin_alignment(df.index, globex, tf)
+
+
+def test_bin_alignment_detects_half_hour_utc_offset():
+    from datetime import time
+
+    from src.data.resample import check_bin_alignment
+
+    kolkata = SessionConfig("nse", time(10, 0), time(15, 0), "Asia/Kolkata")  # 04:30-09:30 UTC
+    check_session_alignment(kolkata, "60min")  # local check passes...
+    idx = pd.date_range("2025-03-10 04:30", periods=10, freq="1min", tz="UTC")
+    check_bin_alignment(idx, kolkata, "30min")
+    with pytest.raises(DataError, match="bin edge"):
+        check_bin_alignment(idx, kolkata, "60min")  # ...but UTC bins would straddle the open

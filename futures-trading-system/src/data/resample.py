@@ -1,12 +1,20 @@
 """OHLCV resampling.
 
 Bars are **left-labelled**: a 5-minute bar stamped 09:30 contains source bars
-09:30 to 09:34 and is only fully known at 09:35. Downstream code must treat a
-bar's values as available at ``timestamp + timeframe``.
+09:30 to 09:34 and is only fully known at 09:35. Each output bar carries that
+instant in ``available_at`` (= ``timestamp + timeframe``).
 
-Empty bins are dropped, never filled. Each output bar records how many source
-bars it contains (``n_source_bars``) and whether that equals the nominal count
-(``is_complete``).
+Empty bins are dropped, never filled, and no valid bar is removed. Each output
+bar records how many source bars it contains (``n_source_bars``) and whether that
+equals the nominal count (``is_complete``).
+
+RULE FOR DOWNSTREAM CODE (strategy, backtest, dashboard):
+    Never generate a signal from a bar with ``is_complete == False``, and never act
+    on a bar before ``available_at``. An incomplete bar is missing source data (a
+    gap, a dropped invalid row, or the edge of the file) and its high/low/close and
+    volume understate the real bar. Indicators are still computed through such bars
+    (they are real observations), so a signal on a later complete bar may be
+    influenced by an earlier incomplete one; ``report.gaps`` shows where.
 """
 
 from __future__ import annotations
@@ -39,6 +47,32 @@ def check_session_alignment(session: SessionConfig, timeframe: str) -> None:
             )
 
 
+def check_bin_alignment(index: pd.DatetimeIndex, session: SessionConfig, timeframe: str) -> None:
+    """Check, for the sessions actually present in ``index``, that every session
+    start and end instant (DST-aware, in UTC) falls on a ``timeframe`` bin edge.
+
+    Bins are aligned to UTC midnight, so this catches timezones whose UTC offset
+    is not a multiple of the timeframe (e.g. +05:30 with 1h bars), which the purely
+    local check in :func:`check_session_alignment` cannot see.
+
+    Raises:
+        DataError: If a session boundary falls inside a bin.
+    """
+    from src.data.sessions import assign_session_dates, session_bounds
+
+    if len(index) == 0:
+        return
+    bounds = session_bounds(assign_session_dates(index, session), session)
+    for col in ("start", "end"):
+        edges = bounds[col]
+        misaligned = edges[edges != edges.dt.floor(timeframe)]
+        if not misaligned.empty:
+            raise DataError(
+                f"Session '{session.name}' {col} {misaligned.iloc[0]} (UTC) is not on a {timeframe} bin "
+                "edge; resampled bars would straddle the session boundary"
+            )
+
+
 def resample_ohlcv(df: pd.DataFrame, timeframe: str, base_frequency: str) -> pd.DataFrame:
     """Aggregate OHLCV bars to ``timeframe``.
 
@@ -51,7 +85,8 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str, base_frequency: str) -> pd.
         base_frequency: Frequency of the input bars.
 
     Returns:
-        Frame with ``open, high, low, close, volume, n_source_bars, is_complete``.
+        Frame with ``open, high, low, close, volume, n_source_bars, is_complete,
+        available_at``.
 
     Raises:
         DataError: If the timeframe is not a multiple of the base frequency or
@@ -73,5 +108,6 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str, base_frequency: str) -> pd.
     out = out[out["n_source_bars"] > 0].copy()
     out["n_source_bars"] = out["n_source_bars"].astype(int)
     out["is_complete"] = out["n_source_bars"] == expected
+    out["available_at"] = out.index + tf
     out.index.name = "timestamp"
     return out

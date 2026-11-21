@@ -20,7 +20,7 @@ import pandas as pd
 from src.config import SessionConfig
 from src.data.errors import DataError
 from src.data.report import DataQualityReport
-from src.data.sessions import assign_session_dates
+from src.data.sessions import assign_session_dates, expected_bars_per_session
 
 PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
 REQUIRED_COLUMNS: tuple[str, ...] = PRICE_COLUMNS + ("volume",)
@@ -148,17 +148,19 @@ def validate_ohlcv(
                 examples=[f"{r.gap_start} -> {r.gap_end}" for r in gaps.head().itertuples()],
             )
 
-        freq = pd.Timedelta(pd.tseries.frequencies.to_offset(base_frequency))
-        expected = int(session.duration / freq)
-        counts = sess[usable].value_counts().sort_index()
+        # Expected bars use each session's real elapsed length, so sessions containing
+        # a DST transition expect e.g. 22h or 24h of bars instead of a fixed 23h.
+        # Only on-grid bars count, so off-grid timestamps cannot make a session look full.
+        counts = sess[usable & ~off_grid].value_counts().sort_index()
+        expected = expected_bars_per_session(counts.index, session, base_frequency).reindex(counts.index)
         short = counts[counts < expected]
         if not short.empty:
             report.add(
                 "info",
                 "INCOMPLETE_SESSION",
-                f"Sessions with fewer than the nominal {expected} bars (partial file edges, "
+                "Sessions with fewer bars than their DST-aware expected count (partial file edges, "
                 "early closes, holidays or missing data)",
                 count=len(short),
-                examples=[f"{d.date()}: {c} bars" for d, c in short.items()],
+                examples=[f"{d.date()}: {c}/{expected[d]} bars" for d, c in short.items()],
             )
     return report, invalid

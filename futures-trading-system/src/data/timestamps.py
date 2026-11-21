@@ -8,8 +8,8 @@ import pandas as pd
 
 from src.data.errors import TimestampError
 
-# Trailing 'Z' or '+HH:MM' / '-HHMM' after a time component.
-_OFFSET_PATTERN = r"\d:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:Z|[+-]\d{2}:?\d{2})$"
+# Trailing 'Z', '+HH:MM' / '-HHMM' or a 'UTC'/'GMT' suffix after a time component.
+_OFFSET_PATTERN = r"\d:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:Z|UTC|GMT|[+-]\d{2}:?\d{2})$"
 
 
 @dataclass(frozen=True)
@@ -67,16 +67,19 @@ def normalize_to_utc(
         aware = True
     else:
         text = raw.astype("string").str.strip()
-        has_offset = text.str.contains(_OFFSET_PATTERN, regex=True, na=False)
-        if has_offset.any():
-            if not has_offset[~is_missing.to_numpy()].all():
-                raise TimestampError(
-                    "File mixes timestamps with and without UTC offsets; cannot interpret them consistently"
-                )
-            # Explicit offsets (possibly mixed across DST): parse straight to UTC.
-            parsed = pd.to_datetime(text, format=fmt, errors="coerce", utc=True)
-        else:
-            parsed = pd.to_datetime(text, format=fmt, errors="coerce")
+        has_offset = text.str.contains(_OFFSET_PATTERN, regex=True, na=False, case=False)
+        if has_offset.any() and not has_offset[~is_missing.to_numpy()].all():
+            raise TimestampError(
+                "File mixes timestamps with and without UTC offsets; cannot interpret them consistently"
+            )
+        try:
+            if has_offset.any():
+                # Explicit offsets (possibly mixed across DST): parse straight to UTC.
+                parsed = pd.to_datetime(text, format=fmt, errors="coerce", utc=True)
+            else:
+                parsed = pd.to_datetime(text, format=fmt, errors="coerce")
+        except Exception as exc:  # e.g. unknown zone names; type differs across pandas versions
+            raise TimestampError(f"Cannot parse timestamps: {exc}") from exc
         if isinstance(parsed.dtype, pd.DatetimeTZDtype):
             utc = parsed.dt.tz_convert("UTC")
             aware = True

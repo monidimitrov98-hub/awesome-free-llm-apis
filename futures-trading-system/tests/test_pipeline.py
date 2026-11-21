@@ -83,3 +83,14 @@ def test_contract_from_filename_without_symbol_column(tmp_path, config):
     md = build_market_data(p, config)
     assert md.contract.label == "MNQM25" and md.contract_source == "filename"
     assert not md.is_synthetic
+
+
+def test_pipeline_frames_mark_incomplete_bars(tmp_path, config):
+    rows = [f"2025-03-10 09:{m:02d}:00,100,101,99,100,10,MESH25\n" for m in range(30, 45) if m != 33]
+    md = build_market_data(write_csv(tmp_path / "MESH25_x.csv", HEADER + "".join(rows)), config)
+    five = md.frames["5min"]
+    assert five["is_complete"].tolist() == [False, True, True]
+    assert five["n_source_bars"].tolist() == [4, 5, 5]
+    assert (five["available_at"] - five.index == pd.Timedelta(minutes=5)).all()
+    assert md.report.get("INCOMPLETE_BARS").count == 1
+    assert len(md.base) == 14  # the missing 09:33 bar was not fabricated

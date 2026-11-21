@@ -134,8 +134,9 @@ bars_5m = md.frames["5min"]
 | Item | Definition |
 |---|---|
 | Timestamps | Converted to tz-aware UTC. Naive values are localized with DST rules first. Unparseable or ambiguous values are reported, never guessed. |
-| Sessions | Globex runs 18:00 to 17:00 New York time (end exclusive). Each bar's `session_date` is the trade date, so Sunday 18:00 belongs to Monday. RTH 09:30–16:00 is also configured. |
-| Resampling | Bars are left-labelled: the 09:30 5m bar covers 09:30:00–09:34:59 and is **known only at 09:35**. Empty bins are dropped. `n_source_bars` and `is_complete` flag partial bars. |
+| Sessions | Globex runs 18:00 to 17:00 New York time (end exclusive). Each bar's `session_date` is the trade date, so Sunday 18:00 belongs to Monday. RTH 09:30–16:00 is also configured. Each session's start and end are resolved to exact UTC instants, so DST is handled per session. A boundary that falls in the skipped spring hour moves forward. One that falls in the repeated autumn hour uses its first occurrence. |
+| Resampling | Bars are left-labelled: the 09:30 5m bar covers 09:30:00–09:34:59 and is **known only at 09:35** (`available_at`). Empty bins are dropped, never filled, and no valid bar is removed. `n_source_bars` and `is_complete` flag partial bars. |
+| Session completeness | Expected bars per session come from that session's real elapsed length: 22h, 23h or 24h, not a fixed 23h. Sessions with fewer on-grid bars are reported as `INCOMPLETE_SESSION` (e.g. `500/540 bars`). |
 | EMA | `alpha = 2/(n+1)`, seeded with the SMA of the first n closes. NaN before that. |
 | RSI | Wilder: the first averages are simple means of n changes, then `(prev*(n-1)+x)/n`. If the average loss is 0 the RSI is 100, or 50 when the price is flat. |
 | ATR | `TR = max(H-L, |H-Cprev|, |L-Cprev|)`, with `TR0 = H0-L0`. Wilder smoothing is seeded with the mean of the first n TRs. |
@@ -144,13 +145,41 @@ bars_5m = md.frames["5min"]
 
 EMA, RSI and ATR run continuously across sessions. Only VWAP resets.
 
+## Rules for downstream code (Sprint 2 onwards)
+
+Every resampled frame has these columns:
+
+| Column | Meaning |
+|---|---|
+| `n_source_bars` | Number of 1m bars that went into the bar |
+| `is_complete` | `True` only when `n_source_bars` equals the nominal count (5 for 5m, 15 for 15m) |
+| `available_at` | The earliest instant the bar's values are known (`timestamp + timeframe`) |
+
+Strategy, backtest and dashboard code **must**:
+
+1. **Never generate a signal from a bar with `is_complete == False`.** Such a bar is missing
+   source data, so its high, low, close and volume understate the real bar. Filter with
+   `frame[frame["is_complete"]]`, or check the flag on the signal bar.
+2. **Never act on a bar before `available_at`.** A bar's timestamp is its open, so acting at
+   the timestamp would be look-ahead.
+3. Be aware that indicators are still computed *through* incomplete bars, because those bars
+   are real observations, not fabricated data. A later complete bar can therefore carry
+   influence from an earlier incomplete one. `report.gaps` and the `INCOMPLETE_BARS` report
+   entry show where this applies.
+
+The engine never removes valid data or fabricates bars to make a frame look complete.
+
 **Look-ahead protection:** every indicator is causal. `tests/test_no_lookahead.py` checks that
 truncating the data, or changing future bars, never changes earlier values.
 
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.
-  Shortened sessions are reported only as `INCOMPLETE_SESSION` (info).
+  Shortened sessions are reported only as `INCOMPLETE_SESSION` (info). Expected bar counts
+  are DST-aware but do not know about holidays or early closes.
+- US DST changes at 02:00 on a Sunday, while CME Globex is closed, so with the default
+  config every real Globex session is 23h. The DST-aware logic matters for sessions that
+  contain a transition: custom sessions, other timezones, or stray weekend data.
 - Gaps are detected only *between* bars of the same session. Bars missing at the very
   start or end of a session show up only in the incomplete-session count.
 - Minutes with no trades are often simply absent from vendor files. They are reported as
@@ -160,7 +189,10 @@ truncating the data, or changing future bars, never changes earlier values.
 - No contract roll handling or back-adjustment. Continuous series show roll gaps.
   The expiry shown is the nominal third Friday and ignores holidays.
 - Bins are aligned to UTC midnight. This is correct for whole-hour timezone offsets
-  (New York, Chicago) and timeframes up to 1h.
+  (New York, Chicago) and timeframes up to 1h. For other offsets (e.g. +05:30) the
+  pipeline refuses to resample when a session boundary would fall inside a bin.
+- `is_complete` is relative to the source data. If a vendor file ends with a still-forming
+  1m bar, the engine cannot tell. Historical exports normally contain only finished bars.
 - Only MES and MNQ are configured. Other roots can be added under `[contracts]`.
 - Indicators use simple Python loops. They are fine for months of 1m data but not optimised
   for many years of tick data.
