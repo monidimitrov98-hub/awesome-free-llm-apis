@@ -43,6 +43,7 @@ class PullbackConfig:
     lookback_bars: int = 3
     zone_atr: float = 0.25
     max_penetration_atr: float = 0.50
+    require_structure_intact: bool = True
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,13 @@ class StopConfig:
 @dataclass(frozen=True)
 class TargetConfig:
     r_multiple: float = 2.0
+    # At the ACTUAL fill, reward/risk must be >= this fraction of the planned R
+    # (0.9 x 2.0 = 1.8). Enforced by the engine; 0 disables.
+    min_actual_r_fraction: float = 0.9
+
+    @property
+    def min_actual_r_multiple(self) -> float:
+        return self.r_multiple * self.min_actual_r_fraction
 
 
 @dataclass(frozen=True)
@@ -98,7 +106,6 @@ class FilterConfig:
     max_entries_per_session: int = 3
     cooldown_minutes: float = 15.0
     one_entry_per_pullback: bool = True
-    reject_incomplete_window: bool = True
 
 
 @dataclass(frozen=True)
@@ -149,7 +156,8 @@ class VwapPullbackConfig:
                 self.ema_fast_col, self.ema_slow_col, self.rsi_col, self.atr_col, "vwap", "rvol"]
 
     def with_r_multiple(self, r: float) -> "VwapPullbackConfig":
-        return replace(self, target=TargetConfig(r_multiple=float(r)))
+        """Same configuration with another target R (the fill-time fraction is kept)."""
+        return replace(self, target=replace(self.target, r_multiple=float(r)))
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -203,8 +211,8 @@ def _validate(c: VwapPullbackConfig) -> None:
     positive(p.lookback_bars, "pullback.lookback_bars")
     positive(p.zone_atr, "pullback.zone_atr", allow_zero=True)
     positive(p.max_penetration_atr, "pullback.max_penetration_atr", allow_zero=True)
-    positive(c.extension.max_vwap_distance_atr, "extension.max_vwap_distance_atr")
-    positive(c.extension.max_ema_distance_atr, "extension.max_ema_distance_atr")
+    positive(c.extension.max_vwap_distance_atr, "extension.max_vwap_distance_atr", allow_zero=True)
+    positive(c.extension.max_ema_distance_atr, "extension.max_ema_distance_atr", allow_zero=True)
     r = c.rsi
     for name in ("long_pullback_max", "long_recovery_min", "long_entry_max", "short_pullback_min",
                  "short_recovery_max", "short_entry_min"):
@@ -220,14 +228,17 @@ def _validate(c: VwapPullbackConfig) -> None:
     positive(st.buffer_ticks, "stop.buffer_ticks", allow_zero=True)
     positive(st.atr_multiplier, "stop.atr_multiplier")
     positive(st.min_distance_atr, "stop.min_distance_atr", allow_zero=True)
-    positive(st.max_distance_atr, "stop.max_distance_atr")
+    positive(st.max_distance_atr, "stop.max_distance_atr", allow_zero=True)
     positive(st.min_distance_ticks, "stop.min_distance_ticks", allow_zero=True)
     positive(st.max_distance_ticks, "stop.max_distance_ticks", allow_zero=True)
-    if st.min_distance_atr >= st.max_distance_atr:
+    if st.max_distance_atr and st.min_distance_atr >= st.max_distance_atr:
         raise ConfigError("stop.min_distance_atr must be < max_distance_atr")
     if st.max_distance_ticks and st.min_distance_ticks >= st.max_distance_ticks:
         raise ConfigError("stop.min_distance_ticks must be < max_distance_ticks")
     positive(c.target.r_multiple, "target.r_multiple")
+    positive(c.target.min_actual_r_fraction, "target.min_actual_r_fraction", allow_zero=True)
+    if c.target.min_actual_r_fraction > 1:
+        raise ConfigError("target.min_actual_r_fraction must be within 0..1")
     f = c.filters
     positive(f.max_entries_per_session, "filters.max_entries_per_session", allow_zero=True)
     positive(f.cooldown_minutes, "filters.cooldown_minutes", allow_zero=True)

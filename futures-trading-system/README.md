@@ -20,6 +20,7 @@ futures-trading-system/
 ├── config/settings.toml        # data settings: columns, timezones, sessions, contracts, indicator periods
 ├── config/backtest.toml        # backtest settings: capital, costs, slippage, execution policies, sizing, risk
 ├── config/strategy_vwap_pullback.toml  # strategy parameters (unvalidated research hypotheses)
+├── config/account_profiles/    # generic account-protection (drawdown) rule profiles
 ├── run_backtest.py             # run the strategy on a CSV and write all result files
 ├── data/samples/               # SYNTHETIC sample CSVs (clearly marked) + README
 ├── run_pipeline.py             # command-line entry point
@@ -43,6 +44,9 @@ futures-trading-system/
 │   ├── strategy/vwap_pullback.py, vwap_pullback_config.py   # VWAP Trend Pullback strategy
 │   ├── indicators/swings.py    # confirmed (non-repainting) swing pivots and market structure
 │   ├── backtest/runner.py      # CSV -> pipeline -> engine -> result files
+│   ├── backtest/manifest.py    # run manifests (config snapshot, data hash, git commit) + replay
+│   ├── backtest/validation.py  # date ranges, in-sample / out-of-sample, walk-forward, OOS ledger
+│   ├── risk/account.py         # account-level drawdown protection (AccountGuard)
 │   ├── ai/ dashboard/          # placeholders for later sprints
 └── tests/                      # pytest suite (one file per module/indicator)
 ```
@@ -558,6 +562,162 @@ same time of day. Earlier bars are rejected with `rvol_unavailable` unless `[rvo
 disabled. Real data is loaded as in Sprint 1, with the same column mapping and timezone
 settings.
 
+## Sprint 3 audit corrections
+
+Each correction below has its own regression test file:
+
+| Finding | Test file |
+|---|---|
+| H1, fill-price risk | `test_fix_h1_fill_quality.py` |
+| H2 and M1, data integrity and pullback key | `test_fix_h2_m1_structure.py` |
+| M2, independent filters | `test_fix_m2_filters.py` |
+| M3, order lifecycle | `test_fix_m3_lifecycle.py` |
+| Drawdown protection | `test_account_guard.py` |
+| M5 and M6, manifests and validation | `test_manifest_validation.py` |
+
+### Fill-price risk and reward/risk (H1)
+
+The strategy attaches three limits to every entry:
+- `max_stop_distance`: the smaller of `max_distance_atr × ATR` and the tick cap.
+- `min_stop_distance`: `max(min_distance_atr × ATR, min_distance_ticks)`.
+- `min_reward_risk`: `r_multiple × min_actual_r_fraction`, which is 2.0 × 0.9 = 1.8 by default.
+
+At the **actual simulated fill** the engine recomputes the stop distance, the reward/risk and
+the dollar risk. If a limit is violated it **rejects** the entry (`stop_too_wide_at_fill`,
+`stop_too_tight_at_fill` or `reward_risk_below_min_at_fill`). These checks run for **every
+sizing method, including fixed**, before the risk-budget and risk-engine checks. Stops and
+targets are never moved.
+
+Every fill attempt is logged in `entry_checks.csv`: fill price, planned and actual stop
+distance, planned and actual R, dollar risk, outcome and reason. Accepted trades carry the
+same columns in `trades.csv`.
+
+### Data integrity in market structure (H2)
+
+Swing pivots are accepted only if every bar of their `left + 1 + right` window is complete and
+exactly one period apart in **time**. A missing bar is never treated as an adjacent candle.
+
+Rejected pivot shapes are counted, and the diagnostics column `structure_data` shows
+`rejected_pivots=N`. When this leaves no valid structure, the setup is rejected with
+`structure_data_invalid`. Stops come only from valid pivots. The pullback window must also be
+complete, contiguous and in the current session. This is data integrity, not a filter, so it
+cannot be switched off.
+
+### Stable pullback identity (M1)
+
+A pullback's id is the last confirmed swing high (long) or low (short). If none is confirmed,
+it is the bar holding the session's highest high (lowest low) up to the latest touch of the
+zone. That is the same timestamp format a later pivot confirmation of that bar produces.
+
+The id does not move with the lookback window, so one pullback can only be entered once.
+
+### Independent filters (M2)
+
+- Trend strength is now **direction-free**: `|EMA9 − EMA21| / ATR`.
+- Direction is checked only by `require_ema_alignment`.
+- A value of 0 disables each numeric filter: trend strength, both extension limits, the
+  maximum stop distance and `min_actual_r_fraction`.
+- `pullback.require_structure_intact` switches the "pullback must not break the last swing"
+  rule on its own.
+- `test_fix_m2_filters.py` proves, filter by filter, that each one fails when on and has no
+  effect when off.
+
+### Signal ↔ engine reconciliation (M3)
+
+Every submitted signal has a `signal_id`, sent to the engine as `client_id`. The engine reports
+`accepted`, `rejected` (stage `signal` or `fill`), `filled` or `cancelled` through
+`Strategy.on_order_event`.
+
+These outcomes are recorded in three places:
+- **`signal_diagnostics.csv`**: the `order_status`, `order_reason` and `order_id` columns.
+- **`signals.csv`**: one lifecycle row per signal.
+- **`trades.csv`, `entry_checks.csv` and `engine_rejections.csv`**: these carry the same id.
+
+A pullback is *reserved* when its order is submitted, *released* if the order is rejected or
+cancelled, and *consumed* only when it fills. A second pending entry is impossible.
+
+### Reproducible runs (M5)
+
+Every result folder contains `manifest.json` with:
+- **Configuration:** the exact text of `settings.toml`, `backtest.toml`, the strategy file
+  and the account profile, plus parsed snapshots.
+- **Data:** the CSV's SHA-256, size and first/last bars, and the period's first/last bars and
+  sessions.
+- **Market setup:** the contract specification, timezone, column mapping, session and
+  indicator settings.
+- **Assumptions:** slippage, commission and the fill model.
+- **Environment:** the git commit (and whether the tree was dirty), and the Python, pandas,
+  numpy and tzdata versions.
+- **Run:** the command line and a result fingerprint (a hash of the trade log and equity
+  curve).
+
+`python run_backtest.py --replay <manifest.json>` rebuilds the configuration from the
+manifest, refuses an altered data file, re-runs the backtest and compares fingerprints.
+`REPRODUCED` exits 0; `MISMATCH` exits 3.
+
+### Historical validation controls (M6)
+
+```powershell
+python run_backtest.py --csv MNQ.csv --start 2025-01-06 --end 2025-03-28
+python run_backtest.py --csv MNQ.csv --in-sample 2025-01-02 2025-02-28 --out-of-sample 2025-03-03 2025-03-28
+python run_backtest.py --csv MNQ.csv --in-sample ... --out-of-sample ... --reveal-oos
+python run_backtest.py --csv MNQ.csv --walk-forward 40 10 --reveal-oos
+```
+
+- **Selection:** periods are selected by trade date (inclusive), and each period starts from
+  the initial capital. Indicators are computed on the whole file; they are causal, so earlier
+  data is only warm-up.
+- **Out-of-sample rules:**
+  - The out-of-sample period must start after the in-sample period ends.
+  - It stays **sealed** until `--reveal-oos` is given.
+  - It accepts **one** pre-registered configuration only. `--r-multiples` is refused there.
+- **Out-of-sample ledger:** every reveal is written to `oos_ledger.json`. Re-testing the same
+  data and out-of-sample period with a *different* configuration is refused (exit 4). It is
+  only possible with `--allow-oos-reuse`, which the manifest records.
+- **Walk-forward:** fixed-configuration rolling folds. There is no optimizer, so nothing is
+  fitted per fold.
+- **Reporting:** each period is reported separately and nothing is ranked.
+
+## Account-level drawdown protection
+
+`src/risk/account.py` (`AccountGuard`) is independent of the strategy and of any AI module. Its
+rules come from a profile file referenced by `config/backtest.toml`
+(`[account] protection_profile`). The strategy configuration cannot contain or override them:
+an unknown `[account_rules]` section is rejected.
+
+The shipped `config/account_profiles/generic_example.toml` holds **illustrative numbers, not
+any firm's rules**. A verified prop-firm profile must be added as its own file.
+
+**What the guard supports:**
+- **Drawdown models:**
+  - `static`: the floor is the initial balance − max drawdown.
+  - `trailing_eod`: the floor trails the highest end-of-session equity.
+  - `trailing_intraday`: the floor trails intraday equity, conservatively using each bar's
+    favourable extreme before its adverse move, or bar closes.
+- **Floor lock:** optional `floor_lock_offset` stops trailing at the initial balance plus an
+  offset.
+- **Entry blocking:**
+  - when the remaining buffer is at or below `safety_buffer` (checked at the signal and at
+    the fill);
+  - when a full stop-out of the new trade, using its actual risk at the fill, would leave less
+    than `safety_buffer` (`require_trade_risk_within_buffer`).
+- **Emergency flatten:** `floor + flatten_buffer` acts as a protective stop for open
+  positions, alongside the bracket stop and the daily-loss level (the closest triggers first).
+  Entries are then locked for the session or permanently.
+- **Breach:** equity at or below the floor locks trading permanently.
+- **Reporting:** the floor and buffer are added to the equity curve, and a summary goes to
+  `account_protection.json` and `metrics.json`.
+
+**What still needs a broker or prop-firm adapter:**
+- tick-level real-time equity and the firm's own equity calculation (fees, platform charges)
+- consistency rules, minimum trading days, payout rules and scaling plans
+- news-event and holiday restrictions, and weekend rules
+- per-account contract limits beyond `max_position_size`
+- any rule that depends on data this bar-based backtest does not have
+
+The realized loss can exceed the flatten level by the exit commission, the exit slippage and
+gaps. Size `flatten_buffer` accordingly.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.
@@ -607,9 +767,8 @@ settings.
 - **Strategy, market structure:** structure is evaluated within the current session only,
   and pivots need 2 confirmation bars, so structure lags by design. Ties (equal highs or
   lows) are not pivots.
-- **Strategy, entry counting:** a pullback is marked as used when the signal is emitted, even
-  if the engine or risk manager then rejects the order. `max_entries_per_session` counts
-  filled entries.
+- **Strategy, entry counting:** `max_entries_per_session` counts filled entries. A pullback
+  is consumed only by a filled entry.
 - **Strategy, no in-trade management:** there is no trailing stop, break-even or partial exit.
   Exits come from the bracket, the session flatten or the daily-loss limit.
 - **Backtest, daily loss:**

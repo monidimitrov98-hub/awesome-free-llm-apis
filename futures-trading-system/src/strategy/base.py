@@ -14,7 +14,7 @@ from typing import Mapping, Sequence
 
 import pandas as pd
 
-from src.backtest.orders import Fill, OrderRequest, Side
+from src.backtest.orders import Fill, OrderEvent, OrderRequest, Side
 from src.config import ContractSpec
 
 
@@ -76,3 +76,6 @@ class Strategy(ABC):
 
     def on_fill(self, fill: Fill) -> None:  # noqa: B027 - optional hook
         """Called after each simulated fill (informational)."""
+
+    def on_order_event(self, event: OrderEvent) -> None:  # noqa: B027 - optional hook
+        """Called when an order with a ``client_id`` is accepted, rejected, filled or cancelled."""

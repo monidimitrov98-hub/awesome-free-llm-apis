@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from src.config import PROJECT_ROOT, ConfigError
+from src.risk.account import AccountRules, load_account_rules
 from src.risk.manager import RiskConfig
 
 DEFAULT_BACKTEST_CONFIG_PATH: Path = PROJECT_ROOT / "config" / "backtest.toml"
@@ -63,6 +64,7 @@ class BacktestConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     sizing: SizingConfig = field(default_factory=SizingConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    account_rules: AccountRules = field(default_factory=AccountRules)  # disabled unless configured
 
     def cost_for(self, root: str) -> CostConfig:
         """Cost configuration for ``root``; raises if none is configured."""
@@ -151,4 +153,6 @@ def load_backtest_config(path: str | Path | None = None) -> BacktestConfig:
         execution=execution,
         sizing=sizing,
         risk=RiskConfig.from_dict(raw.get("risk", {})),
+        account_rules=(load_account_rules(account["protection_profile"])
+                       if str(account.get("protection_profile", "")).strip() else AccountRules()),
     )

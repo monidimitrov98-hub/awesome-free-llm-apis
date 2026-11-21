@@ -54,6 +54,12 @@ class OrderRequest:
     take_profit: float | None = None
     quantity: int | None = None
     tag: str = ""
+    client_id: str | None = None  # strategy's signal id; echoed in order events and logs
+    # Fill-time limits (price points / reward-to-risk). The engine re-checks them against the
+    # ACTUAL fill price and rejects the entry when violated, whatever the sizing method.
+    max_stop_distance: float | None = None
+    min_stop_distance: float | None = None
+    min_reward_risk: float | None = None
 
     @classmethod
     def enter(
@@ -66,9 +72,14 @@ class OrderRequest:
         take_profit: float | None = None,
         quantity: int | None = None,
         tag: str = "",
+        client_id: str | None = None,
+        max_stop_distance: float | None = None,
+        min_stop_distance: float | None = None,
+        min_reward_risk: float | None = None,
     ) -> "OrderRequest":
-        """Entry order (market, stop or limit) with optional bracket prices."""
-        return cls("entry", Side(side), OrderType(order_type), price, stop_loss, take_profit, quantity, tag)
+        """Entry order (market, stop or limit) with optional bracket prices and fill-time limits."""
+        return cls("entry", Side(side), OrderType(order_type), price, stop_loss, take_profit, quantity, tag,
+                   client_id, max_stop_distance, min_stop_distance, min_reward_risk)
 
     @classmethod
     def exit(cls, tag: str = "") -> "OrderRequest":
@@ -105,10 +116,32 @@ class Order:
     fill_price: float | None = None
     risk_budget: float | None = None  # set when sized by the risk method; re-checked at fill
     requested_quantity: int | None = None  # quantity before any reduction at fill
+    client_id: str | None = None
+    reference_price: float | None = None  # price the bracket was planned from (signal close / order price)
+    max_stop_distance: float | None = None
+    min_stop_distance: float | None = None
+    min_reward_risk: float | None = None
 
     @property
     def is_active(self) -> bool:
         return self.status is OrderStatus.PENDING
+
+
+@dataclass(frozen=True)
+class OrderEvent:
+    """Lifecycle notification sent to the strategy for orders carrying a ``client_id``.
+
+    ``status``: ``accepted`` (order created), ``rejected`` (``stage`` = signal or fill),
+    ``filled`` or ``cancelled``.
+    """
+
+    client_id: str
+    order_id: int | None
+    status: str
+    time: pd.Timestamp
+    stage: str = ""
+    reason: str = ""
+    detail: str = ""
 
 
 @dataclass(frozen=True)

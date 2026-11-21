@@ -4,6 +4,9 @@
 
 [account]
 initial_capital = 10000.0
+# Account-level drawdown protection profile (generic rules, see src/risk/account.py).
+# Strategy configuration cannot override it. "" disables account protection.
+protection_profile = "config/account_profiles/generic_example.toml"
 
 # Costs per contract root. PLACEHOLDER VALUES: set them to your own all-in cost
 # per contract per side (broker commission + exchange + clearing + NFA fees).

@@ -25,7 +25,23 @@ direction. LONG shown; SHORT is the mirror image.
    rounded with the engine's conservative tick rounding; min/max distance checks.
    Target = close + R x stop distance, rounded the same way.
 10. Filters: cooldown after an exit, max filled entries per session, one entry per
-    pullback (identified by the swing high the pullback started from).
+    pullback.
+
+Data integrity (not configurable): every bar used for pivots/structure, the stop and
+the pullback window must be complete and exactly one signal period apart in time;
+pivots whose window touches an incomplete bar or a missing bar are discarded
+(``structure_data_invalid`` when that leaves no valid structure).
+
+Pullback identity: the last confirmed swing high (long) / low (short); if none is
+confirmed, the bar holding the session's highest high (lowest low) up to the most
+recent touch of the zone. Neither depends on the moving lookback window, so one
+pullback keeps one id across consecutive bars. A pullback is *reserved* when the
+order is submitted, *released* if the engine rejects or cancels it and *consumed*
+only when the entry fills.
+
+Order lifecycle: every submitted signal carries a ``signal_id`` (``client_id``); the
+engine reports accepted / rejected / filled / cancelled, which is written back into
+the diagnostics row (``order_status``) and :meth:`signals_frame`.
 
 All checks are evaluated and recorded (see :meth:`diagnostics_frame`); the first
 failing check in this order is the ``rejection_reason``. A passing setup emits one
@@ -42,7 +58,7 @@ import numpy as np
 import pandas as pd
 
 from src.backtest.execution import conservative_order_price
-from src.backtest.orders import Fill, OrderRequest, OrderRole, OrderType, Side
+from src.backtest.orders import Fill, OrderEvent, OrderRequest, OrderRole, OrderType, Side
 from src.config import ContractSpec
 from src.indicators.swings import STRUCTURE_BEARISH, STRUCTURE_BULLISH, market_structure
 from src.strategy.base import Strategy, StrategyContext
@@ -63,6 +79,7 @@ class Reason:
     EMA_ALIGNMENT = "ema_alignment"
     TREND_TOO_WEAK = "trend_too_weak"
     STRUCTURE = "structure_not_aligned"
+    STRUCTURE_DATA_INVALID = "structure_data_invalid"
     CONTEXT_UNAVAILABLE = "context_unavailable"
     CONTEXT_STALE = "context_stale"
     CONTEXT_INCOMPLETE = "context_incomplete"
@@ -99,7 +116,10 @@ DIAGNOSTIC_COLUMNS = [
     "close", "vwap_relation", "ema_relation", "trend_strength_atr", "structure", "context_status",
     "pullback_status", "pullback_level", "extension_status", "candle_status", "rsi", "rsi_status",
     "rvol", "rvol_status", "stop_price", "stop_distance", "target_price", "target_distance", "pullback_id",
+    "structure_data", "signal_id", "order_status", "order_id", "order_stage", "order_reason",
 ]
+SIGNAL_COLUMNS = ["signal_id", "direction", "time", "session_date", "pullback_id", "order_id", "status",
+                  "accepted_at", "rejected_at", "filled_at", "cancelled_at", "stage", "reason", "detail"]
 
 
 def _fmt(value: float) -> float:
@@ -127,9 +147,11 @@ class VwapTrendPullbackStrategy(Strategy):
         self.diagnostics = []
         self._contract: ContractSpec | None = None
         self._entries_by_session: dict[pd.Timestamp, int] = defaultdict(int)
-        self._used_pullbacks: set[tuple[str, Any]] = set()
+        self._consumed_pullbacks: set[tuple[str, str]] = set()
+        self._reserved_pullbacks: dict[tuple[str, str], str] = {}  # pullback -> signal id
+        self._signals: dict[str, dict[str, Any]] = {}
         self._last_exit_time: pd.Timestamp | None = None
-        self._last_signal_session: pd.Timestamp | None = None
+        self._last_submitted_session: pd.Timestamp | None = None
         self._columns_checked = False
 
     def on_start(self, contract: ContractSpec) -> None:
@@ -138,14 +160,38 @@ class VwapTrendPullbackStrategy(Strategy):
 
     def on_fill(self, fill: Fill) -> None:
         if fill.role is OrderRole.ENTRY:
-            if self._last_signal_session is not None:
-                self._entries_by_session[self._last_signal_session] += 1
+            # Only one entry can be pending at a time, so this fill belongs to the last submitted signal.
+            if self._last_submitted_session is not None:
+                self._entries_by_session[self._last_submitted_session] += 1
         else:  # stop-loss, take-profit or any exit closes the position
             self._last_exit_time = fill.bar_time
 
+    def on_order_event(self, event: OrderEvent) -> None:
+        """Reconcile a submitted signal with what the engine actually did."""
+        sig = self._signals.get(event.client_id)
+        if sig is None:
+            return
+        sig["status"] = event.status
+        sig[f"{event.status}_at"] = event.time
+        sig.update(order_id=event.order_id, stage=event.stage, reason=event.reason, detail=event.detail)
+        row = self.diagnostics[sig["row"]]
+        row.update(order_status=event.status, order_id=event.order_id, order_stage=event.stage,
+                   order_reason=event.reason)
+        key = sig["pullback_key"]
+        if event.status in ("rejected", "cancelled"):
+            if self._reserved_pullbacks.get(key) == event.client_id:
+                del self._reserved_pullbacks[key]  # not traded: the pullback stays available
+        elif event.status == "filled":
+            self._reserved_pullbacks.pop(key, None)
+            self._consumed_pullbacks.add(key)
+
     def diagnostics_frame(self) -> pd.DataFrame:
-        """All evaluated setups with their statuses, decision and rejection reasons."""
+        """All evaluated setups with their statuses, decision, rejection reasons and order outcome."""
         return pd.DataFrame(self.diagnostics, columns=DIAGNOSTIC_COLUMNS)
+
+    def signals_frame(self) -> pd.DataFrame:
+        """One row per submitted signal: its lifecycle in the engine (final ``status``)."""
+        return pd.DataFrame(list(self._signals.values()), columns=SIGNAL_COLUMNS)
 
     # ------------------------------------------------------------------ decision
     def on_bar(self, ctx: StrategyContext) -> Sequence[OrderRequest] | None:
@@ -175,12 +221,31 @@ class VwapTrendPullbackStrategy(Strategy):
             if fails:
                 self._record(ctx, d, info, fails, decision="reject")
                 continue
+            signal_id = f"{self.name}:{d.value}:{ctx.bar.name.isoformat()}"
+            info.update(signal_id=signal_id, order_status="submitted")
             self._record(ctx, d, info, [], decision="signal")
-            self._used_pullbacks.add((d.value, info["pullback_id"]))
-            self._last_signal_session = ctx.session_date
-            requests.append(OrderRequest.enter(d, OrderType.MARKET, stop_loss=info["stop_price"],
-                                               take_profit=info["target_price"], tag=f"{self.name}:{d.value}"))
+            key = (d.value, info["pullback_id"])
+            self._reserved_pullbacks[key] = signal_id
+            self._last_submitted_session = ctx.session_date
+            self._signals[signal_id] = {
+                "signal_id": signal_id, "direction": d.value, "time": ctx.now, "session_date": ctx.session_date,
+                "pullback_id": info["pullback_id"], "status": "submitted", "row": len(self.diagnostics) - 1,
+                "pullback_key": key,
+            }
+            requests.append(OrderRequest.enter(
+                d, OrderType.MARKET, stop_loss=info["stop_price"], take_profit=info["target_price"],
+                tag=f"{self.name}:{d.value}", client_id=signal_id, **self._fill_limits(ctx, info)))
         return requests
+
+    def _fill_limits(self, ctx: StrategyContext, info: dict[str, Any]) -> dict[str, float | None]:
+        """Stop-width and reward/risk limits the engine must re-check at the ACTUAL fill."""
+        st, tick, atr = self.cfg.stop, ctx.contract.tick_size, info.get("atr", 0.0)
+        caps = [v for v in (st.max_distance_atr * atr if st.max_distance_atr and atr else None,
+                            st.max_distance_ticks * tick if st.max_distance_ticks else None) if v]
+        floor = max(st.min_distance_atr * atr, st.min_distance_ticks * tick)
+        return {"max_stop_distance": min(caps) if caps else None,
+                "min_stop_distance": floor if floor > 0 else None,
+                "min_reward_risk": self.cfg.target.min_actual_r_multiple or None}
 
     # ------------------------------------------------------------------ gates and inputs
     def _gate(self, ctx: StrategyContext) -> str | None:
@@ -207,22 +272,25 @@ class VwapTrendPullbackStrategy(Strategy):
         cols = [cfg.ema_fast_col, cfg.ema_slow_col, cfg.rsi_col, cfg.atr_col, "vwap"]
         if len(w) < n or w[cols].isna().any().any():
             return w, Reason.MISSING_INDICATOR
-        if cfg.filters.reject_incomplete_window:
-            step = ctx.bar["available_at"] - ctx.bar.name
-            contiguous = (pd.Series(w.index).diff().dropna() == step).all()
-            same_session = (w["session_date"] == ctx.session_date).all()
-            if not (contiguous and same_session and bool(w["is_complete"].all())):
-                return w, Reason.INCOMPLETE_WINDOW
+        # Data integrity (always on): complete bars, exactly one period apart, same session.
+        step = ctx.bar["available_at"] - ctx.bar.name
+        contiguous = (pd.Series(w.index).diff().dropna() == step).all()
+        same_session = (w["session_date"] == ctx.session_date).all()
+        if not (contiguous and same_session and bool(w["is_complete"].all())):
+            return w, Reason.INCOMPLETE_WINDOW
         return w, None
 
     def _structure(self, ctx: StrategyContext) -> pd.Series:
+        """Confirmed structure of the current session from complete, time-contiguous pivots."""
         s = self.cfg.structure
         hist = ctx.history.tail(s.lookback_bars)
         hist = hist[hist["session_date"] == ctx.session_date]  # structure of the current session only
         if len(hist) < s.swing_left_bars + s.swing_right_bars + 1:
             return pd.Series({"structure": "insufficient_pivots", "last_high": np.nan, "last_low": np.nan,
-                              "last_high_time": pd.NaT, "last_low_time": pd.NaT})
-        return market_structure(hist["high"], hist["low"], s.swing_left_bars, s.swing_right_bars).iloc[-1]
+                              "last_high_time": pd.NaT, "last_low_time": pd.NaT, "rejected_pivots": 0})
+        step = ctx.bar["available_at"] - ctx.bar.name
+        return market_structure(hist["high"], hist["low"], s.swing_left_bars, s.swing_right_bars,
+                                valid=hist["is_complete"].astype(bool), step=step).iloc[-1]
 
     # ------------------------------------------------------------------ evaluation
     def _evaluate(self, ctx: StrategyContext, d: Side, w: pd.DataFrame, ms: pd.Series,
@@ -237,23 +305,26 @@ class VwapTrendPullbackStrategy(Strategy):
         if atr <= 0:
             info["vwap_relation"] = "na"
             return [Reason.MISSING_INDICATOR]
-        info["close"] = close
+        info["close"], info["atr"] = close, atr
+        rejected = int(ms.get("rejected_pivots", 0) or 0)
+        info["structure_data"] = f"rejected_pivots={rejected}" if rejected else "ok"
 
         # --- trend
         info["vwap_relation"] = "above" if close > vwap else "below" if close < vwap else "at"
         info["ema_relation"] = "fast_above" if ema_f > ema_s else "fast_below" if ema_f < ema_s else "equal"
-        strength = (ema_f - ema_s) * sgn / atr
+        # Strength is direction-free; the direction is the separate EMA-alignment filter.
+        strength = abs(ema_f - ema_s) / atr
         info["trend_strength_atr"] = strength
         info["structure"] = ms["structure"]
         if cfg.trend.require_price_vs_vwap and not (close - vwap) * sgn > 0:
             fails.append(Reason.PRICE_VS_VWAP)
         if cfg.trend.require_ema_alignment and not (ema_f - ema_s) * sgn > 0:
             fails.append(Reason.EMA_ALIGNMENT)
-        if strength < cfg.trend.min_trend_strength_atr:
+        if cfg.trend.min_trend_strength_atr and strength < cfg.trend.min_trend_strength_atr:
             fails.append(Reason.TREND_TOO_WEAK)
         wanted = STRUCTURE_BULLISH if long else STRUCTURE_BEARISH
         if cfg.trend.require_structure and ms["structure"] != wanted:
-            fails.append(Reason.STRUCTURE)
+            fails.append(Reason.STRUCTURE_DATA_INVALID if rejected else Reason.STRUCTURE)
 
         # --- higher-timeframe context
         status = self._context_status(ctx, d)
@@ -264,8 +335,8 @@ class VwapTrendPullbackStrategy(Strategy):
         # --- pullback
         pw = w.tail(cfg.pullback.lookback_bars)
         level_cols = {"ema_fast": cfg.ema_fast_col, "ema_slow": cfg.ema_slow_col, "vwap": "vwap"}
-        touched, too_deep = None, False
-        for _, b in pw.iterrows():
+        touched, too_deep, last_touch = None, False, None
+        for t_bar, b in pw.iterrows():
             extreme = float(b["low"] if long else b["high"])
             b_atr = float(b[cfg.atr_col])
             for name in cfg.pullback.levels:
@@ -274,12 +345,14 @@ class VwapTrendPullbackStrategy(Strategy):
                 beyond = (level - extreme) * sgn  # > 0: below the level (long) / above it (short)
                 if -cfg.pullback.zone_atr * b_atr <= beyond <= cfg.pullback.max_penetration_atr * b_atr:
                     touched = touched or name
+                    last_touch = t_bar
                 elif beyond > cfg.pullback.max_penetration_atr * b_atr:
                     too_deep = True
         info["pullback_level"] = touched
         protective = ms["last_low"] if long else ms["last_high"]
         pullback_extreme = float(pw["low"].min() if long else pw["high"].max())
-        broke = not pd.isna(protective) and (pullback_extreme - float(protective)) * sgn <= 0
+        broke = (cfg.pullback.require_structure_intact and not pd.isna(protective)
+                 and (pullback_extreme - float(protective)) * sgn <= 0)
         if touched is None:
             info["pullback_status"] = "too_deep" if too_deep else "not_reached"
             fails.append(Reason.PULLBACK_TOO_DEEP if too_deep else Reason.PULLBACK_NOT_REACHED)
@@ -291,9 +364,9 @@ class VwapTrendPullbackStrategy(Strategy):
 
         # --- extension
         ext = []
-        if (close - vwap) * sgn / atr > cfg.extension.max_vwap_distance_atr:
+        if cfg.extension.max_vwap_distance_atr and (close - vwap) * sgn / atr > cfg.extension.max_vwap_distance_atr:
             ext.append(Reason.EXTENDED_FROM_VWAP)
-        if abs(close - ema_f) / atr > cfg.extension.max_ema_distance_atr:
+        if cfg.extension.max_ema_distance_atr and abs(close - ema_f) / atr > cfg.extension.max_ema_distance_atr:
             ext.append(Reason.EXTENDED_FROM_EMA)
         info["extension_status"] = ",".join(ext) or "ok"
         fails += ext
@@ -359,18 +432,34 @@ class VwapTrendPullbackStrategy(Strategy):
 
         # --- trade-management filters
         f = cfg.filters
-        anchor = ms["last_high_time"] if long else ms["last_low_time"]
-        if pd.isna(anchor):
-            anchor = pw.index[0]  # no pivot: identify the pullback by its window start
-        info["pullback_id"] = str(anchor)
+        info["pullback_id"] = self._pullback_id(ctx, d, ms, last_touch)
         if f.cooldown_minutes and self._last_exit_time is not None and \
                 ctx.now < self._last_exit_time + pd.Timedelta(minutes=f.cooldown_minutes):
             fails.append(Reason.COOLDOWN)
         if f.max_entries_per_session and self._entries_by_session[ctx.session_date] >= f.max_entries_per_session:
             fails.append(Reason.MAX_ENTRIES_PER_SESSION)
-        if f.one_entry_per_pullback and (d.value, info["pullback_id"]) in self._used_pullbacks:
+        key = (d.value, info["pullback_id"])
+        if f.one_entry_per_pullback and (key in self._consumed_pullbacks or key in self._reserved_pullbacks):
             fails.append(Reason.SAME_PULLBACK)
         return fails
+
+    @staticmethod
+    def _pullback_id(ctx: StrategyContext, d: Side, ms: pd.Series, last_touch: pd.Timestamp | None) -> str:
+        """Stable identity of the pullback (see module docstring)."""
+        long = d is Side.LONG
+        anchor = ms["last_high_time"] if long else ms["last_low_time"]
+        if not pd.isna(anchor):
+            return str(anchor)
+        if last_touch is None:
+            return "no_pullback"
+        h = ctx.history
+        h = h[(h["session_date"] == ctx.session_date) & h["is_complete"].astype(bool) & (h.index <= last_touch)]
+        if h.empty:
+            return "no_pullback"
+        series = h["high"] if long else -h["low"]
+        # Same format as the pivot anchor: when this extreme bar is later confirmed as the
+        # swing pivot, the id does not change, so the pullback cannot be entered twice.
+        return str(series[series == series.max()].index[-1])  # latest bar holding the extreme
 
     def _context_status(self, ctx: StrategyContext, d: Side) -> str:
         cfg = self.cfg
@@ -422,7 +511,8 @@ class VwapTrendPullbackStrategy(Strategy):
         fails = []
         if dist < max(st.min_distance_atr * atr, st.min_distance_ticks * tick) - 1e-9:
             fails.append(Reason.STOP_TOO_TIGHT)
-        if dist > st.max_distance_atr * atr + 1e-9 or (st.max_distance_ticks and dist > st.max_distance_ticks * tick + 1e-9):
+        if (st.max_distance_atr and dist > st.max_distance_atr * atr + 1e-9) or \
+                (st.max_distance_ticks and dist > st.max_distance_ticks * tick + 1e-9):
             fails.append(Reason.STOP_TOO_WIDE)
         target = conservative_order_price(close + sgn * self.cfg.target.r_multiple * dist, tick,
                                           OrderType.LIMIT, is_buy=not long)

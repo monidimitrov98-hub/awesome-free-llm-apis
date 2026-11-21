@@ -16,6 +16,8 @@ import pandas as pd
 
 from src.backtest.config import BacktestConfig
 from src.backtest.engine import BacktestEngine, BacktestResult
+from src.backtest.manifest import build_manifest, snapshot, write_manifest
+from src.backtest.validation import Period, session_dates, slice_frame
 from src.config import AppConfig, ConfigError
 from src.pipeline import MarketData, build_market_data
 from src.strategy.vwap_pullback import VwapTrendPullbackStrategy
@@ -30,6 +32,8 @@ class StrategyRun:
     strategy_config: VwapPullbackConfig
     result: BacktestResult
     diagnostics: pd.DataFrame
+    signals: pd.DataFrame | None = None
+    period: Period | None = None
 
 
 def _frames(md: MarketData, cfg: VwapPullbackConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
@@ -43,15 +47,26 @@ def _frames(md: MarketData, cfg: VwapPullbackConfig) -> tuple[pd.DataFrame, pd.D
 
 
 def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,
-                 label: str = "") -> StrategyRun:
-    """Backtest the VWAP Trend Pullback strategy on already-built market data."""
+                 label: str = "", period: Period | None = None) -> StrategyRun:
+    """Backtest the VWAP Trend Pullback strategy on already-built market data.
+
+    With ``period`` only sessions inside it are traded (indicators were computed on the
+    whole file and are causal, so earlier data is warm-up only). Each period starts from
+    the configured initial capital with a fresh risk manager and account guard.
+    """
     if md.contract.spec is None:
         raise ConfigError(f"No contract specification for {md.contract.root}")
     signal, execution, context = _frames(md, cfg)
+    if period is not None:
+        signal, execution = slice_frame(signal, period), slice_frame(execution, period)
+        context = {k: slice_frame(v, period) for k, v in context.items()}
+        if signal.empty or execution.empty:
+            raise ConfigError(f"No data inside period {period.to_dict()}")
     strategy = VwapTrendPullbackStrategy(cfg, app.session.timezone)
     engine = BacktestEngine(bt, md.contract.spec, app.session)
     result = engine.run(strategy, signal, execution, context_bars=context)
-    return StrategyRun(label or f"r_{cfg.target.r_multiple:g}", cfg, result, strategy.diagnostics_frame())
+    return StrategyRun(label or f"r_{cfg.target.r_multiple:g}", cfg, result, strategy.diagnostics_frame(),
+                       strategy.signals_frame(), period)
 
 
 def run_from_csv(csv_path: str | Path, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,
@@ -81,8 +96,13 @@ def _jsonable(obj: Any) -> Any:
     return obj
 
 
-def write_outputs(run: StrategyRun, md: MarketData, app: AppConfig, bt: BacktestConfig, out_dir: str | Path) -> Path:
-    """Write every artefact of one run to ``out_dir/<label>/`` and return that folder."""
+def write_outputs(run: StrategyRun, md: MarketData, app: AppConfig, bt: BacktestConfig, out_dir: str | Path,
+                  *, manifest: dict[str, Any] | None = None) -> Path:
+    """Write every artefact of one run to ``out_dir/<label>/`` and return that folder.
+
+    ``manifest``: when given (keys ``csv_path``, ``data_sha256``, ``config_texts`` and
+    optionally ``command_line``, ``oos``), a reproducibility ``manifest.json`` is written.
+    """
     folder = Path(out_dir) / run.label
     folder.mkdir(parents=True, exist_ok=True)
     r = run.result
@@ -93,6 +113,10 @@ def write_outputs(run: StrategyRun, md: MarketData, app: AppConfig, bt: Backtest
     r.rejections.to_csv(folder / "engine_rejections.csv", index=False)
     r.adjustments.to_csv(folder / "adjustments.csv", index=False)
     r.orders.to_csv(folder / "orders.csv", index=False)
+    r.entry_checks.to_csv(folder / "entry_checks.csv", index=False)
+    if run.signals is not None:
+        run.signals.to_csv(folder / "signals.csv", index=False)
+    (folder / "account_protection.json").write_text(json.dumps(snapshot(r.account), indent=2), encoding="utf-8")
     (folder / "metrics.json").write_text(json.dumps(_jsonable(r.metrics), indent=2), encoding="utf-8")
     config_used = {
         "source": md.report.source,
@@ -108,6 +132,14 @@ def write_outputs(run: StrategyRun, md: MarketData, app: AppConfig, bt: Backtest
                                              encoding="utf-8")
     (folder / "warnings.txt").write_text("\n".join(r.warnings) + "\n", encoding="utf-8")
     (folder / "data_quality.txt").write_text(md.report.summary() + "\n", encoding="utf-8")
+    if manifest is not None:
+        period = run.period.to_dict() if run.period else {"label": "full", "kind": "full", "fold": None,
+                                                           "start": None, "end": None}
+        sessions = session_dates(r.equity.reset_index()) if len(r.equity) else []
+        write_manifest(folder, build_manifest(
+            md=md, app=app, bt=bt, strategy_config=run.strategy_config, result=r, label=run.label, period=period,
+            sessions_in_period=[str(sessions[0].date()), str(sessions[-1].date()), len(sessions)] if sessions else None,
+            **manifest))
     return folder
 
 

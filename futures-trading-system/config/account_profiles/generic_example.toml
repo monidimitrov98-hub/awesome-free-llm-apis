@@ -1,0 +1,17 @@
+# GENERIC EXAMPLE account-protection profile. These are illustrative placeholder numbers
+# for a $10,000 simulated account, NOT any prop firm's rules. A verified prop-firm profile
+# (e.g. a specific evaluation or funded account) must be added as its own file and checked
+# against the firm's current written rules.
+
+[account_rules]
+enabled = true
+profile = "generic_example"
+description = "Illustrative trailing end-of-day drawdown; not a real firm's rules"
+drawdown_type = "trailing_eod"        # "static" | "trailing_eod" | "trailing_intraday"
+max_drawdown = 2000.0                 # dollars below the reference (initial balance or peak)
+floor_lock_offset = 0.0               # floor stops trailing at initial balance + 0; remove to never lock
+safety_buffer = 400.0                 # block new entries when equity - floor <= this
+flatten_buffer = 150.0                # close any position and lock entries when equity - floor <= this
+lock_after_flatten = "session"        # "session" | "permanent"
+intraday_peak_source = "favorable_extreme"  # trailing_intraday only: conservative peak tracking
+require_trade_risk_within_buffer = true     # a full stop-out must still leave >= safety_buffer

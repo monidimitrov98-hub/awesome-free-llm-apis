@@ -33,6 +33,24 @@ the simulated fill price (slippage included) BEFORE opening anything:
    if that is 0); ``"reject"`` rejects the entry. The quantity is never increased.
 3. The risk engine (windows, daily limits, size) is asked again.
 
+Fill-quality limits (all sizing methods)
+----------------------------------------
+Entry requests may carry ``max_stop_distance``, ``min_stop_distance`` (price points)
+and ``min_reward_risk``. At the simulated fill the engine recomputes the actual stop
+distance, the actual reward-to-risk ``|target - fill| / |fill - stop|`` and the
+actual dollar risk, and rejects the entry (``stop_too_wide_at_fill``,
+``stop_too_tight_at_fill``, ``reward_risk_below_min_at_fill``) before anything is
+opened. Stops and targets are never moved. Every fill attempt is logged in
+``result.entry_checks`` (planned vs actual values, outcome, reason).
+
+Account protection
+------------------
+An :class:`~src.risk.account.AccountGuard` (``config.account_rules``) blocks entries
+near the drawdown floor (at signal time and at the fill, including the trade's actual
+risk), turns ``floor + flatten_buffer`` into a protective stop level for open
+positions, and locks trading after a flatten or a breach. It is configured outside
+the strategy and cannot be overridden by it.
+
 Daily loss with unrealized PnL
 ------------------------------
 With ``risk.daily_loss_basis = "realized_and_unrealized"`` the limit is evaluated on
@@ -72,12 +90,14 @@ import pandas as pd
 from src.backtest.config import BacktestConfig
 from src.backtest.execution import BarPrices, SimFill, conservative_order_price, simulate_fill, apply_slippage
 from src.backtest.metrics import compute_metrics
-from src.backtest.orders import Fill, Order, OrderRequest, OrderRole, OrderStatus, OrderType, Side
+from src.backtest.execution import round_to_tick
+from src.backtest.orders import Fill, Order, OrderEvent, OrderRequest, OrderRole, OrderStatus, OrderType, Side
 from src.backtest.position import Position
 from src.backtest.sizing import position_size, risk_per_contract
 from src.config import ContractSpec, SessionConfig
 from src.data.errors import DataError
 from src.data.sessions import session_bounds
+from src.risk.account import AccountGuard
 from src.risk.manager import RiskManager
 from src.strategy.base import PositionSnapshot, Strategy, StrategyContext
 
@@ -98,6 +118,8 @@ class BacktestResult:
     metrics: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
     adjustments: pd.DataFrame = field(default_factory=pd.DataFrame)
+    entry_checks: pd.DataFrame = field(default_factory=pd.DataFrame)
+    account: dict[str, Any] = field(default_factory=dict)
 
 
 def _validate_bars(df: pd.DataFrame, name: str) -> None:
@@ -133,6 +155,14 @@ class _OpenTrade:
     session_date: pd.Timestamp
     stop_loss: float | None
     take_profit: float | None
+    check: dict[str, Any] | None = None
+
+
+ENTRY_CHECK_COLUMNS = [
+    "time", "order_id", "client_id", "side", "quantity", "reference_price", "fill_price", "stop_loss",
+    "take_profit", "planned_stop_distance", "actual_stop_distance", "planned_reward_risk", "actual_reward_risk",
+    "actual_risk_dollars", "outcome", "reason", "detail",
+]
 
 
 class BacktestEngine:
@@ -220,6 +250,11 @@ class _Simulation:
         self._next_id = 1
         self._bounds_cache: dict[pd.Timestamp, tuple[pd.Timestamp, pd.Timestamp]] = {}
         self._last_mark: float | None = None
+        self.entry_checks: list[dict[str, Any]] = []
+        self.guard = AccountGuard(self.cfg.account_rules, self.cfg.initial_capital)
+        self._guard_session: pd.Timestamp | None = None
+        self._last_equity = self.cfg.initial_capital
+        self._now: pd.Timestamp | None = None  # time of the event being processed
 
     # ------------------------------------------------------------------ helpers
     def _session_end(self, session_date: pd.Timestamp) -> pd.Timestamp:
@@ -241,16 +276,29 @@ class _Simulation:
     def _pending(self, roles: tuple[OrderRole, ...]) -> list[Order]:
         return [o for o in self.orders if o.is_active and o.role in roles]
 
+    def _emit(self, client_id: str | None, order_id: int | None, status: str, when: pd.Timestamp,
+              stage: str = "", reason: str = "", detail: str = "") -> None:
+        if client_id:
+            self.strategy.on_order_event(OrderEvent(client_id, order_id, status, when, stage, reason, detail))
+
     def _cancel(self, order: Order, reason: str) -> None:
         order.status = OrderStatus.CANCELLED
         order.reason = reason
+        if order.role is OrderRole.ENTRY:
+            self._emit(order.client_id, order.id, "cancelled", self._now, "pending", reason)
 
-    def _reject(self, when: pd.Timestamp, stage: str, reason: str, detail: str = "", order: Order | None = None) -> None:
+    def _reject(self, when: pd.Timestamp, stage: str, reason: str, detail: str = "", order: Order | None = None,
+                client_id: str | None = None) -> None:
+        cid = order.client_id if order is not None else client_id
         self.rejections.append({"time": when, "stage": stage, "reason": reason, "detail": detail,
-                                "order_id": order.id if order else None})
+                                "order_id": order.id if order else None, "client_id": cid})
         if order is not None:
             order.status = OrderStatus.REJECTED
             order.reason = reason
+        self._emit(cid, order.id if order else None, "rejected", when, stage, reason, detail)
+
+    def _equity_at(self, price: float) -> float:
+        return self.cfg.initial_capital + self.realized_net + self.position.unrealized_pnl(price)
 
     def _snapshot(self) -> PositionSnapshot:
         if self.position.is_flat:
@@ -276,6 +324,7 @@ class _Simulation:
             c: ex[c].to_numpy() for c in ("open", "high", "low", "close", "is_complete", "session_date", "available_at")
         }
         for when, kind, pos in events:
+            self._now = when
             if kind == 0:
                 self._on_signal(pos, when)
             else:
@@ -315,7 +364,8 @@ class _Simulation:
                 raise TypeError("Strategy.on_bar must return OrderRequest objects")
             if req.action == "entry":
                 if entry_seen:
-                    self._reject(now, "signal", "duplicate_signal", "more than one entry from one bar")
+                    self._reject(now, "signal", "duplicate_signal", "more than one entry from one bar",
+                                 client_id=req.client_id)
                     continue
                 entry_seen = True
                 self._submit_entry(req, now, bar_time, float(bar["close"]), session_date)
@@ -339,20 +389,20 @@ class _Simulation:
 
     def _submit_entry(self, req: OrderRequest, now: pd.Timestamp, bar_time: pd.Timestamp,
                       ref_close: float, session_date: pd.Timestamp | None) -> None:
+        def reject(reason: str, detail: str = "") -> None:
+            self._reject(now, "signal", reason, detail or req.tag, client_id=req.client_id)
+
         if not self.position.is_flat:
-            self._reject(now, "signal", "position_open", req.tag)
-            return
+            return reject("position_open")
         if self._pending((OrderRole.ENTRY,)):
-            self._reject(now, "signal", "entry_pending", req.tag)
-            return
+            return reject("entry_pending")
         assert req.side is not None
         is_buy = req.side is Side.LONG
         tick = self.spec.tick_size
         price = None
         if req.order_type is not OrderType.MARKET:
             if req.price is None or req.price <= 0:
-                self._reject(now, "signal", "missing_order_price", req.tag)
-                return
+                return reject("missing_order_price")
             price = conservative_order_price(req.price, tick, req.order_type, is_buy)
         ref = price if price is not None else ref_close
         # Brackets: protective stop and target, rounded so they are harder to trigger.
@@ -362,32 +412,33 @@ class _Simulation:
                   if req.take_profit is not None else None)
         sgn = req.side.sign
         if stop is not None and (stop - ref) * sgn >= 0:
-            self._reject(now, "signal", "invalid_bracket", f"stop_loss {stop} not beyond entry {ref}")
-            return
+            return reject("invalid_bracket", f"stop_loss {stop} not beyond entry {ref}")
         if target is not None and (target - ref) * sgn <= 0:
-            self._reject(now, "signal", "invalid_bracket", f"take_profit {target} not beyond entry {ref}")
-            return
+            return reject("invalid_bracket", f"take_profit {target} not beyond entry {ref}")
         size = position_size(self.cfg.sizing, self.spec, entry_price=ref, stop_loss=stop,
                              requested=req.quantity, cost=self.cost, slippage=self.cfg.slippage,
                              order_type=req.order_type)
         if size.quantity < 1:
-            self._reject(now, "signal", size.reason, req.tag)
-            return
+            return reject(size.reason)
         if session_date is not None and now >= self._flatten_time(session_date):
-            self._reject(now, "signal", "session_end_cutoff", req.tag)
-            return
+            return reject("session_end_cutoff")
         decision = self.risk.check_entry(when=now, session_date=session_date, quantity=size.quantity)
         if not decision.approved:
-            self._reject(now, "signal", decision.reason, req.tag)
-            return
+            return reject(decision.reason)
+        blocked = self.guard.entry_block_reason(self._last_equity, session_date)
+        if blocked:
+            return reject(blocked, f"equity {self._last_equity:.2f}, floor {self.guard.floor:.2f}")
         expire = now + self.cfg.execution.max_fill_delay if req.order_type is OrderType.MARKET else None
-        self._new_order(role=OrderRole.ENTRY, order_type=req.order_type, is_buy=is_buy,
-                        quantity=size.quantity, price=price, created_at=now, active_from=now,
-                        signal_time=bar_time, session_date=session_date, expire_at=expire,
-                        tag=req.tag, stop_loss=stop, take_profit=target,
-                        risk_budget=(self.cfg.sizing.risk_per_trade
-                                     if self.cfg.sizing.method == "risk" and req.quantity is None else None),
-                        requested_quantity=size.quantity)
+        order = self._new_order(role=OrderRole.ENTRY, order_type=req.order_type, is_buy=is_buy,
+                                quantity=size.quantity, price=price, created_at=now, active_from=now,
+                                signal_time=bar_time, session_date=session_date, expire_at=expire,
+                                tag=req.tag, stop_loss=stop, take_profit=target,
+                                risk_budget=(self.cfg.sizing.risk_per_trade
+                                             if self.cfg.sizing.method == "risk" and req.quantity is None else None),
+                                requested_quantity=size.quantity, client_id=req.client_id, reference_price=ref,
+                                max_stop_distance=req.max_stop_distance, min_stop_distance=req.min_stop_distance,
+                                min_reward_risk=req.min_reward_risk)
+        self._emit(req.client_id, order.id, "accepted", now, "signal")
 
     def _submit_exit(self, now: pd.Timestamp, tag: str) -> None:
         if self.position.is_flat:
@@ -410,11 +461,20 @@ class _Simulation:
         sd = ex["session_date"][j]
         session_date = pd.Timestamp(sd) if not pd.isna(sd) else None
 
+        # 0. Account guard: end-of-session update when a new session starts.
+        if session_date is not None and session_date != self._guard_session:
+            if self._guard_session is not None:
+                self.guard.on_session_end(self._last_equity, session_date)
+            self._guard_session = session_date
+        guard_locked = self.guard.enabled and (self.guard.breached or self.guard.is_locked(session_date))
+
         # 1. Session / emergency housekeeping (uses only configuration and this bar's open).
         if self.open_trade is not None:
             reason = None
             if self.risk.emergency_active:
                 reason = "emergency_stop"
+            elif guard_locked:
+                reason = "account_protection"
             elif session_date is None:
                 reason = "outside_session"
             elif session_date != self.open_trade.session_date:
@@ -428,6 +488,8 @@ class _Simulation:
         for o in self._pending((OrderRole.ENTRY,)):
             if self.risk.emergency_active:
                 self._cancel(o, "emergency_stop")
+            elif guard_locked:
+                self._cancel(o, "account_protection")
             elif session_date is None or o.session_date is None or session_date != o.session_date:
                 self._cancel(o, "session_changed")
             elif t >= self._flatten_time(session_date):
@@ -447,18 +509,41 @@ class _Simulation:
                 sim = self._simulate(o, bar)
                 if sim is None:
                     continue
+                check = self._entry_check(o, sim.price, t)
                 problem = self._bracket_problem(o, sim.price)
                 if problem:
-                    self._reject(t, "fill", "invalid_bracket_at_fill", problem, order=o)
+                    self._reject_entry(check, "invalid_bracket_at_fill", problem, o, t)
+                    continue
+                quality, detail = self._fill_quality_problem(o, check)
+                if quality:
+                    self._reject_entry(check, quality, detail, o, t)
                     continue
                 if not self._fit_risk_budget(o, sim.price, t):
+                    self._log_check(check, o, "rejected", "risk_budget_exceeded_at_fill")
                     continue
+                check["quantity"] = o.quantity
+                check["actual_risk_dollars"] = self._actual_risk_dollars(o, sim.price)
                 decision = self.risk.check_entry(when=t, session_date=session_date, quantity=o.quantity)
                 if not decision.approved:
-                    self._reject(t, "fill", decision.reason, o.tag, order=o)
+                    self._reject_entry(check, decision.reason, o.tag, o, t)
                     continue
-                self._open(o, sim, t, complete, session_date)
+                blocked = self.guard.entry_block_reason(self._last_equity, session_date,
+                                                        trade_risk=check["actual_risk_dollars"])
+                if blocked:
+                    self._reject_entry(check, blocked, f"risk {check['actual_risk_dollars']:.2f}, buffer "
+                                       f"{self.guard.remaining_buffer(self._last_equity):.2f}", o, t)
+                    continue
+                self._log_check(check, o, "accepted", "")
+                self._open(o, sim, t, complete, session_date, check)
                 break
+
+        # 2b. Trailing intraday drawdown: raise the peak BEFORE the bar's adverse move (conservative).
+        if self.guard.enabled:
+            if self.open_trade is not None:
+                fav = bar.high if self.position.quantity > 0 else bar.low
+                self.guard.observe_intraday(self._equity_at(fav), favorable=True)
+            else:
+                self.guard.observe_intraday(self._equity_at(bar.close), favorable=False)
 
         # 3. Exits for the open position.
         if self.open_trade is not None:
@@ -471,22 +556,85 @@ class _Simulation:
                 self.warnings.append(f"{t}: daily loss limit reached with an open position "
                                      f"(action: {self.cfg.risk.daily_loss_action})")
 
+        # 3c. Account protection evaluated at this bar's most adverse equity.
+        if self.guard.enabled:
+            traded_this_bar = bool(self.fills) and self.fills[-1].bar_time == t
+            if self.open_trade is not None:
+                worst = bar.low if self.position.quantity > 0 else bar.high
+                state = self.guard.evaluate(self._equity_at(worst), t, session_date)
+            else:
+                state = self.guard.evaluate(self._equity_at(bar.close), t, session_date,
+                                            position_open=traded_this_bar)
+            if state:
+                self.warnings.append(f"{t}: account protection '{state}' (floor {self.guard.floor:.2f}); "
+                                     "entries locked" + ("; position closed at next bar" if self.open_trade else ""))
+
         # 4. Mark to market at this bar's close, recorded when the close is known.
         self._last_mark = bar.close
         unrealized = self.position.unrealized_pnl(bar.close)
+        equity = self.cfg.initial_capital + self.realized_net + unrealized
+        self.guard.observe_intraday(equity, favorable=False)
+        self._last_equity = equity
         self.equity_rows.append({
             "time": pd.Timestamp(ex["available_at"][j]),
-            "equity": self.cfg.initial_capital + self.realized_net + unrealized,
+            "equity": equity,
             "realized": self.realized_net,
             "unrealized": unrealized,
             "position": self.position.quantity,
             "session_date": session_date,
+            "drawdown_floor": self.guard.floor if self.guard.enabled else np.nan,
+            "drawdown_buffer": self.guard.remaining_buffer(equity) if self.guard.enabled else np.nan,
         })
 
     def _open_pnl(self, mark: float) -> float:
         """Unrealized gross PnL at ``mark`` minus the entry commission already paid."""
         assert self.open_trade is not None
         return self.position.unrealized_pnl(mark) - self.open_trade.entry_fill.commission
+
+    def _entry_check(self, order: Order, fill_price: float, t: pd.Timestamp) -> dict[str, Any]:
+        """Planned vs actual stop distance and reward-to-risk for an entry about to fill."""
+        sgn = 1 if order.is_buy else -1
+        ref = order.reference_price
+        stop, target = order.stop_loss, order.take_profit
+        planned = (ref - stop) * sgn if stop is not None and ref is not None else np.nan
+        actual = (fill_price - stop) * sgn if stop is not None else np.nan
+        planned_rr = ((target - ref) * sgn / planned
+                      if target is not None and ref is not None and planned and planned > 0 else np.nan)
+        actual_rr = (target - fill_price) * sgn / actual if target is not None and actual and actual > 0 else np.nan
+        return {"time": t, "order_id": order.id, "client_id": order.client_id,
+                "side": "long" if order.is_buy else "short", "quantity": order.quantity,
+                "reference_price": ref, "fill_price": fill_price, "stop_loss": stop, "take_profit": target,
+                "planned_stop_distance": planned, "actual_stop_distance": actual,
+                "planned_reward_risk": planned_rr, "actual_reward_risk": actual_rr,
+                "actual_risk_dollars": self._actual_risk_dollars(order, fill_price)}
+
+    def _actual_risk_dollars(self, order: Order, fill_price: float) -> float:
+        if order.stop_loss is None:
+            return np.nan
+        per = risk_per_contract(self.spec, entry_price=fill_price, stop_loss=order.stop_loss, cost=self.cost,
+                                slippage=self.cfg.slippage, include_costs=True, entry_slippage_ticks=0)
+        return per * order.quantity
+
+    def _fill_quality_problem(self, order: Order, check: dict[str, Any]) -> tuple[str, str]:
+        """Enforce the request's fill-time limits on the ACTUAL fill (independent of sizing)."""
+        dist, rr = check["actual_stop_distance"], check["actual_reward_risk"]
+        info = (f"fill {check['fill_price']}, planned stop distance {check['planned_stop_distance']:.2f} / "
+                f"R {check['planned_reward_risk']:.2f}, actual {dist:.2f} / R {rr:.2f}")
+        if order.max_stop_distance is not None and not (dist <= order.max_stop_distance + 1e-9):
+            return "stop_too_wide_at_fill", f"{info}; max distance {order.max_stop_distance:.2f}"
+        if order.min_stop_distance is not None and not (dist >= order.min_stop_distance - 1e-9):
+            return "stop_too_tight_at_fill", f"{info}; min distance {order.min_stop_distance:.2f}"
+        if order.min_reward_risk is not None and not (rr >= order.min_reward_risk - 1e-9):
+            return "reward_risk_below_min_at_fill", f"{info}; min R {order.min_reward_risk:.2f}"
+        return "", ""
+
+    def _log_check(self, check: dict[str, Any], order: Order, outcome: str, reason: str, detail: str = "") -> None:
+        self.entry_checks.append(check | {"quantity": order.quantity, "outcome": outcome, "reason": reason,
+                                          "detail": detail})
+
+    def _reject_entry(self, check: dict[str, Any], reason: str, detail: str, order: Order, t: pd.Timestamp) -> None:
+        self._log_check(check, order, "rejected", reason, detail)
+        self._reject(t, "fill", reason, detail, order=order)
 
     def _bracket_problem(self, order: Order, fill_price: float) -> str:
         """Why the order's bracket is invalid at ``fill_price`` ('' when valid)."""
@@ -537,13 +685,15 @@ class _Simulation:
         self.strategy.on_fill(fill)
         return fill
 
-    def _open(self, order: Order, sim: SimFill, t: pd.Timestamp, complete: bool, session_date: pd.Timestamp) -> None:
+    def _open(self, order: Order, sim: SimFill, t: pd.Timestamp, complete: bool, session_date: pd.Timestamp,
+              check: dict[str, Any] | None = None) -> None:
         fill = self._record_fill(order, sim, t, complete)
+        self._emit(order.client_id, order.id, "filled", t, "fill", "", f"fill {sim.price}")
         self.position.apply_fill(order.is_buy, order.quantity, sim.price)
         self.risk.on_entry_filled(session_date)
         side = Side.LONG if order.is_buy else Side.SHORT
         self.open_trade = _OpenTrade(side, order.quantity, order, fill, order.signal_time, session_date,
-                                     order.stop_loss, order.take_profit)
+                                     order.stop_loss, order.take_profit, check)
         exit_buy = not order.is_buy
         common = dict(is_buy=exit_buy, quantity=order.quantity, created_at=t, active_from=t,
                       signal_time=order.signal_time, session_date=session_date, tag=order.tag)
@@ -565,22 +715,32 @@ class _Simulation:
         tp = next((o for o in active if o.role is OrderRole.TAKE_PROFIT), None)
         intrabar_entry_bar = trade.entry_fill.bar_time == t and not trade.entry_fill.at_open
         stop_reason = "stop_loss"
+        long = self.position.quantity > 0
 
-        # Daily-loss level as a protective stop; the closer of the two stops governs.
+        # Protective levels competing with the bracket stop: the daily-loss level and the
+        # account-protection level. All are stops on the same side, so the one closest to
+        # the market triggers first (no ambiguity between them).
+        levels: list[tuple[float, str]] = []
         if (session_date is not None and self.cfg.risk.tracks_unrealized_loss
                 and self.cfg.risk.daily_loss_action == "flatten"):
             level = self.risk.daily_loss_trigger_price(
-                session_date=session_date, is_long=self.position.quantity > 0,
+                session_date=session_date, is_long=long,
                 quantity=abs(self.position.quantity), avg_price=self.position.avg_price,
                 paid_costs=trade.entry_fill.commission, point_value=self.spec.point_value,
                 tick=self.spec.tick_size)
-            long = self.position.quantity > 0
-            if level is not None and (sl is None or (level > sl.price if long else level < sl.price)):
+            if level is not None:
+                levels.append((level, "daily_loss_limit"))
+        account_level = self._account_flatten_price()
+        if account_level is not None:
+            levels.append((account_level, "account_protection"))
+        for level, why in levels:
+            current = sl.price if sl is not None else None
+            if current is None or (level > current if long else level < current):
                 sl = self._new_order(register=False, role=OrderRole.EXIT, order_type=OrderType.STOP,
                                      is_buy=not long, quantity=abs(self.position.quantity), price=level,
                                      created_at=t, active_from=t, signal_time=None,
-                                     session_date=trade.session_date, tag="daily_loss_limit")
-                stop_reason = "daily_loss_limit"
+                                     session_date=trade.session_date, tag=why)
+                stop_reason = why
 
         sl_sim = self._simulate(sl, bar) if sl else None
         if sl_sim is not None and intrabar_entry_bar and sl_sim.at_open:
@@ -590,10 +750,10 @@ class _Simulation:
                              sl.price, False)
         tp_sim = None if (tp is None or intrabar_entry_bar) else self._simulate(tp, bar)
 
-        if sl_sim and stop_reason == "daily_loss_limit":
+        if sl_sim and stop_reason in ("daily_loss_limit", "account_protection"):
             assert sl is not None
             self.orders.append(sl)  # register the synthetic exit only when it fills
-            if session_date is not None:
+            if stop_reason == "daily_loss_limit" and session_date is not None:
                 self.risk.mark_daily_loss_breached(session_date)
         if sl_sim and tp_sim:
             if sl_sim.at_open:
@@ -606,6 +766,15 @@ class _Simulation:
             self._close(sl, sl_sim, t, complete, stop_reason, intrabar_entry_bar)
         elif tp_sim:
             self._close(tp, tp_sim, t, complete, "take_profit", False)
+
+    def _account_flatten_price(self) -> float | None:
+        """Price at which equity falls to floor + flatten_buffer for the open position."""
+        target = self.guard.flatten_equity_level()
+        if target is None or self.position.is_flat:
+            return None
+        q = self.position.quantity
+        raw = self.position.avg_price + (target - self.cfg.initial_capital - self.realized_net) / (q * self.spec.point_value)
+        return round_to_tick(raw, self.spec.tick_size, "up" if q > 0 else "down")
 
     def _force_exit(self, t: pd.Timestamp, bar: BarPrices, complete: bool, reason: str) -> None:
         assert self.open_trade is not None
@@ -636,6 +805,7 @@ class _Simulation:
         initial_risk = (abs(entry.price - trade.stop_loss) * trade.quantity * self.spec.point_value
                         if trade.stop_loss is not None else np.nan)
         exit_session = self._ex_session(t)
+        chk = trade.check or {}
         self.trades.append({
             "trade_id": len(self.trades) + 1,
             "side": trade.side.value,
@@ -662,6 +832,13 @@ class _Simulation:
             "data_incomplete": (not entry.bar_complete) or (not complete),
             "session_date": trade.session_date,
             "exit_session_date": exit_session if exit_session is not None else trade.session_date,
+            "signal_id": trade.entry_order.client_id,
+            "reference_price": chk.get("reference_price", np.nan),
+            "planned_stop_distance": chk.get("planned_stop_distance", np.nan),
+            "actual_stop_distance": chk.get("actual_stop_distance", np.nan),
+            "planned_reward_risk": chk.get("planned_reward_risk", np.nan),
+            "actual_reward_risk": chk.get("actual_reward_risk", np.nan),
+            "actual_risk_dollars": chk.get("actual_risk_dollars", np.nan),
         })
         self.risk.on_trade_closed(net, self.trades[-1]["exit_session_date"])
         self.open_trade = None
@@ -691,14 +868,19 @@ class _Simulation:
                       "entry_at_open", "entry_price", "exit_time", "exit_at_open", "exit_price", "exit_reason",
                       "stop_loss", "take_profit", "gross_pnl", "commission", "slippage_cost", "total_costs", "net_pnl",
                       "initial_risk", "r_multiple", "ambiguous", "data_incomplete", "session_date",
-                      "exit_session_date"]
+                      "exit_session_date", "signal_id", "reference_price", "planned_stop_distance",
+                      "actual_stop_distance", "planned_reward_risk", "actual_reward_risk", "actual_risk_dollars"]
         trades = pd.DataFrame(self.trades, columns=trade_cols)
         orders = pd.DataFrame([vars(o) | {"role": o.role.value, "order_type": o.order_type.value,
                                           "status": o.status.value} for o in self.orders])
         fills = pd.DataFrame([vars(f) | {"role": f.role.value} for f in self.fills])
         equity = pd.DataFrame(self.equity_rows).set_index("time") if self.equity_rows else pd.DataFrame()
-        rejections = pd.DataFrame(self.rejections, columns=["time", "stage", "reason", "detail", "order_id"])
+        rejections = pd.DataFrame(self.rejections, columns=["time", "stage", "reason", "detail", "order_id",
+                                                            "client_id"])
         adjustments = pd.DataFrame(self.adjustments, columns=["time", "order_id", "reason", "from_quantity",
                                                               "to_quantity", "risk_per_contract", "detail"])
         metrics, daily = compute_metrics(trades, equity, self.cfg.initial_capital)
-        return BacktestResult(trades, orders, fills, equity, rejections, daily, metrics, self.warnings, adjustments)
+        account = self.guard.summary()
+        metrics["account_protection"] = {k: v for k, v in account.items() if k != "events"}
+        return BacktestResult(trades, orders, fills, equity, rejections, daily, metrics, self.warnings, adjustments,
+                              pd.DataFrame(self.entry_checks, columns=ENTRY_CHECK_COLUMNS), account)
