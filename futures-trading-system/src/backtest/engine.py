@@ -47,9 +47,20 @@ Account protection
 ------------------
 An :class:`~src.risk.account.AccountGuard` (``config.account_rules``) blocks entries
 near the drawdown floor (at signal time and at the fill, including the trade's actual
-risk), turns ``floor + flatten_buffer`` into a protective stop level for open
-positions, and locks trading after a flatten or a breach. It is configured outside
-the strategy and cannot be overridden by it.
+risk plus a gap reserve), turns ``floor + flatten_buffer`` into a protective stop level
+for open positions, and locks trading after a flatten or a breach. It is configured
+outside the strategy and cannot be overridden by it.
+
+* With the guard enabled every entry needs a valid stop-loss; an entry whose risk is
+  missing, NaN, infinite or not positive is rejected (``account_requires_stop_loss`` /
+  ``account_risk_unknown``) -- for every sizing method and every order type.
+* The flatten trigger includes the estimated exit commission and stop slippage of the
+  actual quantity: if filled as modelled, equity after the exit is ``floor +
+  flatten_buffer``. Gaps can still fill beyond it; any equity at or below the floor --
+  including after the final end-of-data exit -- is recorded as a breach.
+* ``trailing_intraday`` with ``favorable_extreme``: a floor raised by the bar's high (long)
+  can only be acted on after that high, i.e. intrabar at the trigger level, never at
+  the bar's open (which happened before the high).
 
 Daily loss with unrealized PnL
 ------------------------------
@@ -81,6 +92,7 @@ not credited and a stop-loss within the bar range is assumed hit (also flagged).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -94,7 +106,7 @@ from src.backtest.execution import round_to_tick
 from src.backtest.orders import Fill, Order, OrderEvent, OrderRequest, OrderRole, OrderStatus, OrderType, Side
 from src.backtest.position import Position
 from src.backtest.sizing import position_size, risk_per_contract
-from src.config import ContractSpec, SessionConfig
+from src.config import ConfigError, ContractSpec, SessionConfig
 from src.data.errors import DataError
 from src.data.sessions import session_bounds
 from src.risk.account import AccountGuard
@@ -161,7 +173,7 @@ class _OpenTrade:
 ENTRY_CHECK_COLUMNS = [
     "time", "order_id", "client_id", "side", "quantity", "reference_price", "fill_price", "stop_loss",
     "take_profit", "planned_stop_distance", "actual_stop_distance", "planned_reward_risk", "actual_reward_risk",
-    "actual_risk_dollars", "outcome", "reason", "detail",
+    "estimated_net_reward_risk", "actual_risk_dollars", "account_risk_dollars", "outcome", "reason", "detail",
 ]
 
 
@@ -175,6 +187,10 @@ class BacktestEngine:
     """
 
     def __init__(self, config: BacktestConfig, contract: ContractSpec, session: SessionConfig) -> None:
+        for name in ("tick_size", "point_value"):
+            value = getattr(contract, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ConfigError(f"Contract {contract.root}: {name} must be a finite positive number, got {value!r}")
         self.config = config
         self.contract = contract
         self.session = session
@@ -252,6 +268,14 @@ class _Simulation:
         self._last_mark: float | None = None
         self.entry_checks: list[dict[str, Any]] = []
         self.guard = AccountGuard(self.cfg.account_rules, self.cfg.initial_capital)
+        if self.guard.enabled:
+            reserve = self.cost.commission_per_contract_per_side + self.cfg.slippage.stop_ticks * self.spec.tick_value
+            if self.cfg.account_rules.flatten_buffer + 1e-9 < reserve:
+                raise ConfigError(
+                    f"account flatten_buffer {self.cfg.account_rules.flatten_buffer} is smaller than the estimated "
+                    f"exit cost of one {self.spec.root} contract ({reserve:.2f} = commission + stop slippage); "
+                    "an emergency flatten could not keep its cost reserve")
+        self._pre_bar_floor = self.guard.floor
         self._guard_session: pd.Timestamp | None = None
         self._last_equity = self.cfg.initial_capital
         self._now: pd.Timestamp | None = None  # time of the event being processed
@@ -397,6 +421,16 @@ class _Simulation:
         if self._pending((OrderRole.ENTRY,)):
             return reject("entry_pending")
         assert req.side is not None
+        if req.quantity is not None and (isinstance(req.quantity, bool) or not isinstance(req.quantity, int)
+                                         or req.quantity < 1):
+            return reject("invalid_quantity", f"quantity {req.quantity!r}")
+        for name in ("price", "stop_loss", "take_profit"):
+            value = getattr(req, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not math.isfinite(value) or value <= 0):
+                return reject("invalid_order_price", f"{name} {value!r}")
+        if self.guard.enabled and req.stop_loss is None:
+            return reject("account_requires_stop_loss", "account protection needs a stop-loss to bound the risk")
         is_buy = req.side is Side.LONG
         tick = self.spec.tick_size
         price = None
@@ -527,10 +561,11 @@ class _Simulation:
                 if not decision.approved:
                     self._reject_entry(check, decision.reason, o.tag, o, t)
                     continue
-                blocked = self.guard.entry_block_reason(self._last_equity, session_date,
-                                                        trade_risk=check["actual_risk_dollars"])
+                account_risk = self._account_risk(o, check)
+                check["account_risk_dollars"] = account_risk
+                blocked = self.guard.fill_block_reason(self._last_equity, session_date, account_risk)
                 if blocked:
-                    self._reject_entry(check, blocked, f"risk {check['actual_risk_dollars']:.2f}, buffer "
+                    self._reject_entry(check, blocked, f"account risk {account_risk}, buffer "
                                        f"{self.guard.remaining_buffer(self._last_equity):.2f}", o, t)
                     continue
                 self._log_check(check, o, "accepted", "")
@@ -538,6 +573,7 @@ class _Simulation:
                 break
 
         # 2b. Trailing intraday drawdown: raise the peak BEFORE the bar's adverse move (conservative).
+        self._pre_bar_floor = self.guard.floor
         if self.guard.enabled:
             if self.open_trade is not None:
                 fav = bar.high if self.position.quantity > 0 else bar.low
@@ -606,7 +642,29 @@ class _Simulation:
                 "reference_price": ref, "fill_price": fill_price, "stop_loss": stop, "take_profit": target,
                 "planned_stop_distance": planned, "actual_stop_distance": actual,
                 "planned_reward_risk": planned_rr, "actual_reward_risk": actual_rr,
-                "actual_risk_dollars": self._actual_risk_dollars(order, fill_price)}
+                "actual_risk_dollars": self._actual_risk_dollars(order, fill_price),
+                "estimated_net_reward_risk": self._net_reward_risk(order, fill_price),
+                "account_risk_dollars": np.nan}
+
+    def _net_reward_risk(self, order: Order, fill_price: float) -> float:
+        """Reward/risk NET of estimated costs (target reward minus round-trip commission over the
+        stop-out risk including commission and stop slippage). Informational; the configured
+        minimum R is checked on the GROSS price-based ratio."""
+        if order.take_profit is None or order.stop_loss is None:
+            return np.nan
+        sgn = 1 if order.is_buy else -1
+        reward = ((order.take_profit - fill_price) * sgn * self.spec.point_value
+                  - 2 * self.cost.commission_per_contract_per_side) * order.quantity
+        risk = self._actual_risk_dollars(order, fill_price)
+        return reward / risk if risk and risk > 0 else np.nan
+
+    def _account_risk(self, order: Order, check: dict[str, Any]) -> float:
+        """Risk used by the account guard: actual stop-out risk (costs included) + gap reserve.
+        NaN when it cannot be computed (the guard then rejects the entry)."""
+        risk = check["actual_risk_dollars"]
+        if order.stop_loss is None or not isinstance(risk, (int, float)) or not math.isfinite(risk) or risk <= 0:
+            return float("nan")
+        return risk + order.quantity * self.cfg.account_rules.gap_reserve_ticks * self.spec.tick_value
 
     def _actual_risk_dollars(self, order: Order, fill_price: float) -> float:
         if order.stop_loss is None:
@@ -733,6 +791,10 @@ class _Simulation:
         account_level = self._account_flatten_price()
         if account_level is not None:
             levels.append((account_level, "account_protection"))
+        # A floor raised by THIS bar's favourable extreme cannot be acted on at the open
+        # (the open came before that extreme): at-open fills are only legal against the
+        # level implied by the floor in force before the bar.
+        pre_level = self._account_flatten_price(self._pre_bar_floor)
         for level, why in levels:
             current = sl.price if sl is not None else None
             if current is None or (level > current if long else level < current):
@@ -748,13 +810,21 @@ class _Simulation:
             assert sl is not None and sl.price is not None
             sl_sim = SimFill(apply_slippage(sl.price, sl.is_buy, self.cfg.slippage.stop_ticks, self.spec.tick_size),
                              sl.price, False)
+        if (sl_sim is not None and sl_sim.at_open and stop_reason == "account_protection"
+                and pre_level is not None and sl is not None
+                and not ((bar.open <= pre_level) if long else (bar.open >= pre_level))):
+            assert sl.price is not None
+            sl_sim = SimFill(apply_slippage(sl.price, sl.is_buy, self.cfg.slippage.stop_ticks, self.spec.tick_size),
+                             sl.price, False)
         tp_sim = None if (tp is None or intrabar_entry_bar) else self._simulate(tp, bar)
 
+        flatten_hit = False
         if sl_sim and stop_reason in ("daily_loss_limit", "account_protection"):
             assert sl is not None
             self.orders.append(sl)  # register the synthetic exit only when it fills
             if stop_reason == "daily_loss_limit" and session_date is not None:
                 self.risk.mark_daily_loss_breached(session_date)
+            flatten_hit = stop_reason == "account_protection"
         if sl_sim and tp_sim:
             if sl_sim.at_open:
                 self._close(sl, sl_sim, t, complete, stop_reason, False)
@@ -766,14 +836,20 @@ class _Simulation:
             self._close(sl, sl_sim, t, complete, stop_reason, intrabar_entry_bar)
         elif tp_sim:
             self._close(tp, tp_sim, t, complete, "take_profit", False)
+        if flatten_hit and self.open_trade is None and self.trades and self.trades[-1]["exit_reason"] == "account_protection":
+            self.guard.register_flatten(t, session_date, self.cfg.initial_capital + self.realized_net)
 
-    def _account_flatten_price(self) -> float | None:
-        """Price at which equity falls to floor + flatten_buffer for the open position."""
-        target = self.guard.flatten_equity_level()
-        if target is None or self.position.is_flat:
+    def _account_flatten_price(self, floor: float | None = None) -> float | None:
+        """Stop-trigger price at which, AFTER the estimated exit commission and stop slippage of
+        the whole position, equity equals floor + flatten_buffer (an estimate, not a guarantee)."""
+        if not self.guard.enabled or self.position.is_flat:
             return None
+        target = (self.guard.floor if floor is None else floor) + self.cfg.account_rules.flatten_buffer
         q = self.position.quantity
-        raw = self.position.avg_price + (target - self.cfg.initial_capital - self.realized_net) / (q * self.spec.point_value)
+        exit_costs = abs(q) * (self.cost.commission_per_contract_per_side
+                               + self.cfg.slippage.stop_ticks * self.spec.tick_value)
+        raw = self.position.avg_price + (target + exit_costs - self.cfg.initial_capital - self.realized_net) / (
+            q * self.spec.point_value)
         return round_to_tick(raw, self.spec.tick_size, "up" if q > 0 else "down")
 
     def _force_exit(self, t: pd.Timestamp, bar: BarPrices, complete: bool, reason: str) -> None:
@@ -856,9 +932,17 @@ class _Simulation:
             complete = bool(self.execution["is_complete"].iloc[-1])
             self.warnings.append(f"{last_t}: data ended with an open position; closed at the last close")
             self._force_exit(last_t, bar, complete, "end_of_data")
-            unrealized = 0.0
-            self.equity_rows[-1].update(equity=self.cfg.initial_capital + self.realized_net + unrealized,
-                                        realized=self.realized_net, unrealized=unrealized, position=0)
+            equity = self.cfg.initial_capital + self.realized_net
+            sd = self.equity_rows[-1]["session_date"]
+            # The forced exit goes through the same account-state update as every other exit.
+            state = self.guard.evaluate(equity, last_t, sd, position_open=True)
+            if state:
+                self.warnings.append(f"{last_t}: account protection '{state}' after the end-of-data exit")
+            self._last_equity = equity
+            self.equity_rows[-1].update(
+                equity=equity, realized=self.realized_net, unrealized=0.0, position=0,
+                drawdown_floor=self.guard.floor if self.guard.enabled else np.nan,
+                drawdown_buffer=self.guard.remaining_buffer(equity) if self.guard.enabled else np.nan)
         for o in self.orders:
             if o.is_active:
                 self._cancel(o, "end_of_data")
@@ -879,6 +963,13 @@ class _Simulation:
                                                             "client_id"])
         adjustments = pd.DataFrame(self.adjustments, columns=["time", "order_id", "reason", "from_quantity",
                                                               "to_quantity", "risk_per_contract", "detail"])
+        # Invariant: a recorded equity at or below its floor is always a breach.
+        if self.guard.enabled and not self.guard.breached:
+            for row in self.equity_rows:
+                if row["drawdown_buffer"] <= 1e-9:
+                    self.guard.evaluate(row["equity"], row["time"], row["session_date"], position_open=True)
+                    self.warnings.append(f"{row['time']}: equity {row['equity']:.2f} at/below the floor (breach)")
+                    break
         metrics, daily = compute_metrics(trades, equity, self.cfg.initial_capital)
         account = self.guard.summary()
         metrics["account_protection"] = {k: v for k, v in account.items() if k != "events"}

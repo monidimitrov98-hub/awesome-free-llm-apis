@@ -118,6 +118,13 @@ DIAGNOSTIC_COLUMNS = [
     "rvol", "rvol_status", "stop_price", "stop_distance", "target_price", "target_distance", "pullback_id",
     "structure_data", "signal_id", "order_status", "order_id", "order_stage", "order_reason",
 ]
+# Allowed order-lifecycle transitions (anything else is ignored and recorded as a violation).
+LIFECYCLE_TRANSITIONS = {
+    "submitted": {"accepted", "rejected"},
+    "accepted": {"filled", "cancelled", "rejected"},
+    "filled": set(), "rejected": set(), "cancelled": set(),  # terminal
+}
+
 SIGNAL_COLUMNS = ["signal_id", "direction", "time", "session_date", "pullback_id", "order_id", "status",
                   "accepted_at", "rejected_at", "filled_at", "cancelled_at", "stage", "reason", "detail"]
 
@@ -152,6 +159,8 @@ class VwapTrendPullbackStrategy(Strategy):
         self._signals: dict[str, dict[str, Any]] = {}
         self._last_exit_time: pd.Timestamp | None = None
         self._last_submitted_session: pd.Timestamp | None = None
+        self._counted_entry_orders: set[int] = set()
+        self.lifecycle_violations: list[dict[str, Any]] = []
         self._columns_checked = False
 
     def on_start(self, contract: ContractSpec) -> None:
@@ -161,7 +170,9 @@ class VwapTrendPullbackStrategy(Strategy):
     def on_fill(self, fill: Fill) -> None:
         if fill.role is OrderRole.ENTRY:
             # Only one entry can be pending at a time, so this fill belongs to the last submitted signal.
-            if self._last_submitted_session is not None:
+            # Counted once per order id: a duplicate notification cannot count an entry twice.
+            if self._last_submitted_session is not None and fill.order_id not in self._counted_entry_orders:
+                self._counted_entry_orders.add(fill.order_id)
                 self._entries_by_session[self._last_submitted_session] += 1
         else:  # stop-loss, take-profit or any exit closes the position
             self._last_exit_time = fill.bar_time
@@ -170,6 +181,14 @@ class VwapTrendPullbackStrategy(Strategy):
         """Reconcile a submitted signal with what the engine actually did."""
         sig = self._signals.get(event.client_id)
         if sig is None:
+            self.lifecycle_violations.append({"client_id": event.client_id, "event": event.status,
+                                              "from": None, "time": event.time, "issue": "unknown signal"})
+            return
+        if event.status not in LIFECYCLE_TRANSITIONS.get(sig["status"], set()):
+            # Duplicate, delayed or impossible transition (e.g. rejected -> filled): ignored.
+            self.lifecycle_violations.append({"client_id": event.client_id, "event": event.status,
+                                              "from": sig["status"], "time": event.time,
+                                              "issue": "invalid transition"})
             return
         sig["status"] = event.status
         sig[f"{event.status}_at"] = event.time

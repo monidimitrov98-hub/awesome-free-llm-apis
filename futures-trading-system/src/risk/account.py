@@ -25,12 +25,23 @@ Protections (all in dollars of equity above the floor = remaining buffer):
 * equity at or below the floor = breach: everything is locked permanently.
 
 Equity = initial capital + realized net PnL (commissions included) + unrealized PnL
-at the evaluated price. Exit commission and exit slippage are not yet included, so the
-``flatten_buffer`` should exceed them.
+at the evaluated price.
+
+Risk inputs are validated strictly: an entry whose risk is missing, NaN, infinite,
+zero or negative is rejected (``account_risk_unknown``); with the guard enabled every
+entry needs a valid protective stop-loss. ``gap_reserve_ticks`` (per contract) is added
+to the trade risk as a conservative allowance for stops filling through gaps.
+
+The engine places the emergency-flatten trigger so that, AFTER the estimated exit
+commission and stop slippage, equity is still ``floor + flatten_buffer``. These are
+ESTIMATES: a bar-based simulation cannot guarantee real-world fill prices, and no
+finite reserve protects against every gap. An equity at or below the floor is always
+recorded as a breach.
 """
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +50,10 @@ from typing import Any
 from src.config import PROJECT_ROOT, ConfigError
 
 DRAWDOWN_TYPES = ("static", "trailing_eod", "trailing_intraday")
+
+
+def _finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 @dataclass(frozen=True)
@@ -55,6 +70,7 @@ class AccountRules:
     intraday_peak_source: str = "favorable_extreme"
     lock_after_flatten: str = "session"
     require_trade_risk_within_buffer: bool = True
+    gap_reserve_ticks: float = 0.0
     description: str = ""
 
     def __post_init__(self) -> None:
@@ -62,10 +78,22 @@ class AccountRules:
             return
         if self.drawdown_type not in DRAWDOWN_TYPES:
             raise ConfigError(f"account drawdown_type must be one of {DRAWDOWN_TYPES}")
+        for name in ("max_drawdown", "safety_buffer", "flatten_buffer", "gap_reserve_ticks"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ConfigError(f"account {name} must be a finite number, got {value!r}")
         if self.max_drawdown <= 0:
             raise ConfigError("account max_drawdown must be positive")
-        if not 0 <= self.flatten_buffer <= self.safety_buffer < self.max_drawdown:
-            raise ConfigError("account buffers must satisfy 0 <= flatten_buffer <= safety_buffer < max_drawdown")
+        if not 0 < self.flatten_buffer <= self.safety_buffer < self.max_drawdown:
+            raise ConfigError("account buffers must satisfy 0 < flatten_buffer <= safety_buffer < max_drawdown "
+                              "(a zero flatten buffer would leave a flattened account exactly at the floor)")
+        if self.gap_reserve_ticks < 0:
+            raise ConfigError("account gap_reserve_ticks must be >= 0")
+        if self.floor_lock_offset is not None:
+            off = self.floor_lock_offset
+            if isinstance(off, bool) or not isinstance(off, (int, float)) or not math.isfinite(off) or off < 0:
+                # A negative offset would cap the floor BELOW the configured rule (weaker protection).
+                raise ConfigError(f"account floor_lock_offset must be a finite number >= 0, got {off!r}")
         if self.intraday_peak_source not in {"favorable_extreme", "close"}:
             raise ConfigError("intraday_peak_source must be 'favorable_extreme' or 'close'")
         if self.lock_after_flatten not in {"session", "permanent"}:
@@ -164,6 +192,15 @@ class AccountGuard:
             return "flatten"
         return None
 
+    def register_flatten(self, when: Any, session_date: Any, equity: float) -> None:
+        """An emergency flatten happened: lock entries (session or permanently) regardless of
+        where the exit filled, then re-evaluate for a breach."""
+        if not self.rules.enabled:
+            return
+        if not self.is_locked(session_date):
+            self._lock(when, session_date, equity)
+        self.evaluate(equity, when, session_date, position_open=False)
+
     def _lock(self, when: Any, session_date: Any, equity: float) -> None:
         if self.rules.lock_after_flatten == "permanent":
             self.locked_permanently = True
@@ -176,10 +213,18 @@ class AccountGuard:
 
     # --- checks --------------------------------------------------------
     def entry_block_reason(self, equity: float, session_date: Any, trade_risk: float | None = None) -> str | None:
-        """Why a new entry must not be opened ('' / None when allowed)."""
+        """Why a new entry must not be opened (None when allowed).
+
+        ``trade_risk=None`` is the pre-trade (signal-time) check without a known risk. At
+        the fill use :meth:`fill_block_reason`, which REQUIRES a valid risk value.
+        """
         r = self.rules
         if not r.enabled:
             return None
+        if not _finite(equity):
+            return "account_equity_unknown"
+        if trade_risk is not None and not (_finite(trade_risk) and trade_risk > 0):
+            return "account_risk_unknown"
         if self.breached:
             return "account_drawdown_breached"
         if self.is_locked(session_date):
@@ -190,6 +235,14 @@ class AccountGuard:
         if trade_risk is not None and r.require_trade_risk_within_buffer and buffer - trade_risk < r.safety_buffer - 1e-9:
             return "account_trade_risk_exceeds_buffer"
         return None
+
+    def fill_block_reason(self, equity: float, session_date: Any, trade_risk: float | None) -> str | None:
+        """Fill-time check: the trade's risk must be a finite positive number."""
+        if not self.rules.enabled:
+            return None
+        if trade_risk is None or not (_finite(trade_risk) and trade_risk > 0):
+            return "account_risk_unknown"
+        return self.entry_block_reason(equity, session_date, trade_risk)
 
     def flatten_equity_level(self) -> float | None:
         """Equity at which an open position must be closed (floor + flatten_buffer)."""

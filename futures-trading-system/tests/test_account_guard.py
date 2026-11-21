@@ -119,36 +119,48 @@ def cfg_with(r, **kw):
 
 LONG_ROWS = [("10:00", 5000, 5001, 4999, 5000), ("10:01", 5000, 5001, 4999, 5000),
              ("10:02", 4999, 4999.5, 4980, 4982), ("10:03", 4982, 4983, 4981, 4982), ("10:04", 4982, 4983, 4981, 4982)]
+# Sprint 3 audit fixes (H1, H2): with the guard enabled every entry needs a stop-loss, so these
+# flatten-mechanism tests use a far stop (4900 / 5100) and disable the trade-risk-within-buffer
+# check to isolate the flatten level; the expected flatten prices include exit costs (H2).
+FAR_LONG = dict(stop_loss=4900)
+FAR_SHORT = dict(stop_loss=5100)
+
+
+def flat_rules(**kw):
+    return rules(require_trade_risk_within_buffer=False, **kw)
 
 
 def test_open_position_flattened_at_account_level_hand_calculated():
-    # Static floor 9,900; flatten at equity 9,920. Entry 5000.25 (realized -1 commission):
-    # level = 5000.25 + (9920 - 10000 + 1) / 5 = 4984.45 -> rounded up 4984.50; sell stop - 1 tick.
-    res, _ = run(LONG_ROWS, {"10:00": [OrderRequest.enter("long")], "10:03": [OrderRequest.enter("long")]},
-                 config=cfg_with(rules()))
+    # Static floor 9,900; flatten target 9,920 AFTER exit costs (1 x ($1 commission + 1 tick $1.25) = 2.25).
+    # Entry 5000.25 (realized -1): level = 5000.25 + (9920 + 2.25 - 10000 + 1) / 5 = 4984.90 -> up 4985.00;
+    # sell stop - 1 tick = 4984.75 -> equity 9920.50 >= 9920 (cost-aware; was 9918.00 before the fix).
+    res, _ = run(LONG_ROWS, {"10:00": [OrderRequest.enter("long", **FAR_LONG)],
+                             "10:03": [OrderRequest.enter("long", **FAR_LONG)]},
+                 config=cfg_with(flat_rules()))
     t = res.trades.iloc[0]
-    assert (t.exit_reason, t.exit_price, t.exit_time) == ("account_protection", 4984.25, ts("10:02"))
-    assert t.net_pnl == pytest.approx((4984.25 - 5000.25) * 5 - 2)  # -82
+    assert (t.exit_reason, t.exit_price, t.exit_time) == ("account_protection", 4984.75, ts("10:02"))
+    assert t.net_pnl == pytest.approx((4984.75 - 5000.25) * 5 - 2)  # -79.50
     assert list(res.rejections.reason) == ["account_locked_after_flatten"]
     assert res.equity["drawdown_floor"].iloc[-1] == 9_900
-    assert res.equity["drawdown_buffer"].iloc[-1] == pytest.approx(18.0)
+    assert res.equity["drawdown_buffer"].iloc[-1] == pytest.approx(20.5)
     assert res.account["events"][0]["event"] == "flatten_buffer_reached"
 
 
 def test_lock_resets_next_session_but_safety_buffer_still_applies():
     day1 = frame(LONG_ROWS)
     day2 = frame([("18:00", 4982, 4983, 4981, 4982), ("18:01", 4982, 4983, 4981, 4982)])
-    res, _ = run(pd.concat([day1, day2]), {"10:00": [OrderRequest.enter("long")],
-                                           "18:00": [OrderRequest.enter("long")]}, config=cfg_with(rules()))
-    assert list(res.rejections.reason) == ["account_safety_buffer"]  # buffer 18 <= 40 in the new session
+    res, _ = run(pd.concat([day1, day2]), {"10:00": [OrderRequest.enter("long", **FAR_LONG)],
+                                           "18:00": [OrderRequest.enter("long", **FAR_LONG)]},
+                 config=cfg_with(flat_rules()))
+    assert list(res.rejections.reason) == ["account_safety_buffer"]  # buffer 20.50 <= 40 in the new session
 
 
 def test_gap_through_floor_is_a_breach_and_locks_for_good():
     rows = LONG_ROWS[:2] + [("10:02", 4970, 4971, 4960, 4965)]
     day2 = frame([("18:00", 5000, 5001, 4999, 5000), ("18:01", 5000, 5001, 4999, 5000)])
-    res, _ = run(pd.concat([frame(rows), day2]), {"10:00": [OrderRequest.enter("long")],
-                                                   "18:00": [OrderRequest.enter("long")]},
-                 config=cfg_with(rules(lock_after_flatten="session")))
+    res, _ = run(pd.concat([frame(rows), day2]), {"10:00": [OrderRequest.enter("long", **FAR_LONG)],
+                                                   "18:00": [OrderRequest.enter("long", **FAR_LONG)]},
+                 config=cfg_with(flat_rules(lock_after_flatten="session")))
     t = res.trades.iloc[0]
     assert t.exit_reason == "account_protection" and t.exit_price == 4969.75 and t.exit_at_open
     assert res.account["breached"] and list(res.rejections.reason) == ["account_drawdown_breached"]
@@ -177,22 +189,22 @@ def test_trailing_eod_floor_rises_after_profitable_session():
 
 
 def test_closer_protective_level_wins():
-    # Daily loss 30 -> level 4994.50 is closer than the account level 4984.50.
-    res, _ = run(LONG_ROWS, {"10:00": [OrderRequest.enter("long")]},
-                 config=cfg_with(rules(), risk=RiskConfig(max_daily_loss=30,
-                                                          daily_loss_basis="realized_and_unrealized")))
+    # Daily loss 30 -> level 4994.50 is closer than the account level 4985.00.
+    res, _ = run(LONG_ROWS, {"10:00": [OrderRequest.enter("long", **FAR_LONG)]},
+                 config=cfg_with(flat_rules(), risk=RiskConfig(max_daily_loss=30,
+                                                               daily_loss_basis="realized_and_unrealized")))
     assert res.trades.iloc[0].exit_reason == "daily_loss_limit"
-    res, _ = run(LONG_ROWS, {"10:00": [OrderRequest.enter("long")]},
-                 config=cfg_with(rules(), risk=RiskConfig(max_daily_loss=300,
-                                                          daily_loss_basis="realized_and_unrealized")))
+    res, _ = run(LONG_ROWS, {"10:00": [OrderRequest.enter("long", **FAR_LONG)]},
+                 config=cfg_with(flat_rules(), risk=RiskConfig(max_daily_loss=300,
+                                                               daily_loss_basis="realized_and_unrealized")))
     assert res.trades.iloc[0].exit_reason == "account_protection"
 
 
 def test_short_symmetry():
     c = 10000.0
     rows = [(t, c - o, c - l, c - h, c - cl) for t, o, h, l, cl in LONG_ROWS]
-    res, _ = run(rows, {"10:00": [OrderRequest.enter("short")]}, config=cfg_with(rules()))
+    res, _ = run(rows, {"10:00": [OrderRequest.enter("short", **FAR_SHORT)]}, config=cfg_with(flat_rules()))
     t = res.trades.iloc[0]
-    # Short at 4999.75; level = 4999.75 + 15.8 = 5015.55 -> rounded down 5015.50; buy stop + 1 tick.
-    assert (t.exit_reason, t.exit_price) == ("account_protection", 5015.75)
-    assert t.net_pnl == pytest.approx(-82.0)
+    # Short at 4999.75; level = 4999.75 + 15.35 = 5015.10 -> rounded down 5015.00; buy stop + 1 tick.
+    assert (t.exit_reason, t.exit_price) == ("account_protection", 5015.25)
+    assert t.net_pnl == pytest.approx(-79.5)

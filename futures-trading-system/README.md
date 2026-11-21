@@ -636,6 +636,105 @@ These outcomes are recorded in three places:
 A pullback is *reserved* when its order is submitted, *released* if the order is rejected or
 cancelled, and *consumed* only when it fills. A second pending entry is impossible.
 
+### Security and validation fixes (after the adversarial audit of `0b6bb79`)
+
+| Finding | Fix | Tests |
+|---|---|---|
+| H1: unknown risk passed the guard | See *Entry risk validation* below | `test_security_h1_unknown_risk.py` |
+| H2: flatten ignored exit costs | See the emergency-flatten notes below | `test_security_guard_flatten.py` |
+| H3: OOS ledger blind to code | See *Code identity* below | `test_validation_integrity.py` |
+| M1: negative `floor_lock_offset` | `floor_lock_offset` must be a finite number ≥ 0; checked at start-up | `test_security_guard_flatten.py` |
+| M2: end-of-data breach not recorded | The final forced exit updates the guard; a final invariant marks any equity row at or below its floor as a breach | `test_security_guard_flatten.py` |
+| M3: ledger bypasses | Overlap checks; a canonical ledger location independent of `--output-dir` | `test_validation_integrity.py`, `test_security_ledger.py` |
+| M4: replay ignored code identity | Replay checks code, data, manifest consistency and versions | `test_validation_integrity.py` |
+| M5: fragile ledger | Append-only, hash-chained ledger with a head file | `test_security_ledger.py` |
+| L1: no gap reserve | `gap_reserve_ticks` | `test_security_h1_unknown_risk.py` |
+| L2: intraday timing | A floor raised by a bar's high is never acted on at that bar's open | `test_security_guard_flatten.py` |
+| L3: lifecycle idempotency | Explicit lifecycle state machine; entries counted once per order ID | `test_security_lifecycle.py` |
+| L4: overlapping walk-forward folds | `--wf-step` smaller than the test size is rejected | `test_manifest_validation.py` |
+| L5: R on gross prices | Documented below; `estimated_net_reward_risk` added | |
+| L6: account state per period | Documented below | |
+
+#### Entry risk validation (H1)
+
+- With account protection enabled, every entry needs a valid stop-loss (`account_requires_stop_loss`).
+- All order prices must be finite and positive (`invalid_order_price`), and quantities must be
+  integers ≥ 1 (`invalid_quantity`).
+- The contract tick size and point value must be finite and positive; this is checked when the
+  engine starts.
+- At the fill, risk that is NaN, infinite, zero or negative is rejected (`account_risk_unknown`).
+  This applies to every sizing method and order type.
+
+#### Code identity (H3)
+
+The code identity is the git commit, a clean/dirty flag for the working tree, and a SHA-256 over
+all `src/**/*.py` files plus `run_backtest.py` and `run_pipeline.py` (line endings normalised).
+
+The validation fingerprint combines the configuration texts, the target R and that source hash.
+
+An out-of-sample reveal is refused (exit 6) if:
+- the commit is unknown, or
+- the working tree is dirty (modified or untracked files).
+
+It is also refused (exit 4) when it overlaps dates already revealed under another fingerprint.
+
+#### Validation ledger (M3, M5)
+
+**Location:** `validation_history/oos_ledger.jsonl` in the project, plus a `.head` file. The
+folder is git-ignored. `--ledger PATH` or the `FTS_LEDGER_PATH` environment variable can override
+the location; the manifest records which ledger was used and whether it was the canonical one.
+
+**Creation:** the ledger is created only by `--init-ledger`. A missing ledger is never created
+implicitly.
+
+**Overlap rule:** any run is refused (exit 4) if it overlaps out-of-sample dates already revealed
+**for the same instrument under a different fingerprint**. This covers exact, shifted and partial
+overlaps, in-sample ranges and full-file runs. Runs with the same fingerprint are allowed, because
+they add no new selection. `--allow-oos-reuse` overrides the rule but marks the result as
+CONTAMINATED in the manifest and the ledger.
+
+**Damage detection:** each record stores its sequence number, the previous record's hash and its
+own SHA-256. The head file stores the record count and the last hash. Edited, deleted, reordered or
+truncated records, invalid JSON and a missing head file are all detected. When that happens every
+run stops (exit 5), and nothing is ever rewritten or recreated. `--verify-ledger` checks it on
+demand.
+
+**Backup and recovery:** copy both files (`oos_ledger.jsonl` and `oos_ledger.jsonl.head`)
+somewhere safe after each reveal, for example into a separate private repository. Restore both
+together.
+
+**Limitation:** the ledger is tamper-*evident* against accidents and casual edits, not
+tamper-proof. Deleting both files, or consistently rewriting every record and the head, cannot be
+detected without your backup.
+
+#### Replay statuses (M4)
+
+`--replay` checks the data hash, that the manifest's embedded configuration matches its recorded
+hash, the code identity, and the dependency versions. Only `EXACT` counts as a successful exact
+reproduction.
+
+| Status | Meaning | Exit code |
+|---|---|---|
+| `EXACT` | Same trusted code, same data, identical results | 0 |
+| `EXACT_DIFFERENT_DEPENDENCIES` | Identical results, but other Python/pandas/numpy versions | 7 |
+| `APPROXIMATE` | Other library versions; results differ only numerically (same trade count, net profit within 1e-6) | 7 |
+| `MISMATCH` | Same code, different results | 3 |
+| `MANIFEST_INCONSISTENT` | The embedded configuration does not match its recorded hash | 3 |
+| `UNTRUSTED_CODE` | Different source, a dirty tree, or an unknown commit (either side) | 6 |
+
+Changed data stops the replay with exit 1.
+
+#### Reward/risk (L5) and account state (L6)
+
+**Reward/risk:** the minimum R checked at the fill is the **gross, price-based** ratio
+`|target − fill| / |fill − stop|`. `entry_checks.csv` also reports `estimated_net_reward_risk`
+(target reward minus round-trip commission, divided by the stop-out risk including costs). Neither
+number is a statement about profitability.
+
+**Account state:** each period or fold starts a **fresh** simulated account, with a fresh risk
+manager and account guard. Fold results are **not** a continuous funded-account survival
+simulation. A continuous mode is not implemented.
+
 ### Reproducible runs (M5)
 
 Every result folder contains `manifest.json` with:
@@ -715,8 +814,18 @@ any firm's rules**. A verified prop-firm profile must be added as its own file.
 - per-account contract limits beyond `max_position_size`
 - any rule that depends on data this bar-based backtest does not have
 
-The realized loss can exceed the flatten level by the exit commission, the exit slippage and
-gaps. Size `flatten_buffer` accordingly.
+**Emergency flatten and exit costs:**
+- The flatten trigger includes the **estimated exit commission and stop slippage of the whole
+  position**. If the exit fills as modelled, equity afterwards is `floor + flatten_buffer`.
+- `flatten_buffer` must be > 0 and at least one contract's estimated exit cost; this is checked at
+  start-up.
+- Every emergency flatten locks entries, whatever price it filled at.
+- **Gap reserve:** `gap_reserve_ticks` adds a per-contract allowance to each trade's risk before
+  the safety-buffer check.
+
+These are estimates. A bar-based backtest cannot guarantee real-world fill prices, and no finite
+reserve covers every gap. Whenever simulated equity reaches or falls below the floor, including
+through gaps or a final forced exit, it is recorded as a breach.
 
 ## Known limitations
 

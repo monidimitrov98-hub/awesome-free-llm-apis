@@ -1,10 +1,20 @@
 """Run manifests: everything needed to reproduce a backtest and verify the result.
 
 A manifest records the exact configuration texts (settings, backtest, strategy,
-account profile), parsed snapshots, the data file's SHA-256, the period, the git
-commit, library versions and a fingerprint of the results. :func:`replay` rebuilds
-the configuration from the manifest, checks the data hash, re-runs the backtest and
-compares the result fingerprint.
+account profile), parsed snapshots, the data file's SHA-256, the period, the CODE
+IDENTITY (git commit, clean/dirty tree, SHA-256 of every Python source file), library
+versions and a fingerprint of the results. :func:`replay` verifies the data hash, the
+manifest's own consistency and the code identity before re-running and comparing.
+
+Replay statuses (only ``EXACT`` is a successful exact reproduction):
+
+* ``EXACT``                      same trusted code, same data, identical result fingerprint
+* ``EXACT_DIFFERENT_DEPENDENCIES`` identical fingerprint but other library versions
+* ``APPROXIMATE``                other library versions, fingerprint differs, same trade
+                                 count and net profit within 1e-6 (numerical, not exact)
+* ``MISMATCH``                   same code but different results
+* ``UNTRUSTED_CODE``             code differs, or either side is dirty / has an unknown commit
+* ``MANIFEST_INCONSISTENT``      embedded configuration does not match its recorded hash
 """
 
 from __future__ import annotations
@@ -26,7 +36,9 @@ import pandas as pd
 
 from src.config import PROJECT_ROOT, ConfigError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SOURCE_PATTERNS = ("src/**/*.py", "run_backtest.py", "run_pipeline.py")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 def file_sha256(path: str | Path) -> str:
@@ -50,8 +62,37 @@ def git_info(root: Path = PROJECT_ROOT) -> dict[str, Any]:
             return None
 
     commit = run("rev-parse", "HEAD")
-    status = run("status", "--porcelain", "--", ".")
+    status = run("status", "--porcelain", "--untracked-files=all", "--", ".")
     return {"commit": commit or "unknown", "dirty": bool(status) if status is not None else None}
+
+
+def source_fingerprint(root: Path = PROJECT_ROOT) -> tuple[str, int]:
+    """Deterministic SHA-256 over the relevant Python source (paths + contents, CRLF normalised)."""
+    files = sorted({p for pattern in SOURCE_PATTERNS for p in root.glob(pattern) if p.is_file()})
+    h = hashlib.sha256()
+    for p in files:
+        h.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        h.update(p.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    return h.hexdigest(), len(files)
+
+
+def code_identity(root: Path = PROJECT_ROOT) -> dict[str, Any]:
+    """Which code is running. ``trusted`` requires a known commit and a clean working tree."""
+    git = git_info(root)
+    source, n = source_fingerprint(root)
+    reasons = []
+    if not _COMMIT.match(git["commit"] or ""):
+        reasons.append("git commit unknown")
+    if git["dirty"] is not False:
+        reasons.append("working tree has uncommitted changes" if git["dirty"] else "git status unavailable")
+    return {"commit": git["commit"], "dirty": git["dirty"], "source_sha256": source, "source_files": n,
+            "trusted": not reasons, "untrusted_reasons": reasons}
+
+
+def validation_fingerprint(config_texts: dict[str, str], r_multiple: float, source_sha256: str) -> str:
+    """Identity of what is being validated: configuration texts, target R and source code."""
+    return text_sha256(json.dumps({"config": config_texts, "r_multiple": repr(float(r_multiple)),
+                                   "source_sha256": source_sha256}, sort_keys=True))
 
 
 def environment_info() -> dict[str, Any]:
@@ -146,6 +187,9 @@ def build_manifest(**kw: Any) -> dict[str, Any]:
         "config_texts": kw["config_texts"],
         "config_hash": config_hash(kw["config_texts"]),
         "git": git_info(),
+        "code": kw.get("code") or code_identity(),
+        "validation": kw.get("validation"),
+        "account_state": "each period starts a fresh simulated account (not a continuous survival simulation)",
         "environment": environment_info(),
         "command_line": kw.get("command_line"),
         "oos": kw.get("oos"),
@@ -164,10 +208,9 @@ def write_manifest(folder: Path, manifest: dict[str, Any]) -> Path:
 
 
 def replay(manifest_path: str | Path, csv_override: str | Path | None = None) -> dict[str, Any]:
-    """Re-run a backtest from its manifest and compare the result fingerprint.
+    """Re-run a backtest from its manifest; see the module docstring for the statuses.
 
-    Returns a dict with ``reproduced`` (bool), the expected and actual fingerprints and
-    any data-hash mismatch. Raises ConfigError if the data file is missing or altered.
+    Raises ConfigError if the data file is missing or altered.
     """
     from src.backtest.config import load_backtest_config
     from src.backtest.runner import run_strategy
@@ -184,6 +227,25 @@ def replay(manifest_path: str | Path, csv_override: str | Path | None = None) ->
     if actual_hash != m["data"]["sha256"]:
         raise ConfigError(f"Data file changed: sha256 {actual_hash} != manifest {m['data']['sha256']}")
     texts = m["config_texts"]
+    reasons: list[str] = []
+    result: dict[str, Any] = {"data_sha256": actual_hash, "git_commit_then": m.get("git", {}).get("commit"),
+                              "git_commit_now": git_info()["commit"], "reasons": reasons}
+    if config_hash(texts) != m.get("config_hash"):
+        reasons.append("embedded configuration does not match the recorded config hash")
+        return result | {"status": "MANIFEST_INCONSISTENT", "reproduced": False, "expected": None, "actual": None}
+
+    then = m.get("code") or {}
+    now = code_identity()
+    if not then.get("trusted"):
+        reasons.append(f"original run used untrusted code: {then.get('untrusted_reasons') or 'no code identity'}")
+    if not now["trusted"]:
+        reasons.append(f"current code is untrusted: {now['untrusted_reasons']}")
+    if then.get("source_sha256") != now["source_sha256"]:
+        reasons.append("Python source differs from the code that produced the manifest")
+    if then.get("commit") != now["commit"]:
+        reasons.append(f"git commit differs ({then.get('commit')} vs {now['commit']})")
+    code_ok = then.get("trusted") and now["trusted"] and then.get("source_sha256") == now["source_sha256"]
+
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         (d / "settings.toml").write_text(texts["settings"], encoding="utf-8")
@@ -203,6 +265,20 @@ def replay(manifest_path: str | Path, csv_override: str | Path | None = None) ->
     period = Period(p["label"], p["kind"], parse_date(p["start"]), parse_date(p["end"]), p["fold"])
     run = run_strategy(md, app, bt, strat, label=m["label"], period=period)
     actual = results_fingerprint(run.result.trades, run.result.equity)
-    return {"reproduced": actual == m["results"]["fingerprint"], "expected": m["results"]["fingerprint"],
-            "actual": actual, "data_sha256": actual_hash, "git_commit_then": m["git"]["commit"],
-            "git_commit_now": git_info()["commit"]}
+    expected = m["results"]["fingerprint"]
+    env_then, env_now = m.get("environment", {}), environment_info()
+    deps_same = all(env_then.get(k) == env_now.get(k) for k in ("python", "pandas", "numpy"))
+    if not deps_same:
+        reasons.append(f"dependency versions differ: then {[env_then.get(k) for k in ('python', 'pandas', 'numpy')]} "
+                       f"now {[env_now.get(k) for k in ('python', 'pandas', 'numpy')]}")
+    if not code_ok:
+        status = "UNTRUSTED_CODE"
+    elif actual == expected:
+        status = "EXACT" if deps_same else "EXACT_DIFFERENT_DEPENDENCIES"
+    elif not deps_same and int(run.result.metrics["total_trades"]) == m["results"]["total_trades"] and \
+            abs(run.result.metrics["net_profit"] - m["results"]["net_profit"]) <= 1e-6 * max(1.0, abs(m["results"]["net_profit"])):
+        status = "APPROXIMATE"
+    else:
+        status = "MISMATCH"
+        reasons.append("result fingerprint differs")
+    return result | {"status": status, "reproduced": status == "EXACT", "expected": expected, "actual": actual}

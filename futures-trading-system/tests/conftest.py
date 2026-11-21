@@ -60,3 +60,9 @@ def full_session_bars(session: SessionConfig, session_dates: list[str], freq: st
     return pd.DataFrame(
         {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": np.full(n, 10.0)}, index=idx
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_validation_ledger(tmp_path, monkeypatch):
+    """No in-process test may read or write the project's real validation ledger."""
+    monkeypatch.setenv("FTS_LEDGER_PATH", str(tmp_path / "test_ledger" / "oos_ledger.jsonl"))
