@@ -1,0 +1,62 @@
+# Backtest configuration (Sprint 2). HISTORICAL SIMULATION ONLY:
+# there is no broker connection and no real order is ever sent.
+# Contract specifications (tick size, point value) come from config/settings.toml.
+
+[account]
+initial_capital = 10000.0
+
+# Costs per contract root. PLACEHOLDER VALUES: set them to your own all-in cost
+# per contract per side (broker commission + exchange + clearing + NFA fees).
+# They are deliberately not taken from any specific broker.
+[costs.MES]
+commission_per_contract_per_side = 1.00
+
+[costs.MNQ]
+commission_per_contract_per_side = 1.00
+
+# Adverse slippage in ticks, applied to every fill of the given order type
+# (forced exits such as session-end flattening are market orders).
+[slippage]
+market_ticks = 1
+stop_ticks = 1
+limit_ticks = 0
+
+[execution]
+# What happens when a SIGNAL bar has is_complete == False:
+#   "skip"  -> the strategy is not called for that bar (it stays in the history)
+#   "allow" -> the strategy is called and sees ctx.bar_is_complete == False
+incomplete_signal_bar_policy = "skip"
+# May ENTRY orders fill on an execution bar with is_complete == False?
+# Exits (stops, targets, market exits) are always evaluated on every real bar.
+entries_on_incomplete_bars = false
+# Market entry orders that cannot fill within this many minutes after the signal
+# (e.g. because of a data gap) are cancelled and reported, never filled later.
+max_fill_delay_minutes = 2
+# Limit orders fill only if price trades THROUGH the limit (touch is not enough).
+limit_fill_requires_trade_through = true
+# Intraday: open positions are closed at market and pending entries cancelled
+# this many minutes before the configured session end. No new entries after that.
+flatten_minutes_before_session_end = 5
+
+[sizing]
+# "fixed": `contracts` per trade (unless the strategy requests a quantity)
+# "risk":  floor(risk_per_trade / risk per contract); requires a stop-loss
+method = "fixed"
+contracts = 1
+risk_per_trade = 100.0
+# Add round-trip commission and slippage to the risk per contract (conservative).
+include_costs_in_risk = true
+
+# Risk limits. A value of 0 disables a numeric limit. Prop-firm rules are NOT assumed.
+[risk]
+max_daily_loss = 300.0          # stop new entries once realized net daily PnL <= -this
+max_daily_trades = 5            # entries per session date
+max_position_size = 2           # contracts
+max_consecutive_losses = 3      # losing trades in a row
+consecutive_losses_reset_daily = true
+daily_profit_target = 0.0       # stop new entries once realized net daily PnL >= this
+# Local times in the session timezone, "HH:MM-HH:MM" (end exclusive). Entries are allowed
+# only inside a window, both when the signal is processed and when the order fills.
+# An empty list allows entries during the whole session.
+trading_windows = ["09:35-15:45"]
+emergency_stop = false          # true rejects every entry and flattens open positions

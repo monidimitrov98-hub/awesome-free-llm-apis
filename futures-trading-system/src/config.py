@@ -75,6 +75,11 @@ class ContractSpec:
     point_value: float
     listed_months: str
 
+    @property
+    def tick_value(self) -> float:
+        """Dollar value of one minimum price increment for one contract."""
+        return self.tick_size * self.point_value
+
 
 @dataclass(frozen=True)
 class DataConfig:

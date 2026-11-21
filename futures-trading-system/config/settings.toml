@@ -62,6 +62,12 @@ close = "close"
 volume = "volume"
 
 # Contract specifications. Only roots listed here are recognised.
+# Verified against CME Group contract specifications (checked 2026-11):
+#   MES: $5 x S&P 500 Index, minimum tick 0.25 index points = $1.25
+#        https://www.cmegroup.com/markets/equities/sp/micro-e-mini-sandp-500.contractSpecs.html
+#   MNQ: $2 x Nasdaq-100 Index, minimum tick 0.25 index points = $0.50
+#        https://www.cmegroup.com/markets/equities/nasdaq/micro-e-mini-nasdaq-100.html
+# tick value = tick_size * point_value. Re-check if CME changes the specifications.
 [contracts.MES]
 description = "Micro E-mini S&P 500"
 tick_size = 0.25

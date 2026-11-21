@@ -1,18 +1,22 @@
-# Futures Trading System: Sprint 1 Market Data Engine
+# Futures Trading System
 
 A personal Python **research and paper-trading** project for intraday **MES** and **MNQ** futures.
 
 > **No live trading.** This code has no order-execution component. It does not claim that any
 > strategy is profitable. The sample data is **synthetic** and is not real market prices.
 
-Sprint 1 covers the market data engine: loading CSV files, validating them, converting
-timestamps to UTC, identifying contracts, resampling and computing core indicators.
+- **Sprint 1, market data engine:** loading CSV files, validating them, converting timestamps
+  to UTC, identifying contracts, resampling and computing core indicators.
+- **Sprint 2, backtesting engine:** an event-driven historical simulation with orders, fills,
+  positions, costs, a risk engine and performance metrics. There is no trading strategy yet,
+  only the interface for one.
 
 ## Project layout
 
 ```
 futures-trading-system/
-├── config/settings.toml        # every setting: columns, timezones, sessions, contracts, indicator periods
+├── config/settings.toml        # data settings: columns, timezones, sessions, contracts, indicator periods
+├── config/backtest.toml        # backtest settings: capital, costs, slippage, execution policies, sizing, risk
 ├── data/samples/               # SYNTHETIC sample CSVs (clearly marked) + README
 ├── run_pipeline.py             # command-line entry point
 ├── scripts/generate_synthetic_data.py
@@ -29,7 +33,10 @@ futures-trading-system/
 │   │   ├── report.py           # data quality report
 │   │   └── errors.py
 │   ├── indicators/             # ema, rsi (Wilder), atr (Wilder), session vwap, relative volume
-│   ├── strategy/ ai/ risk/ backtest/ dashboard/   # placeholders for later sprints
+│   ├── backtest/               # engine, orders, position, execution (fill rules), sizing, metrics, config
+│   ├── risk/manager.py         # configurable risk limits that can reject any entry
+│   ├── strategy/base.py        # Strategy interface + StrategyContext (no strategy implemented yet)
+│   ├── ai/ dashboard/          # placeholders for later sprints
 └── tests/                      # pytest suite (one file per module/indicator)
 ```
 
@@ -174,6 +181,152 @@ The engine never removes valid data or fabricates bars to make a frame look comp
 **Look-ahead protection:** every indicator is causal. `tests/test_no_lookahead.py` checks that
 truncating the data, or changing future bars, never changes earlier values.
 
+## Sprint 2: Backtesting engine
+
+> Historical simulation only. Nothing here connects to a broker or sends an order.
+> Results on the synthetic sample data are meaningless and are not evidence of profitability.
+
+### Architecture
+
+```
+signal bars (1m/5m/15m) ──► SignalEvent at available_at ──► Strategy.on_bar(ctx) ──► OrderRequest
+                                                                                       │
+                                     validate ─► size (sizing.py) ─► RiskManager.check_entry ─► Order
+                                                                                       │
+execution bars (1m) ──► ExecutionEvent at bar open ──► housekeeping (session end, gaps, emergency)
+                                                   ──► entry fill (+ second risk check) ─► bracket orders
+                                                   ──► exits (market / stop-loss / take-profit, OCO)
+                                                   ──► mark-to-market at close ─► equity curve
+                                                                                       │
+                                          trades, orders, fills, rejections ─► metrics.py
+```
+
+| Module | Responsibility |
+|---|---|
+| `backtest/engine.py` | Event queue, order lifecycle, fills, trade log, equity curve |
+| `backtest/execution.py` | Pure fill rules: tick rounding, slippage, stop/limit triggering, gaps |
+| `backtest/orders.py` | `OrderRequest` (strategy → engine), `Order`, `Fill`, enums |
+| `backtest/position.py` | Signed position, average entry price, realized/unrealized PnL |
+| `backtest/sizing.py` | Fixed or risk-based contract count |
+| `backtest/metrics.py` | Performance statistics |
+| `risk/manager.py` | Daily loss, daily trades, position size, consecutive losses, profit target, trading windows, emergency stop |
+| `strategy/base.py` | `Strategy` ABC and the read-only `StrategyContext` |
+
+### Timing rules (anti-look-ahead)
+
+1. A signal bar produces an event at its `available_at` (open + timeframe). Only then is the
+   strategy called. `ctx.history` holds only bars with `available_at <= now`, and the engine
+   asserts this on every call.
+2. Execution bars produce an event at their **open**. At equal timestamps the signal is
+   processed first. An order created at time T can therefore only fill on bars opening at or
+   after T: a decision made at the close of bar k fills at the open of the next bar at the
+   earliest.
+3. Signals can come from 5m or 15m bars while fills use 1m bars (recommended, because it reduces
+   ambiguity). The execution frame must not be coarser than the signal frame.
+4. Each signal bar is decided exactly once. Only one entry per bar and one pending entry at a
+   time are allowed, and there is no entry while a position is open. Rejections are logged.
+5. Missing data is never filled. A market entry that cannot fill within
+   `max_fill_delay_minutes` (data gap) is cancelled and reported. A position still open when the
+   data jumps into a new session is closed at the first new bar and reported as `session_gap`.
+   NaN prices are rejected.
+
+### Incomplete-bar policy (configurable)
+
+- **Signal bars:** with `incomplete_signal_bar_policy = "skip"` (the default), the strategy is
+  not called on incomplete bars. With `"allow"`, it is called with `ctx.bar_is_complete = False`.
+- **Execution bars:** `entries_on_incomplete_bars = false` (the default) makes entries wait for
+  a complete bar. Exits are always evaluated on every real bar, because protective stops must
+  not be skipped.
+- Trades touching an incomplete bar are flagged `data_incomplete`.
+
+### Fill rules
+
+| Order | Fill |
+|---|---|
+| Market | Next eligible bar open ± slippage (adverse) |
+| Stop | Stop price ± slippage when the bar trades through it, or the **open** when the bar gaps past it (worse) |
+| Limit | Limit price when price trades **through** it (touch is not enough, configurable), or the open when the bar opens through it. No slippage by default |
+| Stop-loss / take-profit | Attached to the entry as an OCO bracket and active from the entry bar |
+
+- **Tick rounding:** trigger prices are rounded so the order is *harder* to fill (buy stop up,
+  sell stop down, buy limit down, sell limit up).
+- **Costs:** commission is charged per contract per side. Slippage is included in fill prices
+  and also reported separately.
+
+**Ambiguity (never the favorable outcome):**
+- If the stop-loss and take-profit could both have been hit in the same bar, and neither at
+  the open, the stop-loss fills and the trade is flagged `ambiguous`.
+- On the bar where a stop or limit entry filled intrabar, a take-profit is never credited, and
+  a stop-loss inside the bar range is assumed hit (also flagged `ambiguous`).
+- Market entries fill at the open, so the rest of that bar can legitimately trigger the bracket.
+
+**Intraday flattening:** positions are closed at market and pending entries cancelled
+`flatten_minutes_before_session_end` before the session end. New entries are rejected from
+that point.
+
+### Contract specifications (verified against CME Group)
+
+| | Multiplier | Tick | Tick value |
+|---|---|---|---|
+| MES | $5 × S&P 500 | 0.25 | $1.25 |
+| MNQ | $2 × Nasdaq-100 | 0.25 | $0.50 |
+
+### Risk engine
+
+`RiskManager.check_entry()` runs when the signal is processed **and again at fill time**.
+Exits are never blocked. Every limit is configurable in `[risk]`, and `0` disables a limit:
+
+- `max_daily_loss` and `daily_profit_target`: realized net PnL per trade date
+- `max_daily_trades`: entries per trade date
+- `max_position_size`
+- `max_consecutive_losses`: a win resets the count; optionally it also resets daily
+- `trading_windows`: local session time, `[start, end)`
+- `emergency_stop`: config flag or `activate_emergency_stop()`. It rejects all entries and
+  flattens at the next bar open.
+
+### Metrics
+
+`net_profit`, `gross_profit`, `gross_loss`, `win_rate`, `profit_factor`, `average_win`,
+`average_loss`, `max_drawdown` (mark-to-market equity, including starting capital),
+`average_r_multiple` (trades with a stop), `expectancy`, `total_trades`, `long`/`short`
+breakdowns, `daily_pnl`, `equity`, total commission and slippage, and the number of ambiguous
+trades. All PnL figures are **net of commission and slippage**.
+
+### Using the engine
+
+```python
+from src.config import load_config
+from src.backtest import BacktestEngine, OrderRequest, load_backtest_config
+from src.pipeline import build_market_data
+from src.strategy import Strategy
+
+class MyStrategy(Strategy):
+    def on_bar(self, ctx):
+        ...  # use only ctx.bar / ctx.history; return [OrderRequest.enter("long", stop_loss=..., take_profit=...)]
+
+cfg = load_config()
+md = build_market_data("data/samples/SYNTHETIC_MES_1m.csv", cfg)
+engine = BacktestEngine(load_backtest_config(), md.contract.spec, cfg.session)
+result = engine.run(MyStrategy(), signal_bars=md.frames["5min"], execution_bars=md.frames["1min"])
+print(result.metrics); result.trades; result.equity; result.rejections
+```
+
+### Sprint 2 assumptions
+
+- **Commission:** `$1.00` per contract per side is a placeholder. Set your own all-in cost.
+- **Slippage:** the default is 1 adverse tick on market and stop fills and 0 on limits. This
+  is a modelling assumption, not a measurement.
+- **Intrabar timing:** intrabar fill times are unknown inside a bar. `entry_time` and
+  `exit_time` are the open of the execution bar (`*_at_open` says whether the fill was at the
+  open). The fill-time risk check uses the bar's open time.
+- **Daily figures:** daily figures use the trade date of the exit. The daily-loss and
+  profit-target limits use **realized** PnL. Entries happen only when flat, so nothing is
+  unrealized at check time.
+- **Positions:** one position at a time, no scaling in or out, and no reversal in one order.
+  The `Position` class is general, but the engine limits it.
+- **Win/loss:** a trade with `net_pnl < 0` is a loss, `> 0` a win, and breakeven resets the
+  consecutive-loss count.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.
@@ -199,3 +352,16 @@ truncating the data, or changing future bars, never changes earlier values.
 - Indicators use simple Python loops. They are fine for months of 1m data but not optimised
   for many years of tick data.
 - Single-digit years (`MESH5`) are resolved to the year nearest the data start.
+- **Backtest, bar data only:**
+  - Intrabar order is unknown, so ambiguous bars are resolved pessimistically. Use 1m
+    execution bars to reduce how often this happens.
+  - There is no queue position, partial fill, liquidity or market-impact model. Limit orders
+    either fill fully or not at all.
+- **Backtest, slippage:** slippage is a fixed number of ticks. It does not vary with
+  volatility, news or order size.
+- **Backtest, positions:** one contract root and one open position at a time. Multi-asset
+  and multi-strategy portfolios are not supported.
+- **Backtest, accounting:** there is no margin, overnight financing or account liquidation
+  model, and no prop-firm rules. The risk limits are generic.
+- **Backtest, exits:** the end of data closes any open position at the last close, and the
+  run reports a warning.
