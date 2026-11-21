@@ -1,0 +1,205 @@
+# Economic News & Event Risk Filter (Sprint 4.1)
+#
+# NewsGuard is an independent safety gate inside the backtest engine: every NEW entry
+# (at the signal and again at the fill) must pass it before the risk manager and the
+# AccountGuard are asked. It never blocks exits, stop-losses, take-profits, flattening or
+# AccountGuard actions. When the calendar is missing, stale, failing, conflicting or
+# cannot tell whether an event is imminent, new entries are BLOCKED (fail closed).
+#
+# This file can NOT change account protection, drawdown limits, risk budgets or position
+# sizing (unknown sections and keys are rejected). The windows below are conservative
+# starting parameters, not optimised or proven values.
+
+[news]
+enabled = true
+mode = "enforce"                       # "enforce" blocks; "observe" only records what would be blocked
+display_timezone = "America/New_York"
+local_timezone = ""                    # optional IANA timezone for a second display time
+
+[calendar]
+max_age_minutes = 1440                 # the last successful refresh of every expected provider must be newer
+lookahead_minutes = 240                # the calendar must cover [now, now + lookahead] (no blind horizon)
+refresh_interval_minutes = 60          # live refresh cadence (run_news_calendar.py --refresh)
+min_request_interval_seconds = 300     # per provider rate limit
+request_timeout_seconds = 10
+max_response_bytes = 2000000
+conflict_policy = "union"              # "union": block every disagreeing time; "prefer_priority": trust the provider with the best priority
+unknown_time_policy = "block_day"      # an event without a valid time blocks its whole New York calendar day
+backtest_calendar_path = ""            # historical calendar used by run_backtest.py when --news-calendar is not given
+store_path = "data/news/calendar_store.json"
+
+[fail_safe]
+on_integrity_failure = "block_entries" # the only accepted value: missing/stale/failed data never allows entries
+provider_failure_policy = "block_entries"  # or "use_fresh_cache": keep evaluating the cached calendar while it is fresh
+recovery_successes = 1                 # successful validated refreshes needed after a failure before trading resumes
+
+[positions]
+pre_event_policy = "keep"              # "keep": open positions follow their brackets; "flatten": close them when a window starts
+flatten_impacts = ["high"]
+
+[impact]
+block = ["high", "medium", "unknown"]  # impacts that open a blackout window ("low" is recorded only)
+
+[unknown_impact]                       # relevant-region events that cannot be classified
+before_minutes = 30
+after_minutes = 30
+
+# Event categories: patterns are case-insensitive regular expressions on the event name.
+[events.cpi]
+patterns = ["consumer price index", "\\bcpi\\b"]
+impact = "high"
+before_minutes = 30
+after_minutes = 30
+
+[events.core_cpi]
+patterns = ["core cpi", "core consumer price"]
+impact = "high"
+before_minutes = 30
+after_minutes = 30
+
+[events.pce]
+patterns = ["personal income and outlays", "\\bpce\\b", "personal consumption expenditures"]
+impact = "high"
+before_minutes = 30
+after_minutes = 30
+
+[events.core_pce]
+patterns = ["core pce"]
+impact = "high"
+before_minutes = 30
+after_minutes = 30
+
+[events.nfp]
+patterns = ["employment situation", "nonfarm payroll", "non-farm payroll", "\\bnfp\\b"]
+impact = "high"
+before_minutes = 30
+after_minutes = 30
+
+[events.unemployment_rate]
+patterns = ["unemployment rate"]
+impact = "high"
+before_minutes = 30
+after_minutes = 30
+
+[events.fomc_decision]
+patterns = ["fomc.*(rate|decision)", "federal funds rate", "interest rate decision"]
+impact = "high"
+before_minutes = 60
+after_minutes = 60
+
+[events.fomc_statement]
+patterns = ["fomc statement", "fomc.*statement"]
+impact = "high"
+before_minutes = 60
+after_minutes = 60
+
+[events.fed_press_conference]
+patterns = ["press conference"]
+impact = "high"
+before_minutes = 30
+after_minutes = 30
+
+[events.fed_chair_speech]
+patterns = ["fed chair", "chair .*(speaks|speech|testimony|testifies)", "powell"]
+impact = "high"
+before_minutes = 15
+after_minutes = 45
+
+[events.ppi]
+patterns = ["producer price index", "\\bppi\\b"]
+impact = "medium"
+before_minutes = 15
+after_minutes = 15
+
+[events.gdp]
+patterns = ["gross domestic product", "\\bgdp\\b"]
+impact = "medium"
+before_minutes = 15
+after_minutes = 15
+
+[events.retail_sales]
+patterns = ["retail sales", "retail trade"]
+impact = "medium"
+before_minutes = 15
+after_minutes = 15
+
+[events.jobless_claims]
+patterns = ["jobless claims", "unemployment insurance weekly claims"]
+impact = "medium"
+before_minutes = 5
+after_minutes = 10
+
+[events.ism_manufacturing]
+patterns = ["ism manufacturing", "manufacturing pmi.*ism"]
+impact = "medium"
+before_minutes = 10
+after_minutes = 15
+
+[events.ism_services]
+patterns = ["ism services", "ism non-manufacturing"]
+impact = "medium"
+before_minutes = 10
+after_minutes = 15
+
+[events.treasury]
+patterns = ["quarterly refunding", "treasury refunding"]
+impact = "medium"
+before_minutes = 15
+after_minutes = 15
+
+[events.unexpected]                    # unexpected official announcements (window starts when they become known)
+patterns = []
+impact = "high"
+before_minutes = 0
+after_minutes = 30
+
+[instruments.MES]
+regions = ["US"]
+
+[instruments.MNQ]
+regions = ["US"]
+
+# Global emergency blackout windows (operator-defined, UTC ISO times). Example:
+# [[emergency.windows]]
+# start = "2025-04-03T00:00:00Z"
+# end = "2025-04-04T00:00:00Z"
+# reason = "manual emergency: market-wide event"
+[emergency]
+windows = []
+
+# Calendar providers. Live providers are DISABLED until you verify them in your own
+# environment (their endpoints could not be reached from the development sandbox).
+# Credentials are read from environment variables named by api_key_env; never put keys here.
+[providers.manual]
+type = "json_file"
+enabled = true
+path = "data/news/manual_calendar.json"   # curated from official schedules (FOMC calendar, BEA, Census, ...)
+reliability = "official"
+priority = 1
+expected = false                          # true: its failure / staleness blocks entries
+
+[providers.bls]
+type = "ics"
+enabled = false
+url = "https://www.bls.gov/schedule/news_release/bls.ics"   # official BLS release calendar (iCalendar)
+reliability = "official"
+priority = 1
+expected = true
+
+[unexpected]
+enabled = false
+provider = "fed_press"
+keywords = ["federal open market committee", "fomc", "discount rate", "emergency", "liquidity", "intermeeting"]
+blackout_minutes = 30
+max_item_age_minutes = 120
+
+[providers.fed_press]
+type = "rss"
+enabled = false
+url = "https://www.federalreserve.gov/feeds/press_monetary.xml"  # verify on federalreserve.gov/feeds before enabling
+reliability = "official"
+priority = 1
+expected = false
+
+[diagnostics]
+explain = true

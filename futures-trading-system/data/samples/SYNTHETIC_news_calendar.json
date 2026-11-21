@@ -1,0 +1,299 @@
+{
+ "schema": "news-calendar/1",
+ "synthetic": true,
+ "note": "SYNTHETIC calendar for the synthetic sample data; not real release times.",
+ "expected_providers": [
+  "synthetic_fixture"
+ ],
+ "provider_priority": {
+  "synthetic_fixture": 1
+ },
+ "refreshes": [
+  {
+   "time": "2025-03-01T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-01T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-02T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-02T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-03T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-03T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-04T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-04T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-05T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-05T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-06T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-06T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-07T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-07T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-08T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-08T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-09T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-09T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-10T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-10T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-11T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-11T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-12T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-12T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-13T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-13T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-14T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-14T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-15T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-15T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-16T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-16T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-17T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-17T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-18T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-18T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  },
+  {
+   "time": "2025-03-19T11:00:00Z",
+   "provider": "synthetic_fixture",
+   "ok": true,
+   "coverage_start": "2025-03-19T11:00:00Z",
+   "coverage_end": "2025-03-31T00:00:00Z",
+   "error": "",
+   "n_events": 0
+  }
+ ],
+ "events": [
+  {
+   "event_id": "cpi:2025-03-12",
+   "name": "Consumer Price Index (SYNTHETIC)",
+   "scheduled_at": "2025-03-12T08:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "ppi:2025-03-13",
+   "name": "Producer Price Index (SYNTHETIC)",
+   "scheduled_at": "2025-03-13T08:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "jobless_claims:2025-03-13",
+   "name": "Unemployment Insurance Weekly Claims (SYNTHETIC)",
+   "scheduled_at": "2025-03-13T08:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "retail_sales:2025-03-17",
+   "name": "Retail Sales (SYNTHETIC)",
+   "scheduled_at": "2025-03-17T08:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "retail_sales:2025-03-17",
+   "name": "Retail Sales (SYNTHETIC)",
+   "scheduled_at": "2025-03-17T10:50:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-12T15:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US",
+   "status": "changed"
+  },
+  {
+   "event_id": "gdp:2025-03-14",
+   "name": "Gross Domestic Product (SYNTHETIC)",
+   "scheduled_at": "2025-03-14T08:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "gdp:2025-03-14",
+   "name": "Gross Domestic Product (SYNTHETIC)",
+   "scheduled_at": "2025-03-14T08:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-13T20:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US",
+   "status": "cancelled"
+  },
+  {
+   "event_id": "fed_chair_speech:2025-03-11",
+   "name": "Fed Chair speech (SYNTHETIC)",
+   "date": "2025-03-11",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "fomc_decision:2025-03-19",
+   "name": "FOMC rate decision (SYNTHETIC)",
+   "scheduled_at": "2025-03-19T14:00:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "fed_press_conference:2025-03-19",
+   "name": "FOMC press conference (SYNTHETIC)",
+   "scheduled_at": "2025-03-19T14:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-01T12:00:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US"
+  },
+  {
+   "event_id": "cpi:2025-03-12",
+   "name": "Consumer Price Index (SYNTHETIC)",
+   "scheduled_at": "2025-03-12T08:30:00",
+   "timezone": "America/New_York",
+   "known_at": "2025-03-12T12:30:00Z",
+   "source": "synthetic_fixture",
+   "reliability": "synthetic",
+   "region": "US",
+   "status": "released",
+   "actual": "0.2"
+  }
+ ]
+}

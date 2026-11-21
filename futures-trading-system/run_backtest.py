@@ -59,6 +59,8 @@ from src.pipeline import build_market_data
 from src.strategy.vwap_pullback_config import DEFAULT_STRATEGY_CONFIG_PATH, load_strategy_config
 from src.ai.market_regime.config import DEFAULT_REGIME_CONFIG_PATH, load_regime_config
 from src.ai.market_regime.identity import instrument_key
+from src.risk.news.backtest import load_setup, paired_comparison
+from src.risk.news.config import DEFAULT_NEWS_CONFIG_PATH, load_news_config
 
 DISCLAIMER = ("No result here is evidence of profitability. In-sample results are descriptive only; "
               "judge the strategy on untouched out-of-sample data.")
@@ -74,6 +76,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--strategy-config", type=Path, default=DEFAULT_STRATEGY_CONFIG_PATH)
     p.add_argument("--regime-config", type=Path, default=DEFAULT_REGIME_CONFIG_PATH,
                    help="AI market regime config (advisory gate; its [regime] enabled flag switches it)")
+    p.add_argument("--news-config", type=Path, default=DEFAULT_NEWS_CONFIG_PATH,
+                   help="economic news & event risk filter config ([news] enabled/mode)")
+    p.add_argument("--news-calendar", type=Path, default=None,
+                   help="point-in-time historical calendar JSON (without one, the enabled filter blocks every entry)")
+    p.add_argument("--news-compare", action="store_true",
+                   help="in-sample only: also run without the filter and in observe mode, write news_comparison.json")
     p.add_argument("--r-multiples", type=float, nargs="+", default=None,
                    help="in-sample only: one run per take-profit R (side by side, never ranked)")
     p.add_argument("--output-dir", type=Path, default=Path("output"))
@@ -152,14 +160,18 @@ def main(argv: list[str] | None = None) -> int:
         bt = load_backtest_config(args.backtest_config)
         strat = load_strategy_config(args.strategy_config)
         regime = load_regime_config(args.regime_config)
+        news_cfg = load_news_config(args.news_config)
+        news = load_setup(news_cfg, args.news_calendar) if news_cfg.enabled else None
         texts = read_config_texts(Path(args.settings), Path(args.backtest_config), Path(args.strategy_config),
-                                  Path(args.regime_config))
+                                  Path(args.regime_config), news)
         md = build_market_data(args.csv, app)
         data_hash = file_sha256(args.csv)
         code = code_identity()
         r_values = args.r_multiples or [strat.target.r_multiple]
         periods = _plan(args, md.frames[strat.execution_timeframe])
         oos_periods = [p for p in periods if p.is_out_of_sample]
+        if oos_periods and args.news_compare:
+            raise ConfigError("--news-compare evaluates several configurations; use it in-sample only")
         if oos_periods and len(r_values) > 1:
             raise ConfigError("Out-of-sample evaluation needs ONE pre-registered configuration; "
                               "compare R-multiples in-sample only")
@@ -196,6 +208,13 @@ def main(argv: list[str] | None = None) -> int:
           f"code {'trusted' if code['trusted'] else 'UNTRUSTED (' + ', '.join(code['untrusted_reasons']) + ')'}")
     command_line = sys.argv if argv is None else ["run_backtest.py", *argv]
     root = instrument_key(md.contract.root, md.is_synthetic)
+    if news is None:
+        print("News filter: DISABLED in config (no event-risk protection in this run)")
+    else:
+        print(f"News filter: {news.cfg.mode}; calendar {news.calendar_path or 'NONE'}")
+        if news.store_text is None:
+            print("  *** no historical calendar: the filter cannot see events, so every new entry is blocked "
+                  "(fail closed). Pass --news-calendar or set [calendar] backtest_calendar_path. ***")
     print(f"Regime engine: {'enabled (' + regime.enforcement + ', ' + regime.model_version + ')' if regime.enabled else 'disabled'}")
     for period in periods:
         if period.is_out_of_sample and not args.reveal_oos:
@@ -229,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                 oos = {"revealed": True, "ledger_seq": rec["seq"], "reuse_acknowledged": bool(conflicts)}
             try:
                 run = run_strategy(md, app, bt, cfg, period=None if period.kind == "full" else period,
-                                   regime=regime)
+                                   regime=regime, news=news)
             except ConfigError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
@@ -244,7 +263,27 @@ def main(argv: list[str] | None = None) -> int:
                 "regime_info": None if run.regime is None else {
                     "model_version": regime.model_version, "enforcement": regime.enforcement,
                     "artifacts": run.regime["artifacts"], "errors": run.regime["errors"],
-                    "gate": run.regime["performance"].get("gate")}})
+                    "gate": run.regime["performance"].get("gate")},
+                "news_info": None if run.news is None else {
+                    "mode": run.news["mode"], "calendar_sha256": run.news["calendar_sha256"],
+                    "calendar_path": news.calendar_path,
+                    "summary": {k: run.news["report"].get(k) for k in (
+                        "entry_signals_evaluated", "entry_signals_blocked", "entry_signals_would_block",
+                        "trades_allowed", "blocked_by_state")}}})
+            if args.news_compare and news is not None:
+                import json as _json
+
+                from src.backtest.runner import _jsonable
+                pp = None if period.kind == "full" else period
+                off = run_strategy(md, app, bt, cfg, period=pp, regime=regime, news=None)
+                obs = run if news.cfg.mode == "observe" else run_strategy(
+                    md, app, bt, cfg, period=pp, regime=regime, news=news.with_mode("observe"))
+                enf = run if news.cfg.mode == "enforce" else run_strategy(
+                    md, app, bt, cfg, period=pp, regime=regime, news=news.with_mode("enforce"))
+                comp = paired_comparison(off, obs, enf)
+                (folder / "news_comparison.json").write_text(_json.dumps(_jsonable(comp), indent=2, default=str), encoding="utf-8")
+                print("  news comparison (same data/config):", {k: comp[k]["total_trades"]
+                                                                for k in ("without_filter", "observe", "enforce")})
             runs.append(run)
             d = run.diagnostics
             print(f"\n=== {period.label} [{period.to_dict()['start'] or 'start'}..{period.to_dict()['end'] or 'end'}]"
@@ -255,6 +294,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("  submitted signals by engine outcome:", run.signals["status"].value_counts().to_dict())
             if not run.result.rejections.empty:
                 print("  engine/risk rejections:", run.result.rejections["reason"].value_counts().to_dict())
+            if run.news is not None:
+                nr = run.news["report"]
+                print(f"  news filter ({nr['mode']}): {nr.get('entry_signals_would_block', 0)} of "
+                      f"{nr.get('entry_signals_evaluated', 0)} entry signals {'blocked' if nr['mode'] == 'enforce' else 'would be blocked'}"
+                      f" {nr.get('blocked_by_state', {})}; calendar gaps {len(nr['calendar']['gaps'])}")
             if run.regime is not None and not run.regime["decisions"].empty:
                 dec = run.regime["decisions"]
                 print("  regime gate:", dec["suitability"].value_counts().to_dict(),

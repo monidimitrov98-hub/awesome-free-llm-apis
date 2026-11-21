@@ -132,13 +132,17 @@ def config_hash(config_texts: dict[str, str]) -> str:
 
 
 def read_config_texts(settings_path: Path, backtest_path: Path, strategy_path: Path,
-                      regime_path: Path | None = None) -> dict[str, str]:
+                      regime_path: Path | None = None, news_setup=None) -> dict[str, str]:
     texts = {"settings": settings_path.read_text(encoding="utf-8"),
              "backtest": backtest_path.read_text(encoding="utf-8"),
              "strategy": strategy_path.read_text(encoding="utf-8")}
     if regime_path is not None and Path(regime_path).is_file():
         texts["regime"] = Path(regime_path).read_text(encoding="utf-8")
         texts["regime_artifacts"] = json.dumps(regime_artifact_hashes(regime_path), sort_keys=True)
+    if news_setup is not None:
+        texts["news"] = Path(news_setup.cfg.source_path).read_text(encoding="utf-8")
+        if news_setup.store_text is not None:
+            texts["news_calendar"] = news_setup.store_text  # exact point-in-time calendar used
     m = re.search(r'^\s*protection_profile\s*=\s*"([^"]*)"', texts["backtest"], flags=re.M)
     if m and m.group(1).strip():
         prof = Path(m.group(1))
@@ -206,6 +210,7 @@ def build_manifest(**kw: Any) -> dict[str, Any]:
         },
         "account_rules": snapshot(bt.account_rules),
         "regime": kw.get("regime_info"),
+        "news": kw.get("news_info"),
         "config_texts": kw["config_texts"],
         "config_hash": config_hash(kw["config_texts"]),
         "git": git_info(),
@@ -287,13 +292,25 @@ def replay(manifest_path: str | Path, csv_override: str | Path | None = None) ->
             if regime_artifact_hashes(d / "regime.toml") != json.loads(texts.get("regime_artifacts", "{}")):
                 raise ConfigError("regime calibration/model artifacts changed since the manifest was written")
             regime_cfg = load_regime_config(d / "regime.toml")
+        news_setup = None
+        if "news" in texts:
+            from src.risk.news.backtest import NewsSetup, load_setup
+            from src.risk.news.config import load_news_config
+
+            (d / "news.toml").write_text(texts["news"], encoding="utf-8")
+            ncfg = load_news_config(d / "news.toml")
+            if "news_calendar" in texts:
+                (d / "news_calendar.json").write_text(texts["news_calendar"], encoding="utf-8")
+                news_setup = load_setup(ncfg, d / "news_calendar.json")
+            else:
+                news_setup = NewsSetup(ncfg, None, "", None)
         app = load_config(d / "settings.toml")
         bt = load_backtest_config(d / "backtest.toml")
         strat = load_strategy_config(d / "strategy.toml").with_r_multiple(m["strategy"]["target"]["r_multiple"])
     md = build_market_data(csv, app)
     p = m["period"]
     period = Period(p["label"], p["kind"], parse_date(p["start"]), parse_date(p["end"]), p["fold"])
-    run = run_strategy(md, app, bt, strat, label=m["label"], period=period, regime=regime_cfg)
+    run = run_strategy(md, app, bt, strat, label=m["label"], period=period, regime=regime_cfg, news=news_setup)
     actual = results_fingerprint(run.result.trades, run.result.equity)
     expected = m["results"]["fingerprint"]
     env_then, env_now = m.get("environment", {}), environment_info()

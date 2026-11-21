@@ -913,6 +913,139 @@ volatility. The last `--oos-sessions` stay sealed until `--reveal-oos`, which ne
 code and the validation ledger, like Sprint 3. Synthetic data is keyed `ROOT:synthetic` in
 the ledger.
 
+## Sprint 4.1: Economic news & event risk filter
+
+The news filter protects the account from scheduled and unexpected event risk. It does
+**not** predict how the market reacts to news. It is an independent gate inside the backtest
+engine.
+
+```
+calendar providers -> normalisation -> classification -> impact -> blackout windows
+   -> NewsGuard -> risk manager -> AccountGuard -> execution
+```
+
+Every new entry asks NewsGuard twice: when the signal is submitted, and again when a pending
+order would fill. It asks before the risk manager and the AccountGuard. Strategies, the
+regime engine and any LLM never get a reference to it, so they cannot override it. It never
+blocks exits, stop-losses, take-profits, flattening or AccountGuard actions. Open positions
+are kept unless you set `pre_event_policy = "flatten"`, which closes them when a window
+starts, with exit reason `news_event_flatten`.
+
+### Package (`src/risk/news/`)
+
+| Module | Role |
+| --- | --- |
+| `config.py` | Strict loader for `config/risk/news_filter.toml`. It rejects unknown sections and keys, and any setting that would allow entries when data is missing |
+| `event.py` | Normalised event model (one *version* per record with `known_at`) and strict parsing of untrusted payloads |
+| `classifier.py` | Category and impact from configured patterns. A provider hint can raise the impact but never lower it |
+| `calendar.py` | Point-in-time store: versions, refresh log, merging across sources, coverage report. JSON only |
+| `blackout.py` | Windows per event and instrument, plus unknown-time days, emergency windows, merging |
+| `guard.py` | `NewsGuard` state machine and decision log with plain-language explanations |
+| `providers.py` | `json_file`, `ics` (HTTPS iCalendar) and `rss` (HTTPS RSS) providers, with rate limit, timeouts and size limit |
+| `unexpected.py` | Unexpected official announcements become emergency blackouts; validation of LLM output |
+| `service.py` | Live refresh of every enabled provider into the store |
+| `backtest.py` | Historical setup, news report (PnL and drawdown around windows), paired comparison |
+
+### Data sources and provider setup
+
+| Provider | Source | Status |
+| --- | --- | --- |
+| `manual` (`json_file`) | A curated JSON file, `data/news/manual_calendar.json`, that you build from official schedules: the Federal Reserve FOMC calendar, BEA (GDP, PCE), Census (retail sales), DOL (jobless claims) and ISM | Enabled. Tested with fixtures only |
+| `bls` (`ics`) | Official BLS release calendar, `https://www.bls.gov/schedule/news_release/bls.ics` (CPI, PPI, Employment Situation) | **Disabled.** The endpoint was not reachable from the development sandbox, so it was tested with fixtures only. Verify it before enabling |
+| `fed_press` (`rss`) | Federal Reserve monetary-policy press-release RSS feed (URL inferred from federalreserve.gov/feeds) | **Disabled.** Not verified. Check the exact feed URL first |
+
+Credentials, when a provider needs them, come only from the environment variable named by
+`api_key_env`. A key written in the config file is rejected, and keys are redacted from
+errors and logs. Only `https://` URLs are accepted. Responses are bounded in size and must be
+valid. Feed text is cleaned and never interpreted as instructions. XML with
+DOCTYPE/ENTITY declarations is refused.
+
+```
+python run_news_calendar.py --refresh                  # schedule daily (or hourly) with your OS scheduler
+python run_news_calendar.py --status --instrument MNQ  # state, active and next windows (exit 8 = entries blocked)
+python run_news_calendar.py --validate data/news/history.json --start 2025-01-01 --end 2025-03-31
+```
+
+Calendar JSON (`schema: news-calendar/1`): `refreshes` (time, provider, ok, coverage) and
+`events`. Each event has a name, `scheduled_at` with a `timezone` (or a `date` only), a
+status, an optional impact and category, a source, a reliability, and `known_at`: the time
+the version became available. A manual provider file only needs `coverage_start`,
+`coverage_end` and `events`.
+
+### Default blackout windows (starting values, not optimised)
+
+| Event | Before | After | Impact |
+| --- | --- | --- | --- |
+| CPI / Core CPI, PCE / Core PCE, NFP, Unemployment rate | 30 min | 30 min | high |
+| FOMC rate decision, FOMC statement | 60 min | 60 min | high |
+| Fed press conference | 30 min | 30 min | high |
+| Fed Chair speech | 15 min | 45 min | high |
+| PPI, GDP, Retail sales, Treasury refunding | 15 min | 15 min | medium |
+| ISM manufacturing / services | 10 min | 15 min | medium |
+| Initial jobless claims | 5 min | 10 min | medium |
+| Unclassified relevant event (unknown impact) | 30 min | 30 min | unknown |
+| Event without a confirmed time | whole New York day | | |
+| Unexpected official announcement | from when it became known | 30 min | high |
+
+The FOMC decision and the press conference are separate events. Overlapping windows are
+merged. A changed time moves the window only once the change is known. A cancellation
+opens no window once it is known. MES and MNQ start with the same US rules; per-instrument
+overrides are possible.
+
+### Fail-closed behaviour
+
+| State | Meaning |
+| --- | --- |
+| `NORMAL` | Calendar fresh, covers the lookahead, no window active |
+| `BLACKOUT_ACTIVE` | Inside a scheduled event window |
+| `EVENT_UNKNOWN` | An event with unknown time or impact covers now |
+| `DATA_CONFLICT` | Equally reliable sources disagree; every reported time is blocked |
+| `CALENDAR_STALE` | No refresh, last refresh too old, or the calendar does not cover the next `lookahead_minutes` |
+| `PROVIDER_UNAVAILABLE` | An expected provider's latest refresh failed or returned malformed data |
+| `RECOVERY_PENDING` | Refreshes succeed again, but there are not yet `recovery_successes` in a row |
+| `EMERGENCY_BLACKOUT` | An operator emergency window or an unexpected official announcement |
+
+Every state except `NORMAL` blocks new entries in `enforce` mode. Recovery needs a successful,
+validated refresh; time passing alone never clears a failure. There is no override switch.
+A NewsGuard failure never disables AccountGuard or protective exits.
+
+### Observe vs enforce
+
+`observe` computes the same decisions and writes them out, but changes no trade. A test
+checks that its trades and equity are identical to a run without the filter. `enforce`
+rejects new entries in every unsafe state. Both modes keep every RiskManager and AccountGuard
+check.
+
+### Backtests and validation
+
+```
+python run_backtest.py --csv data\MNQ.csv --news-calendar data\news\history.json
+python run_backtest.py --csv data\MNQ.csv --news-calendar ... --in-sample 2025-01-02 2025-02-28 --news-compare
+```
+
+- **Point in time.** Decisions see only event versions and refreshes with
+  `known_at`/`time <= now`. Actual values are hidden until the release time. Later schedule
+  changes never leak backwards.
+- **No calendar means blocked.** Without a historical calendar (or where it has gaps), the
+  enabled filter blocks every entry, and the gaps are reported in `news_report.json`.
+- **Outputs.** `news_decisions.csv` (every decision), `news_blocked_signals.csv` (kept
+  separate from trades) and `news_report.json`: blocked signals by state and category,
+  trades allowed, PnL and drawdown around windows by category, flatten events, coverage.
+- **Paired comparison.** `--news-compare` runs without the filter, in observe and in enforce
+  on the same data and configuration, and writes `news_comparison.json`. It is in-sample
+  only.
+- **Blocked signals.** Their outcome is unknown; they are never counted as losses or wins.
+- **Reproducibility.** The news config and the exact calendar are embedded in the manifest
+  and in the validation fingerprint. Replay re-uses them, and a changed calendar is a new
+  configuration for the OOS ledger.
+
+`data/samples/SYNTHETIC_news_calendar.json` (`scripts/generate_synthetic_news_calendar.py`)
+is an invented calendar for the synthetic sample prices. It only exercises the code.
+
+**A calendar filter cannot protect against every unexpected market event.** Real-time
+protection against unscheduled news is only as good as a tested live source, and none is
+verified yet.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.
@@ -980,3 +1113,11 @@ the ledger.
     to study them.
   - The time-of-day volatility percentile needs about 34 earlier sessions before "extreme"
     can be detected at all.
+- **News filter:**
+  - No live provider has been verified from the development environment. BLS and Fed
+    feeds are disabled until you verify them. The manual calendar must be maintained by
+    hand from official schedules.
+  - Historical backtests need a point-in-time calendar. Without one, every entry is
+    blocked (fail closed). Schedule changes published after the fact cannot be
+    reconstructed unless their `known_at` was recorded.
+  - The windows are starting values. Nothing shows that the filter improves results.

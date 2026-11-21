@@ -33,8 +33,9 @@ def test_manifest_contents(full_run):
     m = json.loads((full_run / "manifest.json").read_text())
     assert m["data"]["sha256"] == file_sha256(CSV) and m["data"]["synthetic"] is True
     # Sprint 4: the regime configuration (and its artifact hashes) is part of the configuration identity.
+    # Sprint 4.1: the news filter configuration is too (here without a calendar -> every entry blocked).
     assert set(m["config_texts"]) == {"settings", "backtest", "strategy", "account_profile", "regime",
-                                      "regime_artifacts"}
+                                      "regime_artifacts", "news"}
     assert m["instrument"]["specification"]["point_value"] == 2.0 and m["instrument"]["contract"] == "MNQH25"
     ds = m["data_settings"]
     assert ds["source_timezone"] == "America/New_York" and ds["column_mapping"]["close"] == "close"

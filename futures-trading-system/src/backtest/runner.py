@@ -35,6 +35,7 @@ class StrategyRun:
     signals: pd.DataFrame | None = None
     period: Period | None = None
     regime: dict[str, Any] | None = None  # decisions, snapshots, trades, performance, dashboard, artifacts
+    news: dict[str, Any] | None = None    # news filter decisions and report
 
 
 def _frames(md: MarketData, cfg: VwapPullbackConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
@@ -71,7 +72,8 @@ def _regime_frames(md: MarketData, app: AppConfig, cfg: VwapPullbackConfig, regi
 
 
 def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,
-                 label: str = "", period: Period | None = None, regime=None, explainer=None) -> StrategyRun:
+                 label: str = "", period: Period | None = None, regime=None, explainer=None,
+                 news=None) -> StrategyRun:
     """Backtest the VWAP Trend Pullback strategy on already-built market data.
 
     With ``period`` only sessions inside it are traded (indicators were computed on the
@@ -98,7 +100,14 @@ def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPu
 
         gate = RegimeGatedStrategy(strategy, RegimeEngine(regime, md.contract.root), regime, explainer)
     engine = BacktestEngine(bt, md.contract.spec, app.session)
-    result = engine.run(gate or strategy, signal, execution, context_bars=context)
+    news_guard = news.guard(md.contract.root) if news is not None else None
+    result = engine.run(gate or strategy, signal, execution, context_bars=context, news_guard=news_guard)
+    news_out = None
+    if news_guard is not None:
+        from src.risk.news.backtest import news_report
+
+        news_out = {"decisions": news_guard.decisions_frame(), "report": news_report(news_guard, result),
+                    "calendar_sha256": news.calendar_sha256, "mode": news.cfg.mode, "enabled": news.cfg.enabled}
     regime_out = None
     if gate is not None:
         from src.ai.market_regime.performance import add_excursions, enrich_trades, regime_performance
@@ -110,7 +119,7 @@ def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPu
                       "dashboard": gate.dashboard.current, "artifacts": dict(gate.engine.artifacts),
                       "config": regime.to_dict(), "errors": gate.errors}
     return StrategyRun(label or f"r_{cfg.target.r_multiple:g}", cfg, result, strategy.diagnostics_frame(),
-                       strategy.signals_frame(), period, regime_out)
+                       strategy.signals_frame(), period, regime_out, news_out)
 
 
 def run_from_csv(csv_path: str | Path, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,
@@ -185,6 +194,14 @@ def write_outputs(run: StrategyRun, md: MarketData, app: AppConfig, bt: Backtest
                                                                    default=str), encoding="utf-8")
         (folder / "regime_dashboard.json").write_text(json.dumps(_jsonable(rg["dashboard"]), indent=2, default=str),
                                                       encoding="utf-8")
+    if run.news is not None:
+        run.news["decisions"].to_csv(folder / "news_decisions.csv", index=False)
+        nd = run.news["decisions"]
+        if len(nd):
+            nd[(nd["purpose"] == "entry_signal") & (nd["decision"] == "BLOCK")].to_csv(
+                folder / "news_blocked_signals.csv", index=False)
+        (folder / "news_report.json").write_text(json.dumps(_jsonable(run.news["report"]), indent=2, default=str),
+                                                 encoding="utf-8")
     if manifest is not None:
         period = run.period.to_dict() if run.period else {"label": "full", "kind": "full", "fold": None,
                                                            "start": None, "end": None}

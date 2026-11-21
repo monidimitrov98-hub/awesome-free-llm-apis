@@ -13,3 +13,8 @@ used to evaluate any strategy. Their only purpose is to exercise the pipeline.
   The pipeline detects this and prints a warning banner.
 
 Regenerate with `python scripts/generate_synthetic_data.py`.
+
+`SYNTHETIC_news_calendar.json` is an **invented** point-in-time economic calendar for these
+sample dates (`scripts/generate_synthetic_news_calendar.py`). Its events are not real release
+times. It exercises the news filter: a time change published in advance, a cancellation, an
+event without a confirmed time, and an FOMC decision with a press conference.

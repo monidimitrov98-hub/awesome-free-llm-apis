@@ -62,6 +62,16 @@ outside the strategy and cannot be overridden by it.
   can only be acted on after that high, i.e. intrabar at the trigger level, never at
   the bar's open (which happened before the high).
 
+News / event risk (Sprint 4.1)
+------------------------------
+An optional :class:`~src.risk.news.guard.NewsGuard` (``run(news_guard=...)``) is held by
+the engine only. Every NEW entry asks it at the signal (stage ``news``, before sizing, the
+risk manager and the AccountGuard) and again at the fill (a pending entry never fills into
+a blackout). In ``enforce`` mode a blocked entry is rejected (``news_<state>``); in
+``observe`` mode the decision is only recorded. Exits, brackets, flattening and AccountGuard
+actions never consult it. Open positions are kept unless the news config explicitly sets
+``pre_event_policy = "flatten"`` (exit reason ``news_event_flatten``).
+
 Daily loss with unrealized PnL
 ------------------------------
 With ``risk.daily_loss_basis = "realized_and_unrealized"`` the limit is evaluated on
@@ -204,14 +214,19 @@ class BacktestEngine:
         *,
         risk_manager: RiskManager | None = None,
         context_bars: Mapping[str, pd.DataFrame] | None = None,
+        news_guard: Any = None,
     ) -> BacktestResult:
         """Run the backtest. Inputs are not modified.
 
         Args:
             context_bars: Optional higher-timeframe frames (name -> bars, Sprint 1
                 format) exposed to the strategy as ``ctx.context`` (see module docs).
+            news_guard: Optional :class:`~src.risk.news.guard.NewsGuard`. Held by the engine
+                only (never passed to the strategy); asked for every NEW entry at the signal
+                and at the fill, before the risk manager and the AccountGuard. Never asked
+                for exits or protective actions.
         """
-        sim = _Simulation(self, strategy, signal_bars, execution_bars, risk_manager, context_bars)
+        sim = _Simulation(self, strategy, signal_bars, execution_bars, risk_manager, context_bars, news_guard)
         return sim.run()
 
 
@@ -226,6 +241,7 @@ class _Simulation:
         execution_bars: pd.DataFrame | None,
         risk_manager: RiskManager | None,
         context_bars: Mapping[str, pd.DataFrame] | None = None,
+        news_guard: Any = None,
     ) -> None:
         self.cfg = engine.config
         self.spec = engine.contract
@@ -279,6 +295,7 @@ class _Simulation:
         self._guard_session: pd.Timestamp | None = None
         self._last_equity = self.cfg.initial_capital
         self._now: pd.Timestamp | None = None  # time of the event being processed
+        self.news = news_guard
 
     # ------------------------------------------------------------------ helpers
     def _session_end(self, session_date: pd.Timestamp) -> pd.Timestamp:
@@ -431,6 +448,12 @@ class _Simulation:
                 return reject("invalid_order_price", f"{name} {value!r}")
         if self.guard.enabled and req.stop_loss is None:
             return reject("account_requires_stop_loss", "account protection needs a stop-loss to bound the risk")
+        if self.news is not None:  # independent news/event-risk gate (before risk manager and AccountGuard)
+            nd = self.news.check_entry(now, purpose="entry_signal", client_id=req.client_id, side=req.side.value)
+            if not nd.allowed:
+                self._reject(now, "news", f"news_{nd.status.state.value.lower()}", nd.record.get("explanation", ""),
+                             client_id=req.client_id)
+                return None
         is_buy = req.side is Side.LONG
         tick = self.spec.tick_size
         price = None
@@ -517,6 +540,14 @@ class _Simulation:
                                      "still open in a new session (missing data); closed at this bar's open")
             elif t >= self._flatten_time(session_date):
                 reason = "session_end"
+            elif self.news is not None:
+                w = self.news.flatten_window(t)  # only with an explicit pre_event_policy = "flatten"
+                if w is not None:
+                    self.news.flatten_events.append({"time": t, "window_start": w.start, "window_end": w.end,
+                                                     "events": ";".join(e.name for e in w.events),
+                                                     "enforced": self.news.cfg.enforcing})
+                    if self.news.cfg.enforcing:
+                        reason = "news_event_flatten"
             if reason:
                 self._force_exit(t, bar, complete, reason)
         for o in self._pending((OrderRole.ENTRY,)):
@@ -557,6 +588,13 @@ class _Simulation:
                     continue
                 check["quantity"] = o.quantity
                 check["actual_risk_dollars"] = self._actual_risk_dollars(o, sim.price)
+                if self.news is not None:  # re-checked at the fill: a pending entry never fills into a blackout
+                    nd = self.news.check_entry(t, purpose="entry_fill", client_id=o.client_id,
+                                               side="long" if o.is_buy else "short")
+                    if not nd.allowed:
+                        self._reject_entry(check, f"news_{nd.status.state.value.lower()}",
+                                           nd.record.get("explanation", ""), o, t)
+                        continue
                 decision = self.risk.check_entry(when=t, session_date=session_date, quantity=o.quantity)
                 if not decision.approved:
                     self._reject_entry(check, decision.reason, o.tag, o, t)
