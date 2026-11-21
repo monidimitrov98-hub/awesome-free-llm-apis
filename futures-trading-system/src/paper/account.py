@@ -78,6 +78,16 @@ class PaperAccount:
                 total += pos.unrealized_pnl(m)
         return total
 
+    def known_equity(self) -> float:
+        """Balance plus the unrealized PnL of the positions that HAVE a mark (unmarked ones excluded).
+        Used only for protective checks while full equity is unknown; never for entries or peaks."""
+        total = 0.0
+        for r, pos in self.positions.items():
+            m = self.marks.get(r)
+            if not pos.is_flat and m is not None:
+                total += pos.unrealized_pnl(m)
+        return self.initial_balance + self.net_realized + total
+
     @property
     def net_realized(self) -> float:
         return self.realized_gross - self.commissions

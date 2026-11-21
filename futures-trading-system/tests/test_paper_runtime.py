@@ -117,7 +117,7 @@ def test_account_guard_blocks_and_flattens_even_during_news_blackout(tmp_path):
                 btc=bt(account_rules=rules), news=news)
     s.run()
     t = s.account.closed_trades[0]
-    assert t["exit_role"] == "exit" and t["exit_reason"].startswith("market")
+    assert t["exit_role"] == "exit" and t["exit_reason"] == "account_protection"
     assert any(e["payload"].get("reason") == "account_protection" for e in s.journal.entries("flatten_requested"))
     assert s.decisions[-1]["reason"] in ("account_locked_after_flatten", "news_blackout_active")
     assert s.account.guard.is_locked(pd.Timestamp("2025-03-10"))

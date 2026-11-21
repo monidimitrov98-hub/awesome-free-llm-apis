@@ -148,7 +148,7 @@ def main(argv=None) -> int:
     if a.report:
         a.report.parent.mkdir(parents=True, exist_ok=True)
         a.report.write_text(json.dumps(rep, indent=2, default=str), encoding="utf-8")
-    return 0
+    return 9 if outcome == "system_error" else 0
 
 
 if __name__ == "__main__":

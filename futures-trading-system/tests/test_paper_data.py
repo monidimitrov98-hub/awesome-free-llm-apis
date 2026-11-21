@@ -33,15 +33,16 @@ def test_feed_lifecycle_and_disconnect():
 
 def test_bar_replay_is_labelled_synthetic_and_ordered():
     evs = list(bars_to_events(bars(), "MES"))
-    assert len(evs) == 12 and all(e.synthetic_from_bars and e.kind == "trade" for e in evs)
-    up = [e.last for e in evs[:4]]
-    assert up == [5000.0, 4999.0, 5001.0, 5000.5]  # up bar: open, low, high, close
-    assert [e.last for e in evs[4:8]] == [5000.0, 5001.0, 4999.0, 4999.5]  # down bar: open, high, low, close
+    assert len(evs) == 15 and all(e.synthetic_from_bars and e.kind == "trade" for e in evs)
+    up = [e.last for e in evs[:5]]
+    assert up == [5000.0, 5000.0, 4999.0, 5001.0, 5000.5]  # up bar: open, open (no volume), low, high, close
+    assert [e.last for e in evs[5:10]] == [5000.0, 5000.0, 5001.0, 4999.0, 4999.5]  # down bar
+    assert evs[1].size == 0 and all(e.bar_high == 5001.0 and e.bar_low == 4999.0 for e in evs[:5])
     assert all(a.ts < b.ts for a, b in zip(evs, evs[1:]))
     f = BarReplayFeed({"MES": bars(), "MNQ": bars()})
     f.connect()
     got = f.poll(10_000)
-    assert len(got) == 24 and all(a.ts <= b.ts for a, b in zip(got, got[1:]))
+    assert len(got) == 30 and all(a.ts <= b.ts for a, b in zip(got, got[1:]))
 
 
 def test_tick_replay_reports_bad_rows(tmp_path):

@@ -10,6 +10,9 @@ from tests.paper_helpers import APP, BT, T, quote, trade
 
 SPECS = {"MES": APP.contracts["MES"]}
 OK = lambda o, base, qty, ev: FillDecision(True)  # noqa: E731
+# Unit tests of fill mechanics stand in for the EntryAuthorizer's token (the default broker refuses
+# every entry without one -- see tests/test_paper_audit.py).
+UNIT_TOKEN = lambda o: True  # noqa: E731
 t0 = T("10:00")
 
 
@@ -42,7 +45,7 @@ def at(s):
 
 
 def test_market_fills_at_ask_bid_plus_slippage_never_on_the_decision_event():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     o = mk(b, seq=1)  # created while processing event seq 1
     ex, _ = run(b, [quote(at(0), 4999.75, 5000.0)], start_seq=1)
     assert ex == []                                   # same event: no fill
@@ -56,14 +59,14 @@ def test_market_fills_at_ask_bid_plus_slippage_never_on_the_decision_event():
 
 
 def test_market_without_quote_uses_trade_and_is_flagged():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     mk(b, buy=False)
     ex, _ = run(b, [trade(at(1), 5000.0)], pos=Pos())
     assert ex[0].reference_price == 5000.0 and not ex[0].quote_based and ex[0].reason == "market_at_trade_no_quote"
 
 
 def test_limit_touch_does_not_fill_trade_through_does():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     o = mk(b, otype="limit", limit_price=4998.0)
     ex, _ = run(b, [quote(at(1), 4999.75, 5000.0), trade(at(2), 4998.0), quote(at(3), 4997.75, 4998.0)])
     assert ex == [] and o.state is St.ACCEPTED       # touches only
@@ -72,14 +75,14 @@ def test_limit_touch_does_not_fill_trade_through_does():
 
 
 def test_marketable_limit_takes_the_ask():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     mk(b, otype="limit", limit_price=5001.0)
     ex, _ = run(b, [quote(at(1), 4999.75, 5000.0)])
     assert ex[0].fill_price == 5000.0 and ex[0].reason == "limit_marketable_at_quote"
 
 
 def test_partial_fills_limited_by_trade_size_and_participation():
-    b = PaperBroker(BT, SPECS, participation=0.5)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN, participation=0.5)
     o = mk(b, otype="limit", qty=5, limit_price=4998.0)
     ex, _ = run(b, [quote(at(1), 4999.75, 5000.0), trade(at(2), 4997.75, size=4), trade(at(3), 4997.75, size=1)])
     assert [e.quantity for e in ex] == [2] and o.state is St.PARTIALLY_FILLED and o.filled_qty == 2
@@ -89,7 +92,7 @@ def test_partial_fills_limited_by_trade_size_and_participation():
 
 
 def test_stop_triggers_and_gaps_fill_worse():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     o = mk(b, otype="stop", limit_price=None, stop_price=5002.0)
     ex, _ = run(b, [trade(at(1), 5001.75)])
     assert ex == [] and o.state is St.ACCEPTED
@@ -97,14 +100,14 @@ def test_stop_triggers_and_gaps_fill_worse():
     tick = SPECS["MES"].tick_size
     assert ex[0].reference_price == 5004.0 and ex[0].fill_price == 5004.0 + BT.slippage.stop_ticks * tick
     assert ex[0].reason == "stop_gap_through"
-    b2 = PaperBroker(BT, SPECS)
+    b2 = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     mk(b2, otype="stop", buy=False, stop_price=4995.0)
     ex, _ = run(b2, [quote(at(1), 4995.0, 4995.25)])         # bid reaches the sell stop
     assert ex[0].reference_price == 4995.0 and ex[0].fill_price == 4995.0 - BT.slippage.stop_ticks * tick
 
 
 def test_bracket_oco_and_partial_exit_resizing():
-    b = PaperBroker(BT, SPECS, participation=1.0)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN, participation=1.0)
     entry = mk(b, qty=2, stop_loss=4990.0, take_profit=5010.0)
     ex, pos = run(b, [quote(at(1), 4999.75, 5000.0)])
     kids = {k.role: k for k in b.working("MES")}
@@ -119,7 +122,7 @@ def test_bracket_oco_and_partial_exit_resizing():
 
 
 def test_entry_partial_fill_extends_protection():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     mk(b, otype="limit", qty=3, limit_price=4998.0, stop_loss=4990.0)
     ex, pos = run(b, [quote(at(1), 4999.75, 5000.0), trade(at(2), 4997.75, size=1)])
     sl = b.working("MES", ("stop_loss",))[0]
@@ -129,7 +132,7 @@ def test_entry_partial_fill_extends_protection():
 
 
 def test_rejected_entry_is_never_filled():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     o = mk(b)
     ex, pos = run(b, [quote(at(1), 4999.75, 5000.0)], auth=lambda *a: FillDecision(False, "news_blackout_active"))
     assert ex == [] and o.state is St.REJECTED and o.reason == "news_blackout_active" and pos.q == 0
@@ -138,14 +141,14 @@ def test_rejected_entry_is_never_filled():
 
 
 def test_fill_authorizer_can_reduce_quantity():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     o = mk(b, qty=4)
     ex, _ = run(b, [quote(at(1), 4999.75, 5000.0)], auth=lambda *a: FillDecision(True, "", 2))
     assert ex[0].quantity == 2 and o.quantity == 2 and o.state is St.FILLED
 
 
 def test_cancel_expire_and_lifecycle_rules():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     o = mk(b, otype="limit", limit_price=4990.0, expire_at=at(5))
     run(b, [trade(at(6), 5000.0)])
     assert o.state is St.EXPIRED and not b.cancel(o.order_id, at(7), "late")
@@ -160,7 +163,7 @@ def test_cancel_expire_and_lifecycle_rules():
 
 
 def test_exit_never_over_closes():
-    b = PaperBroker(BT, SPECS)
+    b = PaperBroker(BT, SPECS, entry_token_check=UNIT_TOKEN)
     mk(b, role="exit", qty=5, buy=False)
     pos = Pos()
     pos.q = 2

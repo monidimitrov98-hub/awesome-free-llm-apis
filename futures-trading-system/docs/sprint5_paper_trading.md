@@ -94,7 +94,8 @@ order has a unique id and a timestamped history.
 - **No same-event fills.** An order fills only on an event with a higher sequence number than
   the one it was created on.
 - **Market.** At the ask (buy) or bid (sell), or at the trade price when no quote is known
-  (flagged `quote_based = False`), plus `slippage.market_ticks`.
+  (flagged `quote_based = False`), plus `slippage.market_ticks`. A quote older than
+  `quote_max_age_seconds` is never used to price any fill; the event's trade price is used instead.
 - **Stop / stop-loss.** Triggered by a trade at or through the stop, or by the quote reaching
   it. Fills at the worse of the stop and the market (gaps fill at the market), plus
   `slippage.stop_ticks`.
@@ -102,10 +103,16 @@ order has a unique id and a timestamped history.
   the market trades or quotes *through* it; a touch is not enough. It fills at the limit, for
   at most `limit_participation` × the trade (or quote) size, so partial fills happen.
 - **Brackets (OCO).** An entry fill creates or extends a stop-loss and take-profit. A partial
-  exit shrinks the sibling; a complete exit cancels it. Exits never over-close.
+  exit shrinks the sibling; a complete exit cancels it. Exits never over-close: the broker
+  tracks the position across all fills of one event.
+- **Entries need an authorization token.** The broker accepts an entry order only if the
+  EntryAuthorizer issued it, with unchanged terms, once. A direct `broker.submit` of an entry is
+  refused. Fill-time authorization also re-checks the run mode and the session-end cutoff.
+- **Synthetic bar paths.** When a stop and a target both lie inside one synthetic bar, the stop
+  is assumed to fill first (worst case).
 
 **Expiry:** market entries expire after `execution.max_fill_delay`; limit and stop entries
-expire at the session-end cutoff.
+expire at the session-end cutoff (an order is expired at, not after, its expiry time).
 
 Every execution records the requested price, reference (pre-slippage) price, fill price,
 quantity, timestamp, slippage ticks and cost, commission, order type, reason and source event.
@@ -113,7 +120,9 @@ quantity, timestamp, slippage ticks and cost, commission, order type, reason and
 ## Protections
 
 - **AccountGuard** (existing class) is evaluated on every event. Flatten or breach triggers
-  market exits and locks entries; flattening is never blocked by NewsGuard.
+  market exits and locks entries; flattening is never blocked by NewsGuard. While an open
+  position has no mark (full equity unknown), the known losses alone still trigger the flatten
+  (`account_protection_partial_equity`); no peak and no breach are recorded from partial data.
 - **RiskManager** (existing class) enforces daily limits, size, trading windows, unrealized
   daily loss and the emergency stop.
 - **Session end.** Pending entries are cancelled and positions closed at `flatten_before_session_end`.
@@ -125,7 +134,8 @@ quantity, timestamp, slippage ticks and cost, commission, order type, reason and
 **Storage** is `paper_state.db` (SQLite, WAL, `synchronous=FULL`, owner-only permissions):
 - an append-only journal with `hash = H(prev, seq, ts, kind, payload)`. H is HMAC-SHA256 with
   `FTS_JOURNAL_KEY`, otherwise SHA-256 (which detects accidents, not a determined editor);
-- snapshots with their own hash;
+- snapshots whose hash binds them to the journal hash at the snapshot point (HMAC when keyed).
+  With `FTS_JOURNAL_KEY` set, an unkeyed journal is refused, which blocks a downgrade;
 - completed bars.
 
 **A failed commit** keeps the pending batch for retry (nothing is lost) and blocks new entries
@@ -138,8 +148,10 @@ until a later commit succeeds.
    orders and positions.
 4. Reconcile positions, realized PnL, commissions and order fills against the journal's
    executions. Also check that every position has a working stop and that the AccountGuard peak
-   is not below the initial balance. Any mismatch blocks new entries.
-5. Cancel working entry orders. Protective orders stay working.
+   is not below the initial balance. Also check that no drawdown breach, permanent lock or
+   high-water mark recorded in the journal was lost. Any mismatch blocks new entries.
+5. Cancel working entry orders. Protective orders stay working. A position without a working
+   stop gets its stop-loss re-created from the trade record, or is flattened if no stop is known.
 6. Block new entries for the rest of the session in which the restart happened, because the
    strategy's in-memory state cannot be verified.
 7. Never restore a price as live.
@@ -155,7 +167,9 @@ until a later commit succeeds.
 | --- | --- |
 | Disconnect | Journaled. Reconnect with back-off; after the attempts run out, safe shutdown. After reconnect, entries resume only after `resume_after_events` fresh events |
 | Stale data / data gap | Entries blocked (`market_data_stale`, `data_recovery_pending:*`) |
-| Invalid, duplicate or out-of-order events | Rejected and journaled, never used |
+| Invalid, duplicate or out-of-order events | Rejected and journaled, never used. Duplicates of the last timestamp stay duplicates after a restart |
+| Price jump beyond `max_price_jump_ticks` | Rejected; three consecutive consistent events confirm a new level (journaled `price_level_reset`), after which entries wait for fresh data |
+| Internal error | Journaled `system_error`; entries stop; safe shutdown; CLI exit code 9 |
 | Unknown marks | Equity unknown: entries blocked (`account_equity_unknown`) |
 | NewsGuard not ready | Entries blocked with `news_<state>` |
 | Persistence failure | Entries blocked until a commit succeeds |
@@ -190,12 +204,14 @@ and signals are still processed and recorded.
 
 - **No live provider.** There is no live market-data provider (interface only). Paper mode can
   only run on the simulated real-time replay.
-- **Bar replay is approximate.** It turns bars into an approximate 4-trade path per minute
-  (open, adverse extreme, other extreme, close) without quotes. Fills are therefore
-  trade-based and flagged.
-- **Fills differ from the backtest.** Paper fills on the next event after a decision, not the
-  next bar open. Outcomes can differ: the sample's only signal is authorized but then rejected
-  at the actual fill by the strategy's minimum reward/risk.
+- **Bar replay is approximate.** It turns bars into an approximate 5-trade path per minute
+  (open, open again one second later with no volume, one extreme, the other, close) without
+  quotes. Fills are therefore trade-based and flagged as synthetic, and the report counts them.
+- **Fills and the backtest.** A decision on a bar's open print fills on the repeated open, which
+  is the backtest's next-bar-open assumption. The sample's MNQ 2025-03-17 trade now matches the
+  backtest's entry, exit and net PnL. The earlier difference came from the synthetic path, not
+  from the market. Paper "gross" PnL is after slippage, while the backtest's is before it; net
+  PnL is comparable.
 - **No depth model.** Market and stop orders fill the full micro quantity; there is no queue
   position model for limits beyond the trade-through and participation rules.
 - **Restart cost.** The strategy's in-memory state is not persisted, hence the restart-session

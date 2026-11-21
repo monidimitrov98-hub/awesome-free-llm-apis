@@ -57,7 +57,10 @@ def _on_grid(price: float, tick: float) -> bool:
 
 class EventValidator:
     def __init__(self, specs: dict[str, ContractSpec], session: SessionConfig, *, dedupe_window: int = 200_000,
-                 max_jump_ticks: int = 400) -> None:
+                 max_jump_ticks: int = 400, level_confirm_events: int = 3) -> None:
+        self.level_confirm_events = level_confirm_events
+        self._candidate: dict[str, tuple[float, int]] = {}
+        self._ids_at_last: dict[str, set[str]] = {}
         self.specs = specs
         self.session = session
         self.dedupe_window = dedupe_window
@@ -79,7 +82,7 @@ class EventValidator:
         if ev.ts is None or pd.isna(ev.ts) or ev.ts.tzinfo is None:
             return self._reject("missing_timestamp")
         key = f"{ev.root}:{ev.event_id}"
-        if key in self._seen:
+        if key in self._seen or ev.event_id in self._ids_at_last.get(ev.root, set()):
             return self._reject("duplicate_event")
         last = self._last_ts.get(ev.root)
         if last is not None and ev.ts < last:
@@ -99,27 +102,45 @@ class EventValidator:
             return self._reject("negative_size")
         ref = self._last_price.get(ev.root)
         px = ev.last if ev.last is not None else (ev.bid + ev.ask) / 2
+        level_reset = False
         if ref is not None and abs(px - ref) > self.max_jump_ticks * spec.tick_size:
-            return self._reject("implausible_price_jump")
+            # A single outlier is rejected. A genuine move to a new level is accepted once
+            # ``level_confirm_events`` consecutive events agree on it -- otherwise one real gap would
+            # blind the system forever (no marks, protective stops never triggered).
+            cand = self._candidate.get(ev.root)
+            n = cand[1] + 1 if cand and abs(px - cand[0]) <= self.max_jump_ticks * spec.tick_size else 1
+            self._candidate[ev.root] = (px, n)
+            if n < self.level_confirm_events:
+                return self._reject("implausible_price_jump")
+            level_reset = True
+        self._candidate.pop(ev.root, None)
         # accepted
         self._seen[key] = None
         if len(self._seen) > self.dedupe_window:
             self._seen.popitem(last=False)
+        if last is None or ev.ts > last:
+            self._ids_at_last[ev.root] = set()
+        self._ids_at_last.setdefault(ev.root, set()).add(ev.event_id)
         self._last_ts[ev.root] = ev.ts
         self._last_price[ev.root] = px
         res = ValidationResult(True, session_date=self.calendar(ev.ts))
+        if level_reset:
+            res.warnings.append("price_level_reset")
         if res.session_date is None:
             res.warnings.append("outside_session")
         return res
 
     def state(self) -> dict[str, Any]:
         return {"last_ts": {k: v.isoformat() for k, v in self._last_ts.items()},
-                "last_price": dict(self._last_price), "rejected": dict(self.rejected)}
+                "last_price": dict(self._last_price), "rejected": dict(self.rejected),
+                "ids_at_last_ts": {k: sorted(v) for k, v in self._ids_at_last.items()}}
 
     def restore(self, st: dict[str, Any]) -> None:
         self._last_ts = {k: pd.Timestamp(v) for k, v in st.get("last_ts", {}).items()}
         self._last_price = {k: float(v) for k, v in st.get("last_price", {}).items()}
         self.rejected = dict(st.get("rejected", {}))
+        # duplicates of the last processed timestamp must stay duplicates after a restart
+        self._ids_at_last = {k: set(v) for k, v in st.get("ids_at_last_ts", {}).items()}
 
 
 class DataHealth:
@@ -171,6 +192,11 @@ class DataHealth:
             if last is not None and now - last > self.stale_after and not self.problem.get(r):
                 self.fresh_since_problem[r] = 0
                 self._set(r, "stale", now)
+
+    def flag(self, root: str, problem: str, now: pd.Timestamp) -> None:
+        """An external data problem (e.g. a price level reset): recovery pending again."""
+        self.fresh_since_problem[root] = 0
+        self._set(root, problem, now)
 
     def healthy(self, root: str, now: pd.Timestamp) -> tuple[bool, str]:
         if not self.connected:

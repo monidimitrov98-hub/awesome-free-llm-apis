@@ -1229,6 +1229,8 @@ python run_paper.py --verify
 - **Reports.** They are separated by run kind and never mix rejected opportunities or
   infrastructure runs into trading statistics.
 - **Results.** Nothing here is evidence of profitability or readiness for funded trading.
+- **Audit.** `docs/paper_audit_2026-11-21.md` lists the adversarial-audit findings, their fixes
+  and their regression tests (`tests/test_paper_audit.py`).
 
 ## Known limitations
 

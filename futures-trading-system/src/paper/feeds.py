@@ -53,15 +53,21 @@ class MarketDataFeed(ABC):
 
 
 def bars_to_events(bars: pd.DataFrame, root: str, source: str = "bar_replay") -> Iterator[MarketEvent]:
-    """Synthetic trade path for each 1-minute bar (times within the minute)."""
-    offsets = (pd.Timedelta(seconds=0), pd.Timedelta(seconds=20), pd.Timedelta(seconds=40), pd.Timedelta(seconds=59))
+    """Synthetic trade path for each 1-minute bar: open, open again one second later (so an order
+    decided on the open print fills at the open -- the backtest's next-bar-open assumption -- and not at
+    a bar extreme), then the extremes, then the close. Every event carries the bar's high/low so the
+    broker can apply worst-case rules when a stop and a target both lie inside one bar (the real
+    intrabar order is unknown)."""
+    offsets = (pd.Timedelta(seconds=0), pd.Timedelta(seconds=1), pd.Timedelta(seconds=20), pd.Timedelta(seconds=40),
+               pd.Timedelta(seconds=59))
     for t, row in bars.iterrows():
         o, h, low, c, v = (float(row[k]) for k in ("open", "high", "low", "close", "volume"))
-        path = (o, low, h, c) if c >= o else (o, h, low, c)
+        path = (o, o, low, h, c) if c >= o else (o, o, h, low, c)
         size = max(v / 4.0, 0.0)
-        for i, (px, off) in enumerate(zip(path, offsets)):
-            yield MarketEvent(f"{root}-{t.strftime('%Y%m%dT%H%M')}-{i}", root, "trade", t + off, px, size,
-                              source=source, synthetic_from_bars=True)
+        sizes = (size, 0.0, size, size, size)  # the repeated open carries no volume (no extra limit liquidity)
+        for i, (px, off, sz) in enumerate(zip(path, offsets, sizes)):
+            yield MarketEvent(f"{root}-{t.strftime('%Y%m%dT%H%M')}-{i}", root, "trade", t + off, px, sz,
+                              source=source, synthetic_from_bars=True, bar_high=h, bar_low=low)
 
 
 class _ListFeed(MarketDataFeed):

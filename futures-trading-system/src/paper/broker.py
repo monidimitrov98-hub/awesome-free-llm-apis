@@ -63,9 +63,14 @@ class PaperBroker:
 
     TRANSMITS_REAL_ORDERS = False
 
-    def __init__(self, bt: BacktestConfig, specs: dict[str, ContractSpec], *, participation: float = 1.0) -> None:
+    def __init__(self, bt: BacktestConfig, specs: dict[str, ContractSpec], *, participation: float = 1.0,
+                 quote_max_age: pd.Timedelta = pd.Timedelta(seconds=5),
+                 entry_token_check: Callable[[PaperOrder], bool] | None = None) -> None:
         if not 0 < participation <= 1:
             raise ValueError("participation must be in (0, 1]")
+        self.quote_max_age = quote_max_age
+        # entries are accepted ONLY with an authorization token issued by the EntryAuthorizer
+        self.entry_token_check = entry_token_check or (lambda o: False)
         self.bt = bt
         self.specs = specs
         self.participation = participation
@@ -92,6 +97,8 @@ class PaperBroker:
             raise LifecycleError(f"duplicate order id {order.order_id}")
         if order.quantity < 1:
             raise ValueError("order quantity must be >= 1")
+        if order.role == "entry" and not self.entry_token_check(order):
+            raise LifecycleError(f"entry {order.order_id} was not issued by the EntryAuthorizer; refused")
         spec = self.specs[order.root]
         tick = spec.tick_size
         for name in ("limit_price", "stop_price"):
@@ -120,7 +127,7 @@ class PaperBroker:
 
     def expire(self, now: pd.Timestamp) -> None:
         for o in self.working():
-            if o.expire_at is not None and now > o.expire_at:
+            if o.expire_at is not None and now >= o.expire_at:
                 o.transition(St.EXPIRED, now, "expired")
                 self._log("expired", o, now)
 
@@ -131,18 +138,21 @@ class PaperBroker:
         b = self.books[ev.root]
         if ev.kind == "quote":
             b.bid, b.ask, b.bid_size, b.ask_size = ev.bid, ev.ask, ev.bid_size, ev.ask_size
-        else:
+            b.ts = ev.ts  # quote time: a quote older than quote_max_age is never used for a fill
+        elif ev.kind == "trade":
             b.last = ev.last
-        b.ts = ev.ts
         self.expire(ev.ts)
         execs: list[Execution] = []
         # protective / exit orders first, then entries
         order = {"stop_loss": 0, "exit": 0, "take_profit": 1, "entry": 2}
+        pos = position_qty(ev.root)  # tracked locally: fills inside this event change it immediately
         for o in sorted(self.working(ev.root), key=lambda o: (order.get(o.role, 3), o.created_at, o.order_id)):
             if not o.is_working or seq <= o.active_after_seq:
                 continue
-            if o.role == "entry" and position_qty(o.root) != 0 and o.filled_qty == 0:
+            if o.role == "entry" and pos != 0 and o.filled_qty == 0:
                 continue  # an entry only fills from flat (reversals exit first)
+            if o.role == "take_profit" and self._bar_ambiguous(o, ev):
+                continue  # stop and target both inside this synthetic bar: worst case, the stop first
             res = self._match(o, ev, b)
             if res is None:
                 continue
@@ -159,17 +169,35 @@ class PaperBroker:
                     o.quantity = o.filled_qty + dec.quantity
                     qty = dec.quantity
             if o.role in ("stop_loss", "take_profit", "exit"):
-                qty = min(qty, abs(position_qty(o.root)))  # never over-close (no accidental reversal)
-                if qty <= 0:
+                closing_buy = pos < 0
+                if pos == 0 or o.is_buy != closing_buy:
                     self.cancel(o.order_id, ev.ts, "position_already_flat")
                     continue
-            execs.append(self._fill(o, qty, ref, base, reason, quote_based, ev))
+                qty = min(qty, abs(pos))  # never over-close (no accidental reversal)
+            ex = self._fill(o, qty, ref, base, reason, quote_based, ev)
+            pos += ex.quantity if ex.is_buy else -ex.quantity
+            execs.append(ex)
         return execs
+
+    def _bar_ambiguous(self, tp: PaperOrder, ev: MarketEvent) -> bool:
+        if not ev.synthetic_from_bars or ev.bar_low is None or ev.bar_high is None:
+            return False
+        for s in self.working(tp.root, ("stop_loss",)):
+            if s.oco_group == tp.oco_group and s.stop_price is not None:
+                if (not s.is_buy and ev.bar_low <= s.stop_price) or (s.is_buy and ev.bar_high >= s.stop_price):
+                    return True
+        return False
+
+    def _fresh_quote(self, b: Book, ev: MarketEvent, buy: bool) -> float | None:
+        px = b.ask if buy else b.bid
+        if px is None or b.ts is None or ev.ts - b.ts > self.quote_max_age:
+            return None
+        return px
 
     def _match(self, o: PaperOrder, ev: MarketEvent, b: Book):
         """(qty, requested_price, base_fill_price, reason, quote_based) or None."""
         buy = o.is_buy
-        mkt = (b.ask if buy else b.bid) if (b.ask if buy else b.bid) is not None else None
+        mkt = self._fresh_quote(b, ev, buy)  # None when no quote or the quote is stale
         trade = ev.last if ev.kind == "trade" else None
         if o.order_type == "market":
             if mkt is not None and ev.kind == "quote":

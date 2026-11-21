@@ -85,12 +85,16 @@ def test_real_strategy_signal_is_authorized_then_rechecked_at_the_actual_fill(tm
     assert o.stop_loss == bt_trade.stop_loss and o.take_profit == bt_trade.take_profit
     fa = [e["payload"] for e in s.journal.entries("fill_authorization")][0]
     assert fa["event_id"].endswith("-1")                             # the event AFTER the decision event (-0)
-    # The backtest fills at the next bar open; paper fills on the next market event, here the bar's
-    # adverse extreme. At that ACTUAL price the strategy's minimum reward/risk is not met, so the entry
-    # is rejected -- never converted into a fill.
-    assert not fa["allowed"] and fa["reason"] == "reward_risk_below_min_at_fill"
-    assert o.state.value == "rejected" and not list(s.journal.entries("execution"))
-    assert not s.account.closed_trades
+    # The backtest fills at the next bar open. The synthetic bar path repeats the open one second
+    # later (audit fix: previously the next event was the bar's adverse extreme, which rejected this
+    # entry for reward/risk and made paper differ from the backtest by construction). The fill is
+    # re-authorized at that actual price and now reproduces the backtest trade exactly.
+    assert fa["allowed"]
+    ex = [e["payload"] for e in s.journal.entries("execution")]
+    assert ex[0]["fill_price"] == bt_trade.entry_price and ex[0]["synthetic_data"]
+    (t,) = s.account.closed_trades
+    assert t["exit_price"] == bt_trade.exit_price and t["net_pnl"] == pytest.approx(bt_trade.net_pnl)
+    assert t["exit_reason"] == bt_trade.exit_reason == "session_end"
 
 
 def test_no_look_ahead_in_contexts(tmp_path):

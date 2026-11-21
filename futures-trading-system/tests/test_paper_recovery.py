@@ -88,11 +88,13 @@ def test_tampered_snapshot_is_refused(tmp_path):
 def test_consistent_looking_but_wrong_snapshot_fails_reconciliation(tmp_path):
     first_part(tmp_path, T("10:12"))
     db = sqlite3.connect(tmp_path / "state.db")
-    sid, body = db.execute("SELECT id, state FROM snapshot ORDER BY id DESC LIMIT 1").fetchone()
+    sid, jseq, body = db.execute("SELECT id, journal_seq, state FROM snapshot ORDER BY id DESC LIMIT 1").fetchone()
+    jhash = db.execute("SELECT hash FROM journal WHERE seq=?", (jseq,)).fetchone()[0]
     st = json.loads(body)
-    st["account"]["positions"]["MES"]["quantity"] = 3  # bug or tampering with a recomputed hash
+    st["account"]["positions"]["MES"]["quantity"] = 3  # bug or tampering with a recomputed (unkeyed) hash
     body2 = json.dumps(st, sort_keys=True, separators=(",", ":"), default=str)
-    db.execute("UPDATE snapshot SET state=?, hash=? WHERE id=?", (body2, hashlib.sha256(body2.encode()).hexdigest(), sid))
+    h2 = hashlib.sha256(f"SNAPSHOT|{jhash}|{jseq}|{body2}".encode()).hexdigest()
+    db.execute("UPDATE snapshot SET state=?, hash=? WHERE id=?", (body2, h2, sid))
     db.commit()
     db.close()
     s2 = resume(tmp_path, {T("10:25"): [long()]}, start=T("10:20"))

@@ -64,6 +64,16 @@ def paper_report(session) -> dict[str, Any]:
                    "by_state": dict(Counter(o.state.value for o in session.broker.orders.values()))},
         "account": {k: v for k, v in session.account.summary().items()},
     }
+    execs = [e["payload"] for e in session.journal.entries("execution")]
+    synth = sum(1 for e in execs if e.get("synthetic_data"))
+    report["execution_basis"] = {
+        "executions": len(execs), "from_synthetic_bar_paths": synth,
+        "quote_based": sum(1 for e in execs if e.get("quote_based")),
+        "note": ("fills on synthetic paths built from 1-minute bars: the intrabar order is assumed; a stop and a "
+                 "target inside one bar are resolved stop-first (worst case)") if synth else "",
+    }
+    open_pos = {r: q for r, q in report["account"]["positions"].items() if q}
+    report["open_positions_excluded_from_trade_stats"] = open_pos
     if kind == "infrastructure_validation":
         report["trading"] = None
         return report

@@ -65,6 +65,22 @@ class EntryAuthorizer:
         self.system_state = system_state
         self.flatten_time = flatten_time
         self.allow_reversal = allow_reversal
+        self._issued: dict[str, tuple] = {}
+
+    # ------------------------------------------------------------------ authorization tokens
+    @staticmethod
+    def _fingerprint(o: PaperOrder) -> tuple:
+        return (o.root, o.role, o.order_type, o.is_buy, o.quantity, o.limit_price, o.stop_price, o.stop_loss,
+                o.take_profit, o.risk_budget, o.session_date)
+
+    def issue(self, o: PaperOrder) -> None:
+        """Record that THIS entry order (with exactly these terms) passed authorize_signal."""
+        self._issued[o.order_id] = self._fingerprint(o)
+
+    def check_token(self, o: PaperOrder) -> bool:
+        """Broker hook: an entry is accepted only once, only if issued here, only with unchanged terms."""
+        fp = self._issued.pop(o.order_id, None)
+        return fp is not None and fp == self._fingerprint(o)
 
     # ------------------------------------------------------------------ signal time
     def authorize_signal(self, req: OrderRequest, root: str, now: pd.Timestamp, session_date: pd.Timestamp | None,
@@ -147,8 +163,13 @@ class EntryAuthorizer:
     # ------------------------------------------------------------------ fill time
     def authorize_fill(self, o: PaperOrder, base_price: float, qty: int, ev) -> tuple[Decision, int | None]:
         d = Decision(True)
+        if not d.add("mode", self.mode != "infrastructure_validation", "infrastructure_validation_mode"):
+            return d, None
         ok, why = self.system_state(o.root, ev.ts)
         if not d.add("system", ok, why):
+            return d, None
+        if o.session_date is None or ev.ts >= self.flatten_time(o.session_date):
+            d.add("session", False, "entry_cutoff_reached_at_fill")
             return d, None
         nd = self.news[o.root].check_entry(ev.ts, purpose="entry_fill", client_id=o.client_id,
                                            side="long" if o.is_buy else "short")

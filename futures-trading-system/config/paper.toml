@@ -18,6 +18,7 @@ warmup_sessions = 25                  # completed sessions of history used for i
 
 [execution]
 limit_participation = 1.0             # share of trade-through volume a resting limit may take (0..1]
+quote_max_age_seconds = 5             # an older bid/ask is never used to price a fill (trade price instead)
 
 [persistence]
 snapshot_every_events = 2000          # plus after every execution and at every safe shutdown

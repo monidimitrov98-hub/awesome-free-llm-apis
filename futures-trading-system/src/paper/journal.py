@@ -7,6 +7,16 @@
   variable ``FTS_JOURNAL_KEY`` set, H is HMAC-SHA256 (tampering without the key is detectable);
   otherwise SHA-256 (detects accidental corruption and naive edits, not a determined attacker
   who recomputes the chain).
+* Snapshots are bound to the journal: their hash covers the journal hash at the snapshot point
+  (HMAC when keyed), so a snapshot cannot be edited, or moved onto another journal, without the
+  key -- and without the key (unkeyed mode) recovery's reconciliation against the executions is the
+  only defence for a recomputed snapshot.
+* Downgrade protection: with ``FTS_JOURNAL_KEY`` set, an UNKEYED journal is refused (an attacker
+  could otherwise strip the HMAC by rewriting the chain as plain SHA-256 and the ``keyed`` flag).
+* What the UNKEYED chain can and cannot detect: it detects accidental corruption, truncated or
+  reordered rows and edits that do not recompute the chain; it CANNOT detect a deliberate rewrite
+  that recomputes every hash (anyone with write access can do that). The ``bars`` table is not
+  chained (bars only seed indicators; they never touch balances or positions).
 * :meth:`verify` re-checks the whole chain; recovery refuses a broken chain.
 * Files are created with owner-only permissions. Payloads are JSON only (no pickle).
 """
@@ -71,6 +81,9 @@ class Journal:
         self.keyed = keyed[0] == "1"
         if self.keyed and not os.environ.get(KEY_ENV):
             raise JournalError(f"this journal is HMAC-protected: set {KEY_ENV} to open it")
+        if not self.keyed and os.environ.get(KEY_ENV):
+            raise JournalError(f"{KEY_ENV} is set but this journal is NOT HMAC-protected: refusing it (an unkeyed "
+                               "journal cannot prove it was not rewritten)")
         self._key = os.environ.get(KEY_ENV, "").encode() if self.keyed else b""
         row = self.db.execute("SELECT seq, hash FROM journal ORDER BY seq DESC LIMIT 1").fetchone()
         self.seq, self.last_hash = (row[0], row[1]) if row else (0, "GENESIS")
@@ -98,9 +111,15 @@ class Journal:
     def add_bar(self, root: str, ts: pd.Timestamp, row: tuple) -> None:
         self._pending_bars.append((root, ts.isoformat(), *row))
 
+    def _snapshot_hash(self, journal_hash: str, seq: int, body: str) -> str:
+        msg = f"SNAPSHOT|{journal_hash}|{seq}|{body}".encode()
+        if self._key:
+            return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+        return hashlib.sha256(msg).hexdigest()
+
     def set_snapshot(self, ts: pd.Timestamp, state: dict[str, Any]) -> None:
         body = _canon(state)
-        self._pending_snapshot = (self.seq, ts.isoformat(), body, hashlib.sha256(body.encode()).hexdigest())
+        self._pending_snapshot = (self.seq, ts.isoformat(), body, self._snapshot_hash(self.last_hash, self.seq, body))
 
     def commit(self) -> None:
         if not (self._pending or self._pending_bars or self._pending_snapshot):
@@ -152,8 +171,12 @@ class Journal:
         if row is None:
             return None
         seq, body, h = row
-        if hashlib.sha256(body.encode()).hexdigest() != h:
-            raise JournalError("latest snapshot is corrupted (hash mismatch)")
+        jrow = self.db.execute("SELECT hash FROM journal WHERE seq=?", (seq,)).fetchone() if seq else None
+        jhash = jrow[0] if jrow else "GENESIS"
+        if seq and jrow is None:
+            raise JournalError(f"latest snapshot refers to journal seq {seq}, which does not exist")
+        if not hmac.compare_digest(self._snapshot_hash(jhash, seq, body), h):
+            raise JournalError("latest snapshot is corrupted or not bound to this journal (hash mismatch)")
         try:
             return seq, json.loads(body)
         except ValueError as exc:

@@ -31,6 +31,8 @@ class MarketEvent:
     ask_size: float | None = None
     source: str = ""
     synthetic_from_bars: bool = False
+    bar_high: float | None = None   # synthetic events only: the source bar's range (for worst-case rules)
+    bar_low: float | None = None
     received_at: pd.Timestamp | None = field(default=None, compare=False)
 
     @property
