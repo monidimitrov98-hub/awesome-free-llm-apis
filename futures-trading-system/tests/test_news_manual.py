@@ -43,6 +43,14 @@ def complete():
                      {"name": "TEST Fed Chair testimony", "category": "fed_chair_speech", "date": "2026-12-02",
                       "timezone": "America/New_York", "source": "https://www.federalreserve.gov/newsevents/calendar.htm",
                       "provenance": "manual", "verification_status": "date_only", "last_verified": VERIFIED_AT}]
+    dol = "https://oui.doleta.gov/unemploy/claims_arch.asp"
+    ism = "https://www.ismworld.org/supply-management-news-and-reports/reports/rob-report-calendar/"
+    doc["events"] += [ev(f"TEST Jobless claims {d}", "jobless_claims", f"{d}T08:30:00", dol)
+                      for d in ("2026-11-25", "2026-12-03", "2026-12-10", "2026-12-17", "2026-12-23", "2026-12-31")]
+    doc["events"] += [ev("TEST Producer Price Index", "ppi", "2026-12-11T08:30:00", BLS + "ppi.htm"),
+                      ev("TEST JOLTS", "jolts", "2026-12-08T10:00:00", BLS + "jolts.htm"),
+                      ev("TEST ISM Manufacturing PMI", "ism_manufacturing", "2026-12-01T10:00:00", ism),
+                      ev("TEST ISM Services PMI", "ism_services", "2026-12-03T10:00:00", ism)]
     return doc
 
 

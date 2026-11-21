@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,29 @@ from src.config import PROJECT_ROOT, ConfigError
 from src.risk.news.event import EventDataError, Impact, Reliability, check_timezone, parse_time
 
 DEFAULT_NEWS_CONFIG_PATH = PROJECT_ROOT / "config" / "risk" / "news_filter.toml"
+PROVIDER_EVIDENCE_PATH = PROJECT_ROOT / "config" / "risk" / "provider_verification.json"
+
+# ---------------------------------------------------------------- non-negotiable safety floors
+# (audit 2026-11-21) The configuration may TIGHTEN the filter but can never remove a critical
+# US release, downgrade it below its minimum impact, shrink its window to nothing, drop the US
+# region, accept unofficial sources or relax freshness beyond these bounds.
+MANDATORY_CATEGORIES = {
+    "cpi": Impact.HIGH, "core_cpi": Impact.HIGH, "nfp": Impact.HIGH, "unemployment_rate": Impact.HIGH,
+    "pce": Impact.HIGH, "fomc_decision": Impact.HIGH, "fomc_statement": Impact.HIGH,
+    "fed_press_conference": Impact.HIGH, "fed_chair_speech": Impact.HIGH,
+    "ppi": Impact.MEDIUM, "jobless_claims": Impact.MEDIUM, "ism_manufacturing": Impact.MEDIUM,
+    "ism_services": Impact.MEDIUM, "treasury": Impact.MEDIUM, "gdp": Impact.MEDIUM, "retail_sales": Impact.MEDIUM,
+}
+MIN_WINDOW = pd.Timedelta(minutes=5)          # each side, mandatory categories (overrides included)
+MIN_UNKNOWN_WINDOW = pd.Timedelta(minutes=15)  # each side, unclassified relevant events
+MAX_CALENDAR_AGE = pd.Timedelta(days=3)
+MIN_LOOKAHEAD = pd.Timedelta(minutes=60)
+MAX_MANUAL_AGE = pd.Timedelta(days=14)
+MIN_MANUAL_HORIZON = pd.Timedelta(days=7)
+PROVIDER_REVERIFY = pd.Timedelta(days=90)
+OFFICIAL_DOMAINS = ("bls.gov", "dol.gov", "doleta.gov", "federalreserve.gov", "treasury.gov", "ismworld.org",
+                    "bea.gov", "census.gov")
+_RANK = {Impact.LOW: 0, Impact.UNKNOWN: 1, Impact.MEDIUM: 2, Impact.HIGH: 3}
 MODES = ("observe", "enforce")
 PROVIDER_TYPES = ("json_file", "ics", "rss", "census_html", "fomc_html")
 LIVE_TYPES = ("ics", "rss", "census_html", "fomc_html")
@@ -106,6 +129,7 @@ class NewsConfig:
     manual_max_age: pd.Timedelta = pd.Timedelta(days=7)
     manual_horizon: pd.Timedelta = pd.Timedelta(days=14)
     official_domains: tuple[str, ...] = ()
+    provider_evidence: dict[str, str] = field(default_factory=dict)  # provider -> verified_at of its evidence
     source_path: str = ""
 
     @property
@@ -331,7 +355,7 @@ def load_news_config(path: str | Path | None = None) -> NewsConfig:
     if u_enabled and u_provider not in providers:
         raise ConfigError("[unexpected] provider must name a configured provider")
 
-    return NewsConfig(
+    cfg = NewsConfig(
         enabled=_bool(news, "enabled", "news"), mode=_str(news, "mode", "news", MODES), display_timezone=disp,
         local_timezone=local,
         max_age=pd.Timedelta(minutes=_num(cal, "max_age_minutes", "calendar", strict=True)),
@@ -360,6 +384,8 @@ def load_news_config(path: str | Path | None = None) -> NewsConfig:
         manual_max_age=pd.Timedelta(days=man_age), manual_horizon=pd.Timedelta(days=man_horizon),
         official_domains=tuple(d.lower() for d in domains),
         source_path=str(p))
+    _safety_floors(cfg)
+    return replace(cfg, provider_evidence=_check_evidence(cfg))
 
 
 def _validate_block(impacts: tuple[Impact, ...]) -> tuple[Impact, ...]:
@@ -367,3 +393,64 @@ def _validate_block(impacts: tuple[Impact, ...]) -> tuple[Impact, ...]:
         raise ConfigError("[impact] block must include 'high' and 'unknown': an unclassified or high-impact "
                           "event can never be treated as safe")
     return impacts
+
+
+def _safety_floors(c: NewsConfig) -> None:
+    missing = [k for k in MANDATORY_CATEGORIES if k not in c.required_categories]
+    if missing:
+        raise ConfigError(f"[coverage] required_categories cannot drop mandatory categories {missing}")
+    for cat, floor in MANDATORY_CATEGORIES.items():
+        rule = c.events.get(cat)
+        if rule is None:
+            raise ConfigError(f"[events.{cat}] is mandatory")
+        if _RANK[rule.impact] < _RANK[floor]:
+            raise ConfigError(f"[events.{cat}] impact cannot be lower than {floor.value!r}")
+        if rule.impact not in c.block_impacts:
+            raise ConfigError(f"[impact] block must include {rule.impact.value!r} (used by mandatory {cat!r})")
+        if rule.before < MIN_WINDOW or rule.after < MIN_WINDOW:
+            raise ConfigError(f"[events.{cat}] before/after must each be >= {MIN_WINDOW.total_seconds() / 60:.0f} min")
+    for root, inst in c.instruments.items():
+        if "US" not in inst["regions"]:
+            raise ConfigError(f"[instruments.{root}] regions must include 'US' (US index futures)")
+        for cat, (b, a) in inst["overrides"].items():
+            if cat in MANDATORY_CATEGORIES and (b < MIN_WINDOW or a < MIN_WINDOW):
+                raise ConfigError(f"[instruments.{root}.overrides] {cat} window below the minimum")
+    if c.unknown_before < MIN_UNKNOWN_WINDOW or c.unknown_after < MIN_UNKNOWN_WINDOW:
+        raise ConfigError("[unknown_impact] before/after must each be >= 15 min")
+    if c.max_age > MAX_CALENDAR_AGE:
+        raise ConfigError("[calendar] max_age_minutes cannot exceed 4320 (3 days)")
+    if c.lookahead < MIN_LOOKAHEAD:
+        raise ConfigError("[calendar] lookahead_minutes must be >= 60")
+    if c.manual_max_age > MAX_MANUAL_AGE:
+        raise ConfigError("[manual] max_verification_age_days cannot exceed 14")
+    if c.manual_horizon < MIN_MANUAL_HORIZON:
+        raise ConfigError("[manual] operational_horizon_days must be >= 7")
+    bad = [d for d in c.official_domains if d not in OFFICIAL_DOMAINS]
+    if bad:
+        raise ConfigError(f"[manual] official_domains may only narrow the built-in official list; refused {bad}")
+
+
+def _check_evidence(c: NewsConfig) -> dict[str, str]:
+    """An enabled live provider must match a verification record produced by
+    scripts/verify_news_providers.py (same type and URLs, successful, same date as verified_on).
+    This stops an ordinary config edit from marking an unverified source as verified. It does NOT
+    stop someone who edits the evidence file as well (see docs/news_provider_verification.md)."""
+    live = [p for p in c.providers.values() if p.enabled and p.live]
+    if not live:
+        return {}
+    try:
+        from src.risk.news.event import strict_json_loads
+
+        doc = strict_json_loads(PROVIDER_EVIDENCE_PATH.read_text(encoding="utf-8"))
+        evidence, when = doc["providers"], str(doc["verified_at"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ConfigError(f"provider verification evidence {PROVIDER_EVIDENCE_PATH} missing or invalid: {exc}") from exc
+    out = {}
+    for p in live:
+        e = evidence.get(p.name)
+        if not isinstance(e, dict) or e.get("ok") is not True or e.get("type") != p.type \
+                or list(e.get("urls", [])) != list(p.all_urls()) or when[:10] != p.verified_on:
+            raise ConfigError(f"[providers.{p.name}] has no matching successful verification record in "
+                              f"{PROVIDER_EVIDENCE_PATH.name} (run scripts/verify_news_providers.py)")
+        out[p.name] = when
+    return out

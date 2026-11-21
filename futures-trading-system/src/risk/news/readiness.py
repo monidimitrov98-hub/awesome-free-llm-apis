@@ -27,7 +27,7 @@ import pandas as pd
 
 from src.config import PROJECT_ROOT
 from src.risk.news.calendar import CalendarStore
-from src.risk.news.config import NewsConfig
+from src.risk.news.config import PROVIDER_REVERIFY, NewsConfig
 from src.risk.news.guard import NewsGuard, NewsState
 from src.risk.news.manual import SCHEMA, validate_manual
 
@@ -50,7 +50,9 @@ def load_manual(cfg: NewsConfig) -> tuple[str, Any]:
     path = Path(pcs[0].path)
     path = path if path.is_absolute() else PROJECT_ROOT / path
     try:
-        return str(path), json.loads(path.read_text(encoding="utf-8"))
+        from src.risk.news.event import strict_json_loads
+
+        return str(path), strict_json_loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return str(path), exc
 
@@ -83,40 +85,32 @@ def readiness_report(cfg: NewsConfig, store: CalendarStore, now: pd.Timestamp, c
         if pc.enabled and pc.live and not pc.verified:
             add(CONFIG, f"provider {name} is enabled but not verified")
 
-    # 3. provider health / staleness / coverage (the same checks NewsGuard enforces on every entry)
-    guard = NewsGuard(cfg, store, instrument)
+    # 3. provider health / staleness / coverage (the SAME rules NewsGuard enforces on every entry,
+    #    in operational mode: only verified-live or manual data counts)
+    guard = NewsGuard(cfg, store, instrument, operational=True)
     problems, health, _ = guard._integrity(now)
     for state, msg in problems:
         add(STATE_VERDICT.get(state, INCOMPLETE), msg)
+    for p, h in health.items():
+        if h.get("status") == "degraded_cached":
+            add(PROVIDER, f"provider {p}: latest refresh failed; only cached data available")
+    for p, when in cfg.provider_evidence.items():
+        if now - pd.Timestamp(when) > PROVIDER_REVERIFY:
+            add(CONFIG, f"provider {p}: live verification from {when} is older than "
+                        f"{PROVIDER_REVERIFY.days} days; re-run scripts/verify_news_providers.py")
 
-    # 4. operational horizon per required category
+    # 4. operational horizon per required category (same rule, strict, longer horizon)
     table: dict[str, Any] = {}
     for cat in cfg.required_categories:
-        row = {"covered": False, "by": None, "through": None, "reasons": []}
+        row = {"covered": False, "by": None, "reasons": []}
         for p, cats in store.provider_coverage.items():
             if cat not in cats:
                 continue
-            h = health.get(p, {})
-            cls = store.provider_class.get(p, "unknown")
-            if h.get("status") != "ok":
-                row["reasons"].append(f"{p}: {h.get('status', 'no refresh')}")
-                continue
-            if cls not in ("verified_live", "manual"):
-                row["reasons"].append(f"{p}: data class {cls} is not operational")
-                continue
-            cc = h.get("category_coverage")
-            if cc is not None:
-                prob = guard._category_problem(cc, cat, now, cfg.manual_horizon)
-                through = cc.get(cat, {}).get("through")
-            else:
-                last = [r for r in store.refreshes_until(now) if r.provider == p and r.ok][-1]
-                through = last.coverage_end.isoformat() if last.coverage_end is not None else None
-                prob = None if last.coverage_end is not None and last.coverage_end >= horizon_end else \
-                    (NewsState.CALENDAR_INCOMPLETE, f"covered only through {through}")
+            prob = guard.coverage_problem(p, cat, now, cfg.manual_horizon, health, operational=True, strict=True)
             if prob is None:
-                row.update(covered=True, by=p, through=through)
+                row.update(covered=True, by=p)
                 break
-            row["reasons"].append(f"{p}: {prob[1]}")
+            row["reasons"].append(prob[1])
         if not row["covered"] and not any(f"category {cat!r} not covered" in m for _, m in findings):
             stale = any("last verified" in r for r in row["reasons"])
             add(STALE if stale else INCOMPLETE, f"required category {cat!r} not covered through "

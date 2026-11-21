@@ -84,11 +84,24 @@ class NewsDecision:
     record: dict[str, Any] = field(default_factory=dict)
 
 
+# a provider-level source "covers" a category only if its own data contains a future event of it
+# (or of the release that carries it)
+CATEGORY_SOURCES = {"core_cpi": {"core_cpi", "cpi"}, "core_pce": {"core_pce", "pce"},
+                    "unemployment_rate": {"unemployment_rate", "nfp"},
+                    "fomc_statement": {"fomc_statement", "fomc_decision"},
+                    "fed_press_conference": {"fed_press_conference", "fomc_decision"}}
+OPERATIONAL_CLASSES = ("verified_live", "manual")
+
+
 class NewsGuard:
-    def __init__(self, cfg: NewsConfig, store: CalendarStore, instrument: str) -> None:
+    """``operational=True`` (paper/live use) applies the same coverage rules as the readiness
+    report: only verified-live or manual data counts, synthetic data blocks every entry."""
+
+    def __init__(self, cfg: NewsConfig, store: CalendarStore, instrument: str, *, operational: bool = False) -> None:
         self.cfg = cfg
         self.store = store
         self.instrument = instrument
+        self.operational = operational
         cfg.regions_for(instrument)  # every traded instrument needs explicit rules (raises otherwise)
         self.decisions: list[dict[str, Any]] = []
         self.flatten_events: list[dict[str, Any]] = []
@@ -130,6 +143,7 @@ class NewsGuard:
         if cls == "verified_live" and age > self.cfg.refresh_interval:
             h["data_class"] = "cached_live"  # live data, but not refreshed within the refresh interval
         if fails and fails[-1].time > last_ok.time:
+            h["status"] = "degraded_cached"  # latest refresh failed; cached data used (use_fresh_cache only)
             if self.cfg.provider_failure_policy == "block_entries" or age > self.cfg.max_age:
                 h["status"] = "failing"
                 problems.append((NewsState.PROVIDER_UNAVAILABLE,
@@ -176,6 +190,8 @@ class NewsGuard:
                 problems += probs
                 if age is not None:
                     ages.append(age)
+        if self.operational and self.store.is_synthetic:
+            problems.append((NewsState.CALENDAR_INCOMPLETE, "synthetic calendar data is not allowed in operation"))
         for cat in self.cfg.required_categories:
             providers = [p for p, cats in self.store.provider_coverage.items() if cat in cats]
             why = []
@@ -183,7 +199,8 @@ class NewsGuard:
                 if p not in healthy:
                     why.append((NewsState.CALENDAR_INCOMPLETE, f"{p} unhealthy"))
                     continue
-                prob = self._category_problem(health[p].get("category_coverage"), cat, now, self.cfg.lookahead)
+                prob = self.coverage_problem(p, cat, now, self.cfg.lookahead, health,
+                                             operational=self.operational)
                 if prob is None:
                     why = []
                     break
@@ -197,6 +214,35 @@ class NewsGuard:
                 problems.append((state, f"required category {cat!r} not covered: "
                                  + "; ".join(r for _, r in why)))
         return problems, health, (max(ages) if ages else None)
+
+    def coverage_problem(self, p: str, cat: str, now: pd.Timestamp, horizon: pd.Timedelta, health: dict[str, Any],
+                         *, operational: bool, strict: bool = False) -> tuple[NewsState, str] | None:
+        """THE coverage rule, shared by entry authorization and the readiness report.
+        None when provider ``p`` covers ``cat`` from ``now`` for ``horizon``."""
+        h = health.get(p, {})
+        ok_states = ("ok",) if strict else ("ok", "degraded_cached")
+        if h.get("status") not in ok_states:
+            return NewsState.CALENDAR_INCOMPLETE, f"{p}: {h.get('status', 'no refresh')}"
+        if operational and self.store.provider_class.get(p) not in OPERATIONAL_CLASSES:
+            return NewsState.CALENDAR_INCOMPLETE, f"{p}: data class {self.store.provider_class.get(p, 'unknown')} " \
+                                                  "is not operational"
+        cc = h.get("category_coverage")
+        if cc is not None:
+            return self._category_problem(cc, cat, now, horizon)
+        last = [r for r in self.store.refreshes_until(now) if r.provider == p and r.ok][-1]
+        if last.coverage_end is None or last.coverage_end < now + horizon:
+            return NewsState.CALENDAR_INCOMPLETE, f"{p}: covers only through {last.coverage_end}"
+        if self.store.provider_class.get(p) not in ("verified_live", "unverified_live", "cached_live"):
+            return None  # historical/research store: coverage is attested by the calendar file itself
+        wanted = CATEGORY_SOURCES.get(cat, {cat})
+        for r in self.store.records:
+            if r.source == p and r.category in wanted and r.known_at <= now:
+                t = r.scheduled_at if r.scheduled_at is not None else (
+                    pd.Timestamp(r.event_date).tz_localize("America/New_York").tz_convert("UTC")
+                    + pd.Timedelta(days=1) if r.event_date is not None else None)
+                if t is not None and t >= now:
+                    return None
+        return NewsState.CALENDAR_INCOMPLETE, f"{p}: its data lists no upcoming {cat} event"
 
     def _category_problem(self, cc: dict[str, dict[str, str]] | None, cat: str, now: pd.Timestamp,
                           horizon: pd.Timedelta) -> tuple[NewsState, str] | None:
@@ -212,11 +258,17 @@ class NewsGuard:
             return NewsState.CALENDAR_INCOMPLETE, f"manual category verified only through {entry['through']}"
         return None
 
-    def status(self, now: pd.Timestamp) -> NewsStatus:
+    def status(self, now: pd.Timestamp, until: pd.Timestamp | None = None) -> NewsStatus:
+        """State at ``now``; with ``until`` every window overlapping [now, until) counts as active
+        (a fill can happen anywhere inside an execution bar)."""
         if not self.cfg.enabled:
             return NewsStatus(now, NewsState.DISABLED, ["news filter disabled in config"], [], None, None, {})
         wins = self.windows_at(now)
-        active = [w for w in wins if w.contains(now)]
+        end = until if until is not None and until > now else None
+        if end is not None:
+            active = [w for w in wins if w.start < end and w.end > now]
+        else:
+            active = [w for w in wins if w.contains(now)]
         nxt = next((w for w in wins if w.start > now), None)
         problems, health, age = self._integrity(now)
         candidates = list(problems) + [(KIND_STATE[w.kind], f"{w.kind} window {w.start}..{w.end}") for w in active]
@@ -226,8 +278,8 @@ class NewsGuard:
 
     # ------------------------------------------------------------------ decisions
     def check_entry(self, now: pd.Timestamp, *, purpose: str, client_id: str | None = None,
-                    side: str | None = None) -> NewsDecision:
-        st = self.status(now)
+                    side: str | None = None, until: pd.Timestamp | None = None) -> NewsDecision:
+        st = self.status(now, until)
         would_block = not st.safe
         allowed = not (would_block and self.cfg.enforcing)
         w = st.active[0] if st.active else None

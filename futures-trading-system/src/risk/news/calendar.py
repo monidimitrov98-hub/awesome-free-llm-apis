@@ -175,7 +175,9 @@ class CalendarStore:
     @classmethod
     def from_json(cls, text: str, classify, where: str = "calendar") -> "CalendarStore":
         try:
-            doc = json.loads(text)
+            from src.risk.news.event import strict_json_loads
+
+            doc = strict_json_loads(text)
         except ValueError as exc:
             raise ConfigError(f"{where}: not valid JSON ({exc})") from exc
         if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
@@ -192,7 +194,7 @@ class CalendarStore:
                     parse_time(r["coverage_start"], "coverage_start") if r.get("coverage_start") else None,
                     parse_time(r["coverage_end"], "coverage_end") if r.get("coverage_end") else None,
                     str(r.get("error", ""))[:300], int(r.get("n_events", 0)),
-                    _category_coverage(r.get("category_coverage"))))
+                    _category_coverage(r.get("category_coverage"), r["time"])))
             for i, e in enumerate(doc.get("events", [])):
                 e = dict(e)
                 source = str(e.pop("source", ""))
@@ -230,15 +232,18 @@ class CalendarStore:
                 "events": len(self.records), "gaps": [[a.isoformat(), b.isoformat()] for a, b in gaps if b > a]}
 
 
-def _category_coverage(raw: Any) -> dict[str, dict[str, str]] | None:
+def _category_coverage(raw: Any, refresh_time: Any) -> dict[str, dict[str, str]] | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("category_coverage must be an object")
+    t = parse_time(refresh_time, "refresh time")
     out = {}
     for c, v in raw.items():
-        out[str(c)] = {"through": parse_time(v["through"], "through").isoformat(),
-                       "verified_at": parse_time(v["verified_at"], "verified_at").isoformat()}
+        verified = parse_time(v["verified_at"], "verified_at")
+        if verified > t:  # a refresh cannot know a verification made after it (no look-ahead)
+            raise ValueError(f"category {c}: verified_at {verified} is after the refresh time {t}")
+        out[str(c)] = {"through": parse_time(v["through"], "through").isoformat(), "verified_at": verified.isoformat()}
     return out
 
 

@@ -23,6 +23,45 @@ class EventDataError(ValueError):
     """A calendar payload is malformed or unsafe."""
 
 
+MAX_JSON_DEPTH = 32
+
+
+def strict_json_loads(text: str) -> Any:
+    """JSON for untrusted calendar files: duplicate keys, NaN/Infinity and excessive nesting are
+    refused (a duplicate key could silently turn "unresolved" into "verified"). Raises ValueError."""
+    import json
+
+    def pairs(items):
+        keys = [k for k, _ in items]
+        if len(keys) != len(set(keys)):
+            raise ValueError(f"duplicate JSON keys {sorted({k for k in keys if keys.count(k) > 1})}")
+        return dict(items)
+
+    def bad_constant(name):
+        raise ValueError(f"JSON constant {name} is not allowed")
+
+    depth = cur = 0
+    in_str = esc = False
+    for ch in text:  # cheap nesting check before parsing (no RecursionError)
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            cur += 1
+            depth = max(depth, cur)
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError(f"JSON nested deeper than {MAX_JSON_DEPTH}")
+        elif ch in "]}":
+            cur -= 1
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=bad_constant)
+
+
 class Impact(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"

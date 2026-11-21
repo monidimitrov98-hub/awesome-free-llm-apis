@@ -41,7 +41,11 @@ def _cfg(tmp_path, manual_path):
     text = text.replace('type = "ics"\nenabled = true', 'type = "ics"\nenabled = false')
     text = text.replace('type = "census_html"\nenabled = true', 'type = "census_html"\nenabled = false')
     text = text.replace('type = "fomc_html"\nenabled = true', 'type = "fomc_html"\nenabled = false')
-    text, n = re.subn(r"required_categories = \[[^\]]*\]", 'required_categories = ["cpi", "nfp"]', text)
+    from src.risk.news.config import MANDATORY_CATEGORIES
+
+    # required categories cannot be dropped (audit fix): the manual provider claims all of them instead
+    allcats = json.dumps(sorted(MANDATORY_CATEGORIES))
+    text, n = re.subn(r"(\[providers\.manual\][\s\S]*?covers = )\[[^\]]*\]", lambda m: m.group(1) + allcats, text)
     assert n == 1
     assert text.count("enabled = true") == 2  # [news] and the manual provider only
     p = tmp_path / "news.toml"

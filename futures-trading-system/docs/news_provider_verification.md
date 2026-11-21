@@ -2,10 +2,10 @@
 
 Verified on **2026-11-21** from the cloud development environment, with network access
 restricted to the five official hosts listed below. Machine-readable results are in
-`docs/news_provider_verification.json`, produced by:
+`config/risk/provider_verification.json`, produced by:
 
 ```
-python scripts/verify_news_providers.py --out docs/news_provider_verification.json
+python scripts/verify_news_providers.py --out config/risk/provider_verification.json
 ```
 
 The script uses the production fetch and parse code and writes nothing to the calendar store.

@@ -39,6 +39,14 @@ CATEGORY_KEYS = {"official_source", "status", "verified_through", "last_verified
 EVENT_KEYS = {"event_id", "name", "category", "scheduled_at", "date", "timezone", "source", "last_verified",
               "provenance", "verification_status", "notes", "previous", "forecast"}
 EVENT_STATUSES = ("verified", "date_only", "unresolved")
+# Plausibility (audit 2026-11-21): "verified" without listed releases is not coverage. Regular
+# releases must appear at least every MAX_GAP_DAYS across [today, verified_through]; a release
+# group (one official release carrying several categories) counts once for all its members.
+RELEASE_GROUP = {"cpi": "cpi", "core_cpi": "cpi", "nfp": "employment_situation",
+                 "unemployment_rate": "employment_situation", "fomc_decision": "fomc", "fomc_statement": "fomc"}
+MAX_GAP_DAYS = {"cpi": 40, "core_cpi": 40, "nfp": 40, "unemployment_rate": 40, "ppi": 40, "jolts": 45,
+                "ism_manufacturing": 40, "ism_services": 40, "jobless_claims": 8, "treasury": 100}
+NO_SAME_DAY_CHECK = {"fed_chair_speech", "treasury"}
 
 
 @dataclass
@@ -71,7 +79,14 @@ class ManualReport:
 def official_url(url: Any, cfg: NewsConfig) -> bool:
     if not isinstance(url, str) or not url.startswith("https://") or len(url) > 500:
         return False
-    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    parts = urllib.parse.urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return False  # malformed port ("host:evil")
+    if parts.username or parts.password or port is not None or parts.netloc.lower() != (parts.hostname or ""):
+        return False  # no userinfo or ports: "https://www.bls.gov@evil.example" must not pass
+    host = (parts.hostname or "").lower()
     return any(host == d or host.endswith("." + d) for d in cfg.official_domains)
 
 
@@ -147,6 +162,8 @@ def validate_manual(doc: Any, cfg: NewsConfig, now: pd.Timestamp, classify) -> M
     # ---------------------------------------------------------------- events
     seen_ids: set[str] = set()
     seen_keys: set[tuple] = set()
+    by_group_day: dict[tuple[str, date], set] = {}
+    days_by_group: dict[str, set[date]] = {}
     for i, e in enumerate(events):
         where = f"event #{i + 1}"
         if not isinstance(e, dict):
@@ -213,6 +230,10 @@ def validate_manual(doc: Any, cfg: NewsConfig, now: pd.Timestamp, classify) -> M
             err(f"{where}: duplicate event ({c} at {key[1]})")
             continue
         seen_keys.add(key)
+        group = RELEASE_GROUP.get(c, c)
+        days_by_group.setdefault(group, set()).add(day)
+        if c not in NO_SAME_DAY_CHECK:
+            by_group_day.setdefault((group, day), set()).add(when.isoformat() if when is not None else "date_only")
         raw = {"name": e["name"], "category": c, "timezone": e["timezone"], "provenance": "manual"}
         if e.get("event_id"):
             raw["event_id"] = e["event_id"]
@@ -224,6 +245,24 @@ def validate_manual(doc: Any, cfg: NewsConfig, now: pd.Timestamp, classify) -> M
             rep.upcoming_high_impact.append({"name": e["name"], "category": c, "time": t.isoformat(),
                                              "time_ny": t.tz_convert(NY).strftime("%Y-%m-%d %H:%M %Z"),
                                              "time_known": when is not None})
+    for (group, day), times in sorted(by_group_day.items()):
+        if len(times) > 1:
+            err(f"contradictory records for {group} on {day}: {sorted(times)} (one release, one time)")
+    today = now.tz_convert(NY).date()
+    for c, v in rep.categories.items():
+        gap = MAX_GAP_DAYS.get(c)
+        if gap is None or v["status"] != "verified" or "verified_through" not in v:
+            continue
+        through = date.fromisoformat(v["verified_through"])
+        if through < today:
+            continue
+        days = sorted(d for d in days_by_group.get(RELEASE_GROUP.get(c, c), set()) if today <= d <= through)
+        points = [today] + days + [through]
+        worst = max((b - a).days for a, b in zip(points, points[1:]))
+        if worst > gap:
+            v["reasons"].append(f"implausible: no {c} release listed in a {worst}-day span up to {through} "
+                                f"(expected at least one every {gap} days); list every release or mark it unresolved")
+            rep.coverage.pop(c, None)
     for c, v in rep.categories.items():
         if v["status"] == "verified" and c in rep.coverage and not v["reasons"]:
             v["covered"] = True

@@ -36,7 +36,8 @@ import pandas as pd
 
 from src.config import PROJECT_ROOT
 from src.risk.news.config import NewsConfig, ProviderConfig
-from src.risk.news.event import NY, EventDataError, EventRecord, Provenance, clean_text, parse_record
+from src.risk.news.event import (NY, EventDataError, EventRecord, Provenance, clean_text, parse_record,
+                                  strict_json_loads)
 
 MAX_EVENTS = 5000
 MAX_LINE = 10_000
@@ -76,16 +77,35 @@ def user_agent() -> str:
     return "futures-research-calendar/1.0" + (f" (contact: {contact})" if contact else "")
 
 
+def _opener():
+    return urllib.request.build_opener(_SafeRedirect())
+
+
 def https_get(url: str, headers: dict[str, str], timeout: float, max_bytes: int) -> bytes:
+    """GET with a per-operation timeout AND a total deadline (3 x timeout): a server trickling
+    bytes slowly cannot keep a refresh open indefinitely."""
+    import time
+
     if not url.startswith("https://"):
         raise ProviderError("only https:// URLs are allowed")
-    opener = urllib.request.build_opener(_SafeRedirect())
     req = urllib.request.Request(url, headers={"User-Agent": user_agent(), **headers})
+    deadline = time.monotonic() + 3 * timeout
     try:
-        with opener.open(req, timeout=timeout) as resp:
+        with _opener().open(req, timeout=timeout) as resp:
             if resp.status != 200:
                 raise ProviderError(f"HTTP {resp.status}")
-            data = resp.read(max_bytes + 1)
+            chunks, size = [], 0
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > max_bytes:
+                    break
+                if time.monotonic() > deadline:
+                    raise ProviderError("download exceeded the total time limit")
+            data = b"".join(chunks)
     except ProviderError:
         raise
     except urllib.error.HTTPError as exc:
@@ -179,7 +199,7 @@ class JsonFileProvider(Provider):
         p = PROJECT_ROOT / self.pc.path if not os.path.isabs(self.pc.path) else self.pc.path
         try:
             with open(p, "rb") as fh:
-                doc = json.loads(decode_utf8(fh.read(self.cfg.max_response_bytes + 1), self.cfg.max_response_bytes))
+                doc = strict_json_loads(decode_utf8(fh.read(self.cfg.max_response_bytes + 1), self.cfg.max_response_bytes))
         except (OSError, ValueError) as exc:
             raise ProviderError(f"cannot read {self.pc.path}: {type(exc).__name__}") from None
         if isinstance(doc, dict) and doc.get("schema") == "manual-calendar/1":

@@ -956,7 +956,7 @@ starts, with exit reason `news_event_flatten`.
 ### Data sources and provider setup
 
 The live verification on 2026-11-21 is documented in `docs/news_provider_verification.md`
-(evidence and procedure) and `docs/news_provider_verification.json` (raw results).
+(evidence and procedure) and `config/risk/provider_verification.json` (raw results).
 
 | Provider | Source | Status |
 | --- | --- | --- |
@@ -968,7 +968,13 @@ The live verification on 2026-11-21 is documented in `docs/news_provider_verific
 | `manual` (`json_file`) | `data/news/manual_calendar.json`, curated by you from official schedules | Manual data. Required for CPI, NFP, PPI, jobless claims, ISM, Fed Chair speeches, Treasury |
 
 A live provider cannot be enabled unless the config records its verification
-(`verified = true`, `verified_on`, `documentation`). Every record carries its provenance:
+(`verified = true`, `verified_on`, `documentation`), **and** that record matches a successful
+entry in `config/risk/provider_verification.json`: same type, same URLs, and `verified_on`
+equal to the evidence date. That file is written by `scripts/verify_news_providers.py`.
+Readiness also requires the evidence to be less than 90 days old.
+
+A live provider only "covers" a category if its own data lists an upcoming event of that
+category. Claiming a category in `covers` is not enough. Every record carries its provenance:
 `verified_live`, `manual`, `synthetic` or `unknown`. Provider health additionally reports
 `cached_live` when live data has not been refreshed within `refresh_interval_minutes`.
 Synthetic data can never be labelled anything else. `[coverage] required_categories` must each
@@ -1064,13 +1070,39 @@ The verdict is `READY` only when no finding applies, and an invariant re-checks 
 required category before it is returned. Invalid manual data also makes the provider refresh
 fail, so NewsGuard blocks entries too.
 
+### Safety floors (cannot be configured away)
+
+After the adversarial audit of 2026-11-21 (`docs/news_audit_2026-11-21.md`), the news config
+can tighten the filter but not weaken it:
+
+- **Mandatory categories.** The 16 mandatory categories (CPI, Core CPI, NFP, unemployment
+  rate, PCE, FOMC decision, statement and press conference, Fed Chair, PPI, jobless claims,
+  ISM manufacturing and services, Treasury refunding, GDP, retail sales) stay required.
+- **Impact.** Their impact cannot be lowered below high or medium, and that impact must be
+  in `[impact] block`.
+- **Windows.** At least 5 minutes on each side, including instrument overrides. Unclassified
+  events get at least 15 minutes on each side.
+- **Instruments.** Every instrument must include the `US` region.
+- **Freshness.** `max_age_minutes` at most 3 days, `lookahead_minutes` at least 60, manual
+  `max_verification_age_days` at most 14, `operational_horizon_days` at least 7.
+- **Official sources.** Official domains can only be narrowed from the built-in list.
+
+Calendar JSON is parsed strictly: duplicate keys, NaN or Infinity, and nesting deeper than 32
+levels are refused. A manual category marked "verified" must list its regular releases.
+Monthly releases must appear at least every 40 days and jobless claims at least every 8
+days; one release (for example CPI) counts for every category it carries (Core CPI).
+Contradictory times for one release are errors. During a fill, NewsGuard checks the whole
+execution bar.
+
 ### Research mode vs operational mode
 
 - **Research mode (backtests).** A historical point-in-time calendar file is used. Manual,
   synthetic or old (`unknown` provenance) data is allowed, but it is labelled in
   `news_report.json`. A **synthetic** calendar is refused with non-synthetic price data. A
   calendar without coverage metadata blocks every entry (`CALENDAR_INCOMPLETE`).
-- **Operational mode (paper/live, later sprints).** `run_news_calendar.py --status` reports
+- **Operational mode (paper/live, later sprints).** Use `NewsGuard(..., operational=True)`.
+  It applies the same coverage rule as `--readiness`: only verified-live or manual data counts,
+  and synthetic data blocks every entry. `run_news_calendar.py --status` reports
   `operational_readiness`, which requires all of the following: the filter enabled in
   `enforce` mode; no synthetic data; no enabled unverified live provider; and every required
   category covered by a healthy `verified_live` or `manual` provider.

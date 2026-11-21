@@ -1,6 +1,9 @@
 """Verify the configured LIVE calendar providers against their real endpoints.
 
-    python scripts/verify_news_providers.py --out docs/news_provider_verification.json
+    python scripts/verify_news_providers.py --out config/risk/provider_verification.json
+
+The output is the verification EVIDENCE the config loader checks: an enabled live provider must
+match a successful record here (same type, same URLs, verified_on = the date of verified_at).
 
 For every live provider (enabled or not): fetch, parse with the production parser, and report
 HTTP outcome, number of events, date range, timezone handling (UTC vs New York times),

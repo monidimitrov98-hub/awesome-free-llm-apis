@@ -80,7 +80,9 @@ def main(argv=None) -> int:
             if args.validate_manual:
                 path = args.validate_manual
                 try:
-                    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+                    from src.risk.news.event import strict_json_loads
+
+                    doc = strict_json_loads(Path(path).read_text(encoding="utf-8"))
                 except (OSError, ValueError) as exc:
                     doc = exc
             if isinstance(doc, Exception) or doc is None:

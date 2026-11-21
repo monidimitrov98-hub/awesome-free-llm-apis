@@ -589,8 +589,9 @@ class _Simulation:
                 check["quantity"] = o.quantity
                 check["actual_risk_dollars"] = self._actual_risk_dollars(o, sim.price)
                 if self.news is not None:  # re-checked at the fill: a pending entry never fills into a blackout
+                    # the whole execution bar: a stop/limit can fill anywhere inside [t, t + bar length)
                     nd = self.news.check_entry(t, purpose="entry_fill", client_id=o.client_id,
-                                               side="long" if o.is_buy else "short")
+                                               side="long" if o.is_buy else "short", until=t + self.exec_len)
                     if not nd.allowed:
                         self._reject_entry(check, f"news_{nd.status.state.value.lower()}",
                                            nd.record.get("explanation", ""), o, t)
