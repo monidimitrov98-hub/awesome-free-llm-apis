@@ -45,6 +45,13 @@ both stops on the same side, so whichever is closer to the market triggers first
 without ambiguity. With ``"block_entries"`` the position is kept but no new entry
 is allowed that day. Exits are never blocked.
 
+Higher-timeframe context
+------------------------
+Optional ``context_bars`` (e.g. 15m) are never events themselves. At every signal
+event the engine passes each context frame cut to the rows with
+``available_at <= now`` (``ctx.context``), so a context candle becomes visible
+exactly when it is complete and never earlier.
+
 Ambiguity
 ---------
 OHLC bars do not tell the order of prices inside a bar. When a stop-loss and a
@@ -57,7 +64,7 @@ not credited and a stop-loss within the bar range is assumed hit (also flagged).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
@@ -150,9 +157,15 @@ class BacktestEngine:
         execution_bars: pd.DataFrame | None = None,
         *,
         risk_manager: RiskManager | None = None,
+        context_bars: Mapping[str, pd.DataFrame] | None = None,
     ) -> BacktestResult:
-        """Run the backtest. Inputs are not modified."""
-        sim = _Simulation(self, strategy, signal_bars, execution_bars, risk_manager)
+        """Run the backtest. Inputs are not modified.
+
+        Args:
+            context_bars: Optional higher-timeframe frames (name -> bars, Sprint 1
+                format) exposed to the strategy as ``ctx.context`` (see module docs).
+        """
+        sim = _Simulation(self, strategy, signal_bars, execution_bars, risk_manager, context_bars)
         return sim.run()
 
 
@@ -166,6 +179,7 @@ class _Simulation:
         signal_bars: pd.DataFrame,
         execution_bars: pd.DataFrame | None,
         risk_manager: RiskManager | None,
+        context_bars: Mapping[str, pd.DataFrame] | None = None,
     ) -> None:
         self.cfg = engine.config
         self.spec = engine.contract
@@ -181,6 +195,16 @@ class _Simulation:
         if self.exec_len > self.signal_len:
             raise DataError("Execution bars must not be longer than signal bars")
         self.risk = risk_manager or RiskManager(self.cfg.risk, self.session)
+        self.context: dict[str, pd.DataFrame] = {}
+        self._context_avail: dict[str, pd.DatetimeIndex] = {}
+        for name, frame in (context_bars or {}).items():
+            frame = frame.copy()
+            _validate_bars(frame, f"context '{name}'")
+            avail = pd.DatetimeIndex(frame["available_at"])
+            if not avail.is_monotonic_increasing:
+                raise DataError(f"context '{name}': available_at must be increasing")
+            self.context[name] = frame
+            self._context_avail[name] = avail
 
         self.position = Position(point_value=self.spec.point_value)
         self.open_trade: _OpenTrade | None = None
@@ -282,6 +306,7 @@ class _Simulation:
             position=self._snapshot(),
             has_pending_entry=bool(self._pending((OrderRole.ENTRY,))),
             contract=self.spec,
+            context=self._context_at(now),
         )
         requests = self.strategy.on_bar(ctx) or []
         entry_seen = False
@@ -301,6 +326,16 @@ class _Simulation:
                     self._cancel(o, "cancelled_by_strategy")
             else:
                 raise ValueError(f"Unknown request action {req.action!r}")
+
+    def _context_at(self, now: pd.Timestamp) -> dict[str, pd.DataFrame]:
+        """Each context frame cut to the rows completed by ``now`` (no unfinished candle)."""
+        out = {}
+        for name, frame in self.context.items():
+            n = int(self._context_avail[name].searchsorted(now, side="right"))
+            view = frame.iloc[:n]
+            assert n == 0 or self._context_avail[name][n - 1] <= now, "look-ahead guard"
+            out[name] = view
+        return out
 
     def _submit_entry(self, req: OrderRequest, now: pd.Timestamp, bar_time: pd.Timestamp,
                       ref_close: float, session_date: pd.Timestamp | None) -> None:

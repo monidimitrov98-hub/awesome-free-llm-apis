@@ -8,8 +8,10 @@ A personal Python **research and paper-trading** project for intraday **MES** an
 - **Sprint 1, market data engine:** loading CSV files, validating them, converting timestamps
   to UTC, identifying contracts, resampling and computing core indicators.
 - **Sprint 2, backtesting engine:** an event-driven historical simulation with orders, fills,
-  positions, costs, a risk engine and performance metrics. There is no trading strategy yet,
-  only the interface for one.
+  positions, costs, a risk engine and performance metrics.
+- **Sprint 3, VWAP Trend Pullback strategy:** the first rule-based strategy, with
+  multi-timeframe context, structured signal diagnostics and a reproducible backtest runner.
+  It is **not** validated and makes **no** profitability claim.
 
 ## Project layout
 
@@ -17,6 +19,8 @@ A personal Python **research and paper-trading** project for intraday **MES** an
 futures-trading-system/
 ├── config/settings.toml        # data settings: columns, timezones, sessions, contracts, indicator periods
 ├── config/backtest.toml        # backtest settings: capital, costs, slippage, execution policies, sizing, risk
+├── config/strategy_vwap_pullback.toml  # strategy parameters (unvalidated research hypotheses)
+├── run_backtest.py             # run the strategy on a CSV and write all result files
 ├── data/samples/               # SYNTHETIC sample CSVs (clearly marked) + README
 ├── run_pipeline.py             # command-line entry point
 ├── scripts/generate_synthetic_data.py
@@ -35,7 +39,10 @@ futures-trading-system/
 │   ├── indicators/             # ema, rsi (Wilder), atr (Wilder), session vwap, relative volume
 │   ├── backtest/               # engine, orders, position, execution (fill rules), sizing, metrics, config
 │   ├── risk/manager.py         # configurable risk limits that can reject any entry
-│   ├── strategy/base.py        # Strategy interface + StrategyContext (no strategy implemented yet)
+│   ├── strategy/base.py        # Strategy interface + StrategyContext (incl. higher-timeframe context)
+│   ├── strategy/vwap_pullback.py, vwap_pullback_config.py   # VWAP Trend Pullback strategy
+│   ├── indicators/swings.py    # confirmed (non-repainting) swing pivots and market structure
+│   ├── backtest/runner.py      # CSV -> pipeline -> engine -> result files
 │   ├── ai/ dashboard/          # placeholders for later sprints
 └── tests/                      # pytest suite (one file per module/indicator)
 ```
@@ -414,6 +421,143 @@ print(result.metrics); result.trades; result.equity; result.rejections
 - **Win/loss:** a trade with `net_pnl < 0` is a loss, `> 0` a win, and breakeven resets the
   consecutive-loss count.
 
+## Sprint 3: VWAP Trend Pullback strategy
+
+> A research implementation. All parameters are **unvalidated hypotheses**. Results on the
+> synthetic sample data are meaningless, and nothing here is evidence of profitability
+> without out-of-sample testing on real data.
+
+### Architecture
+
+```
+CSV ─► Sprint 1 pipeline ─► 1m, 5m, 15m frames (indicators, is_complete, available_at)
+                                  │        │       │
+         execution bars (1m) ◄────┘        │       └──► context_bars (15m): the engine cuts each
+         signal bars (5m) ◄────────────────┘             frame to available_at <= now (ctx.context)
+                                  │
+            BacktestEngine (Sprint 2) ── SignalEvent ──► VwapTrendPullbackStrategy.on_bar(ctx)
+                                  │                          │ rules + diagnostics record
+                                  │ ◄── OrderRequest.enter(market, stop_loss, take_profit)
+            RiskManager ─► execution model ─► bracket ─► trade log, equity, metrics
+```
+
+The strategy contains only decision logic. Orders, fills, brackets, risk checks, the trade log
+and metrics all come from Sprint 2, unchanged.
+
+Two small, additive engine changes were needed:
+1. `BacktestEngine.run(..., context_bars=...)` with a new `ctx.context` field. Without
+   context frames, behaviour is unchanged.
+2. Lazy exports in `src/backtest/__init__.py`. This fixes a latent circular import that
+   appeared when `src.strategy` was imported first.
+
+### LONG rules (SHORT is the exact mirror)
+
+All checks run on **completed** signal bars. Every check is evaluated and recorded.
+
+| # | Check | Default |
+|---|---|---|
+| Gates | Flat, no pending entry, current bar complete, inside the session and the strategy window (decision time), indicator values present on every bar used, and those bars contiguous, complete and in the current session | window 09:45–15:30 NY |
+| Trend | Close > VWAP; EMA9 > EMA21; (EMA9 − EMA21) / ATR ≥ minimum strength | 0.10 ATR |
+| Structure | Confirmed swing pivots in the current session: last swing high > previous **and** last swing low > previous (HH + HL) | pivots 2 left / 2 right, 60 bars |
+| Context | Last **completed** 15m candle of this session: close > VWAP, EMA9 > EMA21; not stale, not incomplete | on |
+| Pullback | In the last 3 signal bars, some bar's low lies in `[level − 0.5 ATR, level + 0.25 ATR]` of EMA9, EMA21 or VWAP. No bar of that window may reach the last confirmed swing low | 3 bars, 0.25 / 0.50 ATR |
+| Not chasing | (close − VWAP) ≤ 1.5 ATR and \|close − EMA9\| ≤ 1.0 ATR | |
+| Confirmation | Close > open, close > EMA9 (close > previous high is optional) | |
+| RSI | Min RSI in the window ≤ 50, RSI now ≥ 50 and ≤ 75, rising | |
+| RVOL | RVOL ≥ 1.0. NaN (not enough history) never passes; the filter can be disabled | |
+| Stop / target | See below | |
+| Filters | 15-minute cooldown after an exit fill; max 3 filled entries per trade date; one entry per pullback | |
+
+**SHORT** mirrors every rule:
+- **Trend:** close < VWAP, EMA9 < EMA21, LH + LL structure.
+- **Pullback:** a *high* reaches into `[level − 0.25 ATR, level + 0.5 ATR]`, and the last
+  confirmed swing *high* must not be reached.
+- **Confirmation:** close < open and below EMA9.
+- **RSI:** max RSI in the window ≥ 50, RSI now ≤ 50 and ≥ 25, falling.
+
+A pullback alone never generates an entry: the confirmation candle, RSI and RVOL checks must
+pass on the current completed bar. At most one entry is emitted per bar.
+
+### Stop-loss and take-profit
+
+The reference price is the confirmation bar's close.
+
+- **Swing (default):** the stop is the last confirmed swing low − 2 ticks (long), or the last
+  confirmed swing high + 2 ticks (short).
+- **ATR:** the stop is close − 1.5 × ATR (long), or close + 1.5 × ATR (short).
+- **Rounding:** prices are rounded with the engine's own `conservative_order_price`. A sell
+  stop rounds down and a buy stop rounds up, so the stop is never closer than requested.
+- **Distance limits:** the stop must lie on the correct side, at least
+  `max(0.5 ATR, 4 ticks)` away and at most `3 ATR` away. An optional absolute tick cap is
+  also available. Otherwise the setup is rejected (`stop_wrong_side`, `stop_too_tight`,
+  `stop_too_wide`, `stop_unavailable`).
+- **Take-profit:** close ± R × stop distance, rounded conservatively (sell limit up, buy limit
+  down). The default is R = 2.
+- **Several R values:** `--r-multiples 1.5 2 3` runs each value separately, side by side. No
+  value is selected.
+- **Re-checks at the fill:** the engine re-checks both prices at the actual fill. If a gap
+  puts the fill outside the bracket, the entry is rejected (`invalid_bracket_at_fill`).
+  Risk-based size is fitted to the budget. The realised R therefore differs slightly from
+  the planned R.
+
+### How the timeframes interact
+
+| Timeframe | Role | Visible to the strategy |
+|---|---|---|
+| 1m | Execution only (fills, brackets, session flatten) | Never |
+| 5m | Signal: one decision per completed bar at `now = available_at` (bar open + 5 min) | Rows with `available_at <= now`, i.e. up to the current bar |
+| 15m | Context: trend filter | Rows with `available_at <= now`, cut by the engine. The 10:30 candle is visible from 10:45, never earlier |
+
+- **Example:** at 10:55 (5m bar 10:50 just completed) the last visible 15m candle is the
+  10:30 one. The 10:45 candle becomes visible at 11:00.
+- **Context rejections:**
+  - `context_stale`: the latest visible 15m candle is older than one 15m period (a data gap).
+  - `context_unavailable`: it belongs to another session, for example the first 15 minutes
+    after the open.
+  - `context_incomplete`: it is incomplete.
+  - `context_missing_indicator`: its indicator values are missing.
+- **Order execution:** the strategy's order fills on the next eligible 1m bar (open ≥ `now`).
+  If no 1m bar arrives within 2 minutes, the order is cancelled and reported.
+- **Incomplete signal bars:** they are skipped (engine policy, logged as
+  `incomplete_signal_bar_skipped`). If the engine is configured to allow them, the strategy
+  itself rejects them (`incomplete_signal_bar`).
+- **No fabricated data:** missing indicator values (warm-up) are rejected, never filled in.
+
+### Signal diagnostics
+
+Every evaluated setup produces one row per direction in `strategy.diagnostics_frame()`
+(written to `signal_diagnostics.csv`). The columns are:
+
+`time, bar_time, session_date, instrument, direction, decision (signal / reject / skip),
+rejection_reason (first failing check), reasons (all failing checks), close, vwap_relation,
+ema_relation, trend_strength_atr, structure, context_status, pullback_status, pullback_level,
+extension_status, candle_status, rsi, rsi_status, rvol, rvol_status, stop_price,
+stop_distance, target_price, target_distance, pullback_id`.
+
+The codes are defined in `src/strategy/vwap_pullback.py` (`Reason`). Rejections by the risk
+manager and the execution engine (for example `outside_trading_window`,
+`invalid_bracket_at_fill` or `max_daily_loss`) are written to `engine_rejections.csv`.
+
+### Running the strategy
+
+```powershell
+python run_backtest.py --csv data\samples\SYNTHETIC_MES_1m.csv
+python run_backtest.py --csv C:\data\MNQM25_1m.csv --output-dir output\mnq
+python run_backtest.py --csv C:\data\MESM25_1m.csv --r-multiples 1.5 2 3
+python run_backtest.py --csv my.csv --strategy-config config\strategy_vwap_pullback.local.toml
+```
+
+Each run writes the following files to `output/r_<R>/`:
+- `trades.csv`, `equity.csv`, `daily_pnl.csv`, `metrics.json`
+- `config_used.json` (strategy, backtest, contract and session settings)
+- `signal_diagnostics.csv`, `engine_rejections.csv`, `orders.csv`, `adjustments.csv`
+- `warnings.txt`, `data_quality.txt`
+
+The CSV needs at least 6 sessions of 1m data, because RVOL needs 5 earlier sessions at the
+same time of day. Earlier bars are rejected with `rvol_unavailable` unless `[rvol]` is
+disabled. Real data is loaded as in Sprint 1, with the same column mapping and timezone
+settings.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.
@@ -452,6 +596,22 @@ print(result.metrics); result.trades; result.equity; result.rejections
   model, and no prop-firm rules. The risk limits are generic.
 - **Backtest, exits:** the end of data closes any open position at the last close, and the
   run reports a warning.
+- **Strategy:**
+  - Parameters are untested hypotheses. There has been no optimisation and no
+    out-of-sample validation.
+  - The synthetic sample is a random walk and produces almost no trends, so it only
+    exercises the code.
+- **Strategy, stops and targets:** they are planned from the confirmation close. The fill
+  happens at the next 1m open, so the realised risk and R differ slightly. The engine
+  re-checks the bracket and the risk budget.
+- **Strategy, market structure:** structure is evaluated within the current session only,
+  and pivots need 2 confirmation bars, so structure lags by design. Ties (equal highs or
+  lows) are not pivots.
+- **Strategy, entry counting:** a pullback is marked as used when the signal is emitted, even
+  if the engine or risk manager then rejects the order. `max_entries_per_session` counts
+  filled entries.
+- **Strategy, no in-trade management:** there is no trailing stop, break-even or partial exit.
+  Exits come from the bracket, the session flatten or the daily-loss limit.
 - **Backtest, daily loss:**
   - The unrealized check uses the bar's extreme. Inside one bar the engine cannot tell whether
     the extreme came before or after a take-profit, so it assumes the worst case.

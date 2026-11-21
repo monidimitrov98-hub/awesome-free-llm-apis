@@ -9,8 +9,8 @@ execution bar).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, field
+from typing import Mapping, Sequence
 
 import pandas as pd
 
@@ -45,6 +45,10 @@ class StrategyContext:
         position: Current position snapshot.
         has_pending_entry: True while an entry order waits to be filled.
         contract: Contract specification (tick size, point value).
+        context: Higher-timeframe frames passed to ``BacktestEngine.run(context_bars=...)``,
+            each already cut by the engine to rows with ``available_at <= now``. An
+            unfinished higher-timeframe candle is therefore never visible. Empty when
+            no context frames are supplied.
     """
 
     now: pd.Timestamp
@@ -55,6 +59,7 @@ class StrategyContext:
     position: PositionSnapshot
     has_pending_entry: bool
     contract: ContractSpec
+    context: Mapping[str, pd.DataFrame] = field(default_factory=dict)
 
 
 class Strategy(ABC):
