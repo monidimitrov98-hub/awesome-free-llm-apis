@@ -59,9 +59,12 @@ def event_windows(merged: list[MergedEvent], cfg: NewsConfig, root: str) -> list
         for rec in m.chosen:
             if rec.region not in regions or rec.status is EventStatus.CANCELLED:
                 continue
-            if rec.impact not in cfg.block_impacts:
-                continue
-            before, after = cfg.window(root, rec.category)
+            # every relevant event blocks (an impact label can never remove a blackout); the window
+            # is the most conservative over all categories that apply to the event
+            before, after = pd.Timedelta(0), pd.Timedelta(0)
+            for cat in (rec.category, *rec.alt_categories):
+                b, a = cfg.window(root, cat)
+                before, after = max(before, b), max(after, a)
             kind = "conflict" if conflict else ("unknown_impact" if rec.impact is Impact.UNKNOWN else "scheduled")
             if rec.category == "unexpected":
                 out.append(Window(rec.known_at, rec.known_at + after, "unexpected", [rec], [f"unexpected: {rec.name}"]))

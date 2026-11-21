@@ -103,7 +103,11 @@ def test_dropping_a_category_from_required_is_rejected(tmp_path):
 ])
 def test_new_alias_cannot_capture_a_mandatory_release(tmp_path, alias):
     text = TEXT.replace("# Event categories:", alias + "\n# Event categories:", 1)  # defined FIRST in the file
-    c = load(tmp_path, text)  # allowed to exist ...
+    with pytest.raises(ConfigError, match="30 min before / 30 min after"):
+        load(tmp_path, text)  # weaker than 30/30: refused outright
+    text = re.sub(r"(before|after)_minutes = [0-9]+", r"\1_minutes = 30", alias)
+    text = TEXT.replace("# Event categories:", text + "\n# Event categories:", 1)
+    c = load(tmp_path, text)  # a 30/30 alias may exist ...
     from src.risk.news.classifier import make_classifier
 
     classify = make_classifier(c)  # ... but mandatory categories always win classification

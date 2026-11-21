@@ -91,7 +91,7 @@ def test_unknown_impact_and_unknown_time_are_never_safe():
     postponed = guard(rec("Consumer Price Index", date="2025-03-12", status="postponed"))
     assert state(postponed, "2025-03-12 12:00") is S.EVENT_UNKNOWN
     low = guard(rec("Some low thing", "2025-03-12T10:00:00", impact="low"))
-    assert state(low, "2025-03-12 10:00") is S.NORMAL
+    assert state(low, "2025-03-12 09:30") is S.BLACKOUT_ACTIVE  # an impact label never removes a blackout (30/30)
 
 
 def test_conflict_state():

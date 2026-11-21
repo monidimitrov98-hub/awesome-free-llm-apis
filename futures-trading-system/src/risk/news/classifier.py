@@ -46,4 +46,11 @@ def make_classifier(cfg: NewsConfig):
         base = cfg.events[cat].impact
         return cat, base if hint is None or IMPACT_RANK[hint] <= IMPACT_RANK[base] else hint
 
+    def matches(name: str) -> list[str]:
+        """EVERY configured category whose patterns match ``name`` (ambiguity is resolved by
+        protecting against all of them, never by trusting one)."""
+        return [c for c in order if any(p.search(name) for p in cfg.events[c].compiled)]
+
+    classify.matches = matches
+    classify.impact_of = lambda c: cfg.events[c].impact if c in cfg.events else Impact.UNKNOWN
     return classify

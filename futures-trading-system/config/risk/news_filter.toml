@@ -38,7 +38,7 @@ pre_event_policy = "keep"              # "keep": open positions follow their bra
 flatten_impacts = ["high"]
 
 [impact]
-block = ["high", "medium", "unknown"]  # impacts that open a blackout window ("low" is recorded only)
+block = ["high", "medium", "unknown", "low"]  # every impact blocks: an impact label never removes a blackout
 
 [unknown_impact]                       # relevant-region events that cannot be classified (floor 30/30)
 before_minutes = 30
@@ -154,26 +154,26 @@ after_minutes = 15
 [events.trade_balance]
 patterns = ["international trade in goods", "advance economic indicators"]
 impact = "medium"
-before_minutes = 10
-after_minutes = 10
+before_minutes = 30
+after_minutes = 30
 
 [events.durable_goods]
 patterns = ["durable goods"]
 impact = "medium"
-before_minutes = 10
-after_minutes = 10
+before_minutes = 30
+after_minutes = 30
 
 [events.housing_starts]
 patterns = ["new residential construction", "housing starts"]
 impact = "medium"
-before_minutes = 10
-after_minutes = 10
+before_minutes = 30
+after_minutes = 30
 
 [events.new_home_sales]
 patterns = ["new residential sales", "new home sales"]
 impact = "medium"
-before_minutes = 10
-after_minutes = 10
+before_minutes = 30
+after_minutes = 30
 
 [events.jolts]
 patterns = ["job openings and labor turnover", "\\bjolts\\b"]
@@ -181,30 +181,31 @@ impact = "medium"
 before_minutes = 15
 after_minutes = 15
 
-# Lower-impact releases: recorded, no window (impact "low" is not in [impact] block).
+# Lower-impact releases: impact "low" is informational only; like every non-mandatory
+# category they block at least 30 min before and after (non-negotiable floor).
 [events.construction_spending]
 patterns = ["construction spending"]
 impact = "low"
-before_minutes = 0
-after_minutes = 0
+before_minutes = 30
+after_minutes = 30
 
 [events.wholesale_trade]
 patterns = ["wholesale trade", "wholesale inventories"]
 impact = "low"
-before_minutes = 0
-after_minutes = 0
+before_minutes = 30
+after_minutes = 30
 
 [events.factory_orders]
 patterns = ["manufacturers' shipments, inventories", "factory orders"]
 impact = "low"
-before_minutes = 0
-after_minutes = 0
+before_minutes = 30
+after_minutes = 30
 
 [events.business_formation]
 patterns = ["business formation"]
 impact = "low"
-before_minutes = 0
-after_minutes = 0
+before_minutes = 30
+after_minutes = 30
 
 [events.minor_statistics]              # structural / annual statistics listed in the BEA and Census calendars
 patterns = ["satellite account", "multinational enterprises", "direct investment by country",
@@ -215,13 +216,14 @@ patterns = ["satellite account", "multinational enterprises", "direct investment
             "state personal income", "personal income by state", "consumer spending by state", "by county",
             "quarterly financial report"]
 impact = "low"
-before_minutes = 0
-after_minutes = 0
+before_minutes = 30
+after_minutes = 30
 
-[events.unexpected]                    # unexpected official announcements (window starts when they become known)
+[events.unexpected]                    # unexpected official announcements (window starts when they become known;
+                                       # "before" cannot apply to the past but the 30/30 floor is kept uniform)
 patterns = []
 impact = "high"
-before_minutes = 0
+before_minutes = 30
 after_minutes = 30
 
 [instruments.MES]

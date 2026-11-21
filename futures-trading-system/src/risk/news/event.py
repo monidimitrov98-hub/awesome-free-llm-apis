@@ -171,6 +171,9 @@ class EventRecord:
     forecast: str | None = None
     actual: str | None = None
     provenance: Provenance = Provenance.UNKNOWN
+    # every OTHER category that also applies to this event (name patterns or explicit hint);
+    # the blackout uses the most conservative window over category + alt_categories
+    alt_categories: tuple[str, ...] = ()
 
     @property
     def time_known(self) -> bool:
@@ -187,6 +190,7 @@ class EventRecord:
         for k in ("scheduled_at", "known_at", "updated_at"):
             d[k] = None if d[k] is None else d[k].isoformat()
         d["event_date"] = None if self.event_date is None else self.event_date.isoformat()
+        d["alt_categories"] = list(self.alt_categories)
         for k in ("status", "impact", "reliability", "provenance"):
             d[k] = str(d[k])
         return d
@@ -242,6 +246,14 @@ def parse_record(raw: Mapping[str, Any], *, source: str, reliability: Reliabilit
         raise EventDataError(f"{name}: known_at {k_at} is after the time it was received ({known_at})")
     category, impact = classify(name, region, clean_text(raw.get("category"), "category"),
                                 clean_text(raw.get("impact"), "impact"))
+    # conflicting/ambiguous classification: keep every applicable category (name matches and the
+    # explicit hint), so an explicit or custom category can never remove stronger protection
+    alts = tuple(c for c in dict.fromkeys(getattr(classify, "matches", lambda n: [])(name)) if c != category)
+    rank = {Impact.LOW: 0, Impact.UNKNOWN: 1, Impact.MEDIUM: 2, Impact.HIGH: 3}
+    for c in alts:
+        other = classify.impact_of(c)
+        if rank[other] > rank[impact]:
+            impact = other
     sid = clean_text(raw.get("source_event_id"), "source_event_id") or ""
     if provenance is None:
         try:
@@ -260,7 +272,7 @@ def parse_record(raw: Mapping[str, Any], *, source: str, reliability: Reliabilit
         updated_at=parse_time(raw["updated_at"], "updated_at") if raw.get("updated_at") else None,
         previous=clean_text(raw.get("previous"), "previous", limit=40),
         forecast=clean_text(raw.get("forecast"), "forecast", limit=40),
-        actual=clean_text(raw.get("actual"), "actual", limit=40), provenance=provenance)
+        actual=clean_text(raw.get("actual"), "actual", limit=40), provenance=provenance, alt_categories=alts)
     if rec.actual is not None and (rec.scheduled_at is None or rec.known_at < rec.scheduled_at):
         raise EventDataError(f"{name}: an actual value cannot be known before the release time")
     return rec

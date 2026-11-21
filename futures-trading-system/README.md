@@ -1085,9 +1085,17 @@ can tighten the filter but not weaken it:
   the before and after side, including instrument overrides. The minimum is enforced when the
   config loads (weaker values are refused) and again whenever a window is computed (a config
   built in code is clamped up to it). The members of one release (CPI/Core CPI, PCE/Core PCE,
-  NFP/unemployment rate, FOMC decision/statement) all get the widest window in the group. An
-  unclassified relevant event, or a category without a definition, falls back to at least
-  30/30 minutes.
+  NFP/unemployment rate, FOMC decision/statement) all get the widest window in the group.
+- **Non-mandatory categories.** Custom, additional, unclassified or undefined categories,
+  including overrides, have a non-negotiable minimum of **30 minutes before and 30 after**. It
+  is enforced at load time and again in the final window calculation. An impact label (for
+  example "low") never removes a blackout: every relevant event blocks, and `[impact] block`
+  must list every impact.
+- **Conflicts and ambiguity.** Each event keeps every category that applies to it: its name
+  matches plus any explicit category. The blackout is the most conservative window across
+  them, so a custom or wrongly assigned category can never replace a mandatory release's
+  stronger window. An invalid classification (unknown category or impact) fails the refresh,
+  and new entries stay blocked.
 - **Classification.** Mandatory categories are classified before any other category, and every
   canonical release name ("Consumer Price Index", "Employment Situation", "FOMC Statement", ...)
   must still classify into its mandatory category. Removed patterns or alias categories that
@@ -1128,9 +1136,12 @@ execution bar.
 | PPI, GDP, Retail sales, Treasury refunding, JOLTS | 15 min | 15 min | medium |
 | ISM manufacturing / services | 10 min | 15 min | medium |
 | Initial jobless claims | 5 min | 10 min | medium |
-| Unclassified relevant event (unknown impact) | 30 min | 30 min | unknown |
+| Every non-mandatory category (custom, additional, "low impact") and unclassified event | 30 min | 30 min | any |
 
-The shipped configuration uses exactly these minimums. They are conservative policy floors,
+The shipped configuration uses exactly these minimums. Because every non-mandatory release
+also blocks 30/30, the verified BEA/Census calendars add about 130 extra one-hour blackouts per
+year. Most are 09:30-10:30 ET around 10:00 releases (construction, wholesale, factory orders,
+housing, durable goods, trade, structural statistics). They are conservative policy floors,
 not optimised or proven values; widening them is allowed.
 | Event without a confirmed time | whole New York day | | |
 | Unexpected official announcement | from when it became known | 30 min | high |

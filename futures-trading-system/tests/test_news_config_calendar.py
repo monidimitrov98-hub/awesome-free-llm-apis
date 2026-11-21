@@ -50,7 +50,7 @@ def write(tmp_path, text):
     ("max_age_minutes = 1440", "max_age_minutes = nan", "finite"),
     ('impact = "high"\nbefore_minutes = 30\nafter_minutes = 30\n\n[events.core_cpi]',
      'impact = "severe"\nbefore_minutes = 30\nafter_minutes = 30\n\n[events.core_cpi]', "events.cpi"),
-    ('block = ["high", "medium", "unknown"]', 'block = ["high", "medium"]', "unknown"),
+    ('block = ["high", "medium", "unknown", "low"]', 'block = ["high", "medium", "low"]', "block"),
     ('on_integrity_failure = "block_entries"', 'on_integrity_failure = "allow_entries"', "block_entries"),
     ('mode = "enforce"', 'mode = "bypass"', "mode"),
     ("recovery_successes = 1", "recovery_successes = 0", "recovery"),

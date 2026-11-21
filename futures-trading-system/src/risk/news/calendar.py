@@ -206,6 +206,7 @@ class CalendarStore:
                     e["date"] = e.pop("event_date")
                 if e.get("category") == "unclassified":
                     e.pop("category")
+                e.pop("alt_categories", None)  # derived again from the name by the classifier
                 rec = parse_record(e, source=source, reliability=rel, known_at=known, classify=classify)
                 store.add(rec)
         except (EventDataError, KeyError, ValueError, TypeError) as exc:

@@ -70,7 +70,10 @@ CANONICAL_NAMES = {
     "jobless_claims": ("Unemployment Insurance Weekly Claims", "Initial Jobless Claims"),
     "jolts": ("Job Openings and Labor Turnover Survey", "JOLTS"),
 }
-UNKNOWN_FLOOR = (_M(30), _M(30))  # documented conservative fallback for relevant unclassified events
+# Minimum (before, after) for EVERY non-mandatory category: custom, additional, unclassified,
+# undefined. Configuration may widen it, never narrow it.
+UNKNOWN_FLOOR = (_M(30), _M(30))
+CUSTOM_FLOOR = UNKNOWN_FLOOR
 MAX_CALENDAR_AGE = pd.Timedelta(days=3)
 MIN_LOOKAHEAD = pd.Timedelta(minutes=60)
 MAX_MANUAL_AGE = pd.Timedelta(days=14)
@@ -196,12 +199,9 @@ class NewsConfig:
         before = after = pd.Timedelta(0)
         for cat in group:
             b, a = self._configured(root, cat)  # unclassified/undefined -> [unknown_impact] windows
-            if cat in MANDATORY_WINDOWS:
-                floor = MANDATORY_WINDOWS[cat]
-            elif cat in self.events:
-                floor = (pd.Timedelta(0), pd.Timedelta(0))  # optional category: its configured window
-            else:
-                floor = UNKNOWN_FLOOR  # no definition: conservative documented fallback, never weaker
+            # mandatory: its category-specific floor; anything else (custom, additional, unknown,
+            # undefined): the 30/30 floor -- regardless of configuration
+            floor = MANDATORY_WINDOWS.get(cat, UNKNOWN_FLOOR)
             before, after = max(before, b, floor[0]), max(after, a, floor[1])
         return before, after
 
@@ -473,6 +473,18 @@ def _safety_floors(c: NewsConfig) -> None:
                                   f"mandatory minimum {_mins(MANDATORY_WINDOWS[cat][0])}/{_mins(MANDATORY_WINDOWS[cat][1])}")
     if c.unknown_before < UNKNOWN_FLOOR[0] or c.unknown_after < UNKNOWN_FLOOR[1]:
         raise ConfigError("[unknown_impact] before/after must each be >= 30 min")
+    for cat, rule in c.events.items():
+        if cat not in MANDATORY_WINDOWS and (rule.before < CUSTOM_FLOOR[0] or rule.after < CUSTOM_FLOOR[1]):
+            raise ConfigError(f"[events.{cat}] window {_mins(rule.before)}/{_mins(rule.after)} min is below the mandatory "
+                              "minimum 30 min before / 30 min after for non-mandatory categories")
+    for root, inst in c.instruments.items():
+        for cat, (b, a) in inst["overrides"].items():
+            if cat not in MANDATORY_WINDOWS and (b < CUSTOM_FLOOR[0] or a < CUSTOM_FLOOR[1]):
+                raise ConfigError(f"[instruments.{root}.overrides] {cat} window {_mins(b)}/{_mins(a)} min is below the "
+                                  "mandatory minimum 30/30 for non-mandatory categories")
+    if set(c.block_impacts) != set(Impact):
+        raise ConfigError("[impact] block must list every impact (high, medium, unknown, low): an impact label "
+                          "never removes a blackout")
     _check_classification(c)
     if c.max_age > MAX_CALENDAR_AGE:
         raise ConfigError("[calendar] max_age_minutes cannot exceed 4320 (3 days)")
