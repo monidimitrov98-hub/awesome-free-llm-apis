@@ -90,7 +90,8 @@ class PaperSession:
         self.clock = clock
         self._flatten_cache: dict[pd.Timestamp, pd.Timestamp] = {}
         self.sleeper = sleeper or time.sleep
-        self.validator = EventValidator(self.specs, self.session, max_jump_ticks=pcfg.max_price_jump_ticks)
+        self.validator = EventValidator(self.specs, self.session, max_jump_ticks=pcfg.max_price_jump_ticks,
+                                        max_spread_ticks=pcfg.max_spread_ticks, max_future_skew=pcfg.max_future_skew)
         self.health = DataHealth(self.roots, pcfg.stale_after, pcfg.resume_after_events)
         self.account = PaperAccount(bt, self.specs, self.session)
         self.broker = PaperBroker(bt, self.specs, participation=pcfg.limit_participation,
@@ -128,6 +129,7 @@ class PaperSession:
         self._diag_pos = {r: 0 for r in self.roots}
         self._gate_pos = {r: 0 for r in self.roots}
         self._events_since_snapshot = 0
+        self._journaled_peaks: tuple[float, float] | None = None
         self.stopped_reason: str | None = None
         self.clean_shutdown = False
         self._recover_or_init()
@@ -180,6 +182,11 @@ class PaperSession:
         n = self.journal.verify()
         snap = self.journal.latest_snapshot()
         if n == 0 and snap is None:
+            if not getattr(self.journal, "created", False):
+                # an existing state file with no journal and no snapshot is never silently treated as a
+                # new account: that would reset the balance, drawdown peak, breach and locks
+                raise RecoveryError("existing paper state has an empty journal and no snapshot (truncated or "
+                                    "tampered); refusing to start a fresh account on it")
             for r in self.roots:
                 self.builders[r] = BarBuilder(r, self._warmup.get(r))
             self._journal("session_created", {"run_kind": self.run_kind, "instruments": self.roots,
@@ -231,18 +238,23 @@ class PaperSession:
         self.journal.commit()
 
     def _protect_restored_positions(self, now: pd.Timestamp) -> None:
-        """A restored position must never stay unprotected: re-create its stop-loss from the trade
-        record, or (no known stop) flatten it on the next market event."""
+        """A restored (or interrupted) position must never stay unprotected: every contract needs a
+        working stop-loss on the closing side. Missing cover is re-created from the trade record's stop,
+        or (no known stop) the position is flattened on the next market event."""
         for r in self.roots:
             q = self.account.position_qty(r)
-            if q == 0 or self.broker.working(r, ("stop_loss",)):
+            if q == 0:
+                continue
+            covered = sum(o.remaining for o in self.broker.working(r, ("stop_loss",)) if o.is_buy == (q < 0))
+            missing = abs(q) - covered
+            if missing <= 0:
                 continue
             t = self.account.open_trades.get(r)
             if t is not None and t.stop_loss is not None:
-                o = PaperOrder(self.broker.new_id("S"), r, "stop_loss", "stop", q < 0, abs(q), now, self.seq,
+                o = PaperOrder(self.broker.new_id("S"), r, "stop_loss", "stop", q < 0, missing, now, self.seq,
                                stop_price=t.stop_loss, session_date=t.session_date, tag="restart_protection")
                 self.broker.submit(o, now)
-                self._journal("protective_stop_restored", {"root": r, "quantity": abs(q), "stop": t.stop_loss}, now)
+                self._journal("protective_stop_restored", {"root": r, "quantity": missing, "stop": t.stop_loss}, now)
             else:
                 self.flatten(r, "restart_unprotected_position", now)
 
@@ -301,7 +313,65 @@ class PaperSession:
                 hw = max(hw, eq)
         if math.isfinite(hw) and a.high_water < hw - 1e-6:
             problems.append(f"high-water mark {a.high_water} below a journaled equity {hw}")
+        problems += self._reconcile_risk_state()
         problems = list(dict.fromkeys(problems))
+        return problems
+
+    def _reconcile_risk_state(self) -> list[str]:
+        """Replay the journal's executions through a fresh account and compare the protection state
+        (RiskManager days, consecutive losses, daily PnL, closed trades) with the restored one; check
+        that the emergency stop, daily-loss marks, flatten locks and the trailing peak recorded in the
+        journal survived. Detects a lost or edited protection state (bug or recomputed snapshot)."""
+        a, problems = self.account, []
+        shadow = PaperAccount(self.bt, self.specs, self.session)
+        for e in self.journal.entries("execution"):
+            ex = Execution.from_dict(e["payload"])
+            o = self.broker.orders.get(ex.order_id)
+            if o is None:
+                problems.append(f"execution {ex.exec_id} for an order that is not in the restored state")
+                continue
+            sd_ev = self.session_of(ex.ts)
+            sd = (o.session_date or sd_ev) if ex.role == "entry" else sd_ev
+            try:
+                shadow.apply(ex, sd, self.entry_meta.get(ex.order_id))
+            except AccountStateError as exc:
+                problems.append(f"executions cannot be replayed: {exc}")
+                return problems
+        days = lambda acc: {str(k.date()): (v.trades, round(v.realized_pnl, 6)) for k, v in acc.risk._days.items()
+                            if v.trades or v.realized_pnl}  # noqa: E731
+        if days(shadow) != days(a):
+            problems.append("RiskManager daily state differs from the journal's executions")
+        if shadow.risk._consecutive_losses != a.risk._consecutive_losses:
+            problems.append("consecutive-loss count differs from the journal's executions")
+        if {k: round(v, 6) for k, v in shadow.daily_net.items()} != {k: round(v, 6) for k, v in a.daily_net.items()}:
+            problems.append("daily net PnL differs from the journal's executions")
+        if len(shadow.closed_trades) != len(a.closed_trades):
+            problems.append("closed-trade count differs from the journal's executions")
+        if (list(self.journal.entries("emergency_stop")) or any(
+                e["payload"].get("reason") == "emergency_stop" for e in self.journal.entries("flatten_requested"))) \
+                and not a.risk.emergency_active:
+            problems.append("journal records an emergency stop but the restored RiskManager is not stopped")
+        for e in self.journal.entries("daily_loss_limit"):
+            if not a.risk.daily_loss_breached(pd.Timestamp(e["payload"]["session_date"])):
+                problems.append("journal records a daily-loss breach that the restored RiskManager lost")
+        for e in self.journal.entries("account_guard"):
+            st = e["payload"].get("state")
+            if st == "flatten":
+                sd = self.session_of(pd.Timestamp(e["ts"]))
+                if sd is not None and sd == self.account_session and not a.guard.is_locked(sd):
+                    problems.append("journal records a flatten lock for this session that the restored guard lost")
+        for e in self.journal.entries("account_peak"):
+            p = e["payload"]
+            if a.guard.peak < p["guard_peak"] - 1e-6 or a.high_water < p["high_water"] - 1e-6:
+                problems.append("drawdown peak or high-water mark below a value recorded in the journal")
+                break
+        if a.guard.enabled and a.guard.rules.drawdown_type == "trailing_intraday":
+            for kind in ("account_guard", "account_update"):
+                for e in self.journal.entries(kind):
+                    eq = e["payload"].get("equity")
+                    if isinstance(eq, (int, float)) and math.isfinite(eq) and a.guard.peak < eq - 1e-6:
+                        problems.append("trailing drawdown peak below a journaled equity")
+                        break
         return problems
 
     def _snapshot(self, ts: pd.Timestamp) -> None:
@@ -324,6 +394,14 @@ class PaperSession:
         return False
 
     def run(self, *, max_batches: int | None = None, idle_sleep: float = 0.5, stop_when_exhausted: bool = True) -> str:
+        """Main loop. ANY unexpected exception (feed, strategy, clock-driven bars, shutdown) ends in
+        :meth:`_fatal` -- a journaled, fail-closed safe shutdown -- never in an unhandled crash."""
+        try:
+            return self._run(max_batches=max_batches, idle_sleep=idle_sleep, stop_when_exhausted=stop_when_exhausted)
+        except Exception as exc:  # noqa: BLE001
+            return self._fatal(exc, None)
+
+    def _run(self, *, max_batches: int | None, idle_sleep: float, stop_when_exhausted: bool) -> str:
         if not self.connect():
             self.shutdown("feed_unavailable")
             return "feed_unavailable"
@@ -369,6 +447,16 @@ class PaperSession:
         self._journal("system_error", {"error": f"{type(exc).__name__}: {str(exc)[:300]}",
                                        "event_id": getattr(ev, "event_id", None)})
         try:
+            # the failure may have interrupted the event between a fill and its bracket: no position
+            # may be left without a protective stop
+            self._protect_restored_positions(self.now())
+            self._flush_broker_log()
+        except Exception as exc2:  # noqa: BLE001
+            self._journal("protection_check_failed", {"error": f"{type(exc2).__name__}: {str(exc2)[:300]}"})
+        try:
+            if self.stopped_reason == "system_error":
+                raise RuntimeError("second fatal error")
+            self.stopped_reason = "system_error"
             self.shutdown("system_error")
         except Exception as exc2:  # noqa: BLE001
             self._journal("shutdown_failed", {"error": f"{type(exc2).__name__}: {str(exc2)[:300]}"})
@@ -376,7 +464,16 @@ class PaperSession:
         self.stopped_reason = "system_error"
         return "system_error"
 
+    def _journal_peaks(self) -> None:
+        """Record every new drawdown peak / high-water mark in the hash-chained journal (at most once
+        per batch), so a restored snapshot can never silently lower them."""
+        cur = (self.account.guard.peak, self.account.high_water)
+        if cur != self._journaled_peaks:
+            self._journal("account_peak", {"guard_peak": cur[0], "high_water": cur[1]})
+            self._journaled_peaks = cur
+
     def _commit(self) -> None:
+        self._journal_peaks()
         self._snapshot(self.now())
         try:
             self.journal.commit()
@@ -392,9 +489,11 @@ class PaperSession:
 
     # ------------------------------------------------------------------ per event
     def process_event(self, ev: MarketEvent) -> None:
-        v = self.validator.check(ev)
+        clock_now = self.clock() if self.clock is not None and self.feed.kind != "replay" else None
+        v = self.validator.check(ev, clock_now)
         if not v.ok:
-            self._journal("data_rejected", {"reason": v.reason, **ev.ref()}, ev.ts if ev.ts is not None else None)
+            ok_ts = isinstance(ev.ts, pd.Timestamp) and not pd.isna(ev.ts) and ev.ts.tzinfo is not None
+            self._journal("data_rejected", {"reason": v.reason, **ev.ref()}, ev.ts if ok_ts else None)
             return
         self.seq += 1
         self.last_event_ts = ev.ts if self.last_event_ts is None else max(self.last_event_ts, ev.ts)
@@ -500,10 +599,21 @@ class PaperSession:
                 reason = "account_protection_partial_equity"
         if a.risk.emergency_active:
             reason = reason or "emergency_stop"
-        if sd is not None and a.risk.config.tracks_unrealized_loss and any_pos and math.isfinite(eq):
-            open_pnl = a.unrealized() - sum(t.commission for t in a.open_trades.values())  # entry costs paid
-            if a.risk.check_daily_loss(sd, open_pnl) and a.risk.config.daily_loss_action == "flatten":
-                reason = reason or "daily_loss_limit"
+        if sd is not None and a.risk.config.tracks_unrealized_loss and any_pos:
+            paid = sum(t.commission for t in a.open_trades.values())  # entry costs already paid
+            if math.isfinite(eq):
+                was = a.risk.daily_loss_breached(sd)
+                if a.risk.check_daily_loss(sd, a.unrealized() - paid):
+                    if not was:
+                        self._journal("daily_loss_limit", {"session_date": str(sd.date())}, ev.ts)
+                    if a.risk.config.daily_loss_action == "flatten":
+                        reason = reason or "daily_loss_limit"
+            elif a.risk.config.max_daily_loss and a.risk.config.daily_loss_action == "flatten":
+                # an open position is unmarked: the KNOWN losses alone still enforce the limit (flatten
+                # only; the day is not marked from partial information)
+                known_open = a.known_equity() - a.initial_balance - a.net_realized - paid
+                if a.risk.daily_pnl(sd, known_open) <= -a.risk.config.max_daily_loss + 1e-9:
+                    reason = reason or "daily_loss_limit_partial_equity"
         if reason:
             self.flatten_all(reason, ev.ts)
         # session end: cancel entries and flatten before the session closes
@@ -641,15 +751,16 @@ class PaperSession:
         if info.get("reverse_first"):
             self.flatten(root, "reversal", ev.ts)
         otype = req.order_type.value
-        expire = ev.ts + self.bt.execution.max_fill_delay if req.order_type is OrderType.MARKET else self.flatten_time(sd)
+        expire = self.flatten_time(sd)
+        if req.order_type is OrderType.MARKET:
+            expire = min(expire, ev.ts + self.bt.execution.max_fill_delay)  # never beyond the session cutoff
         o = PaperOrder(self.broker.new_id("N"), root, "entry", otype, req.side is Side.LONG, info["quantity"], ev.ts,
                        self.seq, limit_price=info["price"] if otype == "limit" else None,
                        stop_price=info["price"] if otype == "stop" else None, expire_at=expire, client_id=req.client_id,
                        tag=req.tag, stop_loss=info["stop"], take_profit=info["target"],
                        reference_price=info["reference"], max_stop_distance=req.max_stop_distance,
                        min_stop_distance=req.min_stop_distance, min_reward_risk=req.min_reward_risk,
-                       risk_budget=info["risk_budget"], session_date=sd, signal_time=ev.ts)
-        self.authorizer.issue(o)
+                       risk_budget=info["risk_budget"], session_date=sd, signal_time=ev.ts, auth_token=info["token"])
         self.broker.submit(o, ev.ts)
         self.entry_meta[o.order_id] = {"stop_loss": info["stop"], "signal_id": req.client_id,
                                        "context": {k: _jsonable((regime_rec or {}).get(k)) for k in (

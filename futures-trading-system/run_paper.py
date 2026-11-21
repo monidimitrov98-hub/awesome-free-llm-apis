@@ -6,7 +6,8 @@ Examples:
     python run_paper.py --new-account --mode replay --bars MES=... MNQ=... --replay-start 2025-03-17 \\
         --news-calendar data/samples/SYNTHETIC_news_calendar.json --report output/paper/report.json
     python run_paper.py --mode paper --realtime-speed 60 --bars MNQ=... --replay-start ...   (simulated real time)
-    python run_paper.py --verify                       (verify journal + reconciliation of an existing account)
+    python run_paper.py --verify                       (verify the journal chain and snapshot binding; the full
+                                                        reconciliation runs at every start of a session)
 
 Modes: infrastructure_validation (never authorizes entries), replay (historical data; research
 NewsGuard with a point-in-time calendar), paper (operational NewsGuard; needs a live or simulated
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -77,6 +79,17 @@ def news_guards(mode, roots, ncfg, calendar_path):
     rep = readiness_report(ncfg, store, pd.Timestamp.now(tz="UTC"), classify)
     return ({r: NewsGuard(ncfg, store, r, operational=True) for r in roots},
             {"mode": "operational", "verdict": rep["verdict"], "findings": rep["findings"][:20]})
+
+
+def _json_safe(v):
+    """Standard JSON for reports: NaN / infinity (unknown values) become null."""
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if isinstance(v, dict):
+        return {str(k): _json_safe(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    return v
 
 
 def main(argv=None) -> int:
@@ -147,7 +160,7 @@ def main(argv=None) -> int:
     print(rep["disclaimer"])
     if a.report:
         a.report.parent.mkdir(parents=True, exist_ok=True)
-        a.report.write_text(json.dumps(rep, indent=2, default=str), encoding="utf-8")
+        a.report.write_text(json.dumps(_json_safe(rep), indent=2, default=str, allow_nan=False), encoding="utf-8")
     return 9 if outcome == "system_error" else 0
 
 

@@ -16,7 +16,7 @@ MODES = ("infrastructure_validation", "replay", "paper")
 SECTIONS = {
     "paper": {"mode", "instruments", "state_dir", "allow_reversal"},
     "data": {"stale_after_seconds", "resume_after_events", "reconnect_max_attempts", "reconnect_backoff_seconds",
-             "max_price_jump_ticks", "warmup_sessions"},
+             "max_price_jump_ticks", "warmup_sessions", "max_spread_ticks", "max_future_skew_seconds"},
     "execution": {"limit_participation", "quote_max_age_seconds"},
     "persistence": {"snapshot_every_events"},
     "shutdown": {"policy"},
@@ -39,6 +39,8 @@ class PaperConfig:
     snapshot_every_events: int
     shutdown_policy: str
     quote_max_age: pd.Timedelta = pd.Timedelta(seconds=5)
+    max_spread_ticks: int = 40
+    max_future_skew: pd.Timedelta = pd.Timedelta(seconds=5)
 
 
 def _pos(v, name, integer=False):
@@ -94,4 +96,6 @@ def load_paper_config(path: str | Path | None = None) -> PaperConfig:
                                        "[persistence] snapshot_every_events", True)),
         shutdown_policy=pol,
         quote_max_age=pd.Timedelta(seconds=_pos(raw["execution"].get("quote_max_age_seconds"),
-                                                "[execution] quote_max_age_seconds")))
+                                                "[execution] quote_max_age_seconds")),
+        max_spread_ticks=int(_pos(d.get("max_spread_ticks"), "[data] max_spread_ticks", True)),
+        max_future_skew=pd.Timedelta(seconds=_pos(d.get("max_future_skew_seconds"), "[data] max_future_skew_seconds")))

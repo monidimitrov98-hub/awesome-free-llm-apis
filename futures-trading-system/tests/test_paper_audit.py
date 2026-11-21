@@ -164,21 +164,28 @@ def test_direct_entry_submission_in_a_session_is_refused(tmp_path):
     assert s.account.position_qty("MES") == 0
 
 
+def _approved_entry(s, oid, **over):
+    """An entry built from a REAL approval of authorize_signal (the only way to obtain a token)."""
+    now, sd = s.last_event_ts, pd.Timestamp("2025-03-10")
+    d, info = s.authorizer.authorize_signal(long(stop=4990.0), "MES", now, sd, 5000.0)
+    assert d.allowed, d.reason
+    kw = dict(stop_loss=info["stop"], take_profit=info["target"], risk_budget=info["risk_budget"], session_date=sd,
+              expire_at=now + pd.Timedelta(minutes=1), auth_token=info["token"])
+    return PaperOrder(oid, "MES", "entry", "market", True, info["quantity"], now, s.seq, **(kw | over))
+
+
 def test_authorized_entry_with_altered_terms_or_reused_token_is_refused(tmp_path):
     s = started(tmp_path)
-    o = PaperOrder("N9", "MES", "entry", "market", True, 1, T("10:00"), 0, stop_loss=4990.0,
-                   session_date=pd.Timestamp("2025-03-10"))
-    s.authorizer.issue(o)
-    o.quantity = 50  # tampered after authorization
+    feed(s, path(T("10:00"), 6, FLAT))
+    o = _approved_entry(s, "N9")
+    o.quantity += 5  # tampered after authorization
     with pytest.raises(LifecycleError):
-        s.broker.submit(o, T("10:00"))
-    o2 = PaperOrder("N10", "MES", "entry", "market", True, 1, T("10:00"), 0, stop_loss=4990.0,
-                    session_date=pd.Timestamp("2025-03-10"))
-    s.authorizer.issue(o2)
-    s.broker.submit(o2, T("10:00"))
-    s.broker.orders.pop("N10")
-    with pytest.raises(LifecycleError):  # one token, one submission
-        s.broker.submit(o2, T("10:00"))
+        s.broker.submit(o, s.last_event_ts)
+    o2 = _approved_entry(s, "N10")
+    s.broker.submit(o2, s.last_event_ts)
+    o3 = replace(o2, order_id="N11", history=[])  # replay of the consumed token with identical terms
+    with pytest.raises(LifecycleError):
+        s.broker.submit(o3, s.last_event_ts)
 
 
 def test_fill_authorization_rechecks_mode_and_session_cutoff(tmp_path):
@@ -308,7 +315,7 @@ def test_snapshot_cannot_be_moved_to_another_journal(tmp_path):
 
 
 def test_keyed_snapshot_cannot_be_recomputed_without_the_key(tmp_path, monkeypatch):
-    monkeypatch.setenv(KEY_ENV, "audit-test-key")
+    monkeypatch.setenv(KEY_ENV, "audit-test-key-0123456789")
     s = started(tmp_path)
     feed(s, path(T("10:00"), 1, FLAT))
     s._commit()
@@ -321,7 +328,7 @@ def test_keyed_snapshot_cannot_be_recomputed_without_the_key(tmp_path, monkeypat
 def test_unkeyed_journal_is_refused_when_a_key_is_configured(tmp_path, monkeypatch):
     monkeypatch.delenv(KEY_ENV, raising=False)
     Journal(tmp_path / "j.db", create=True).close()
-    monkeypatch.setenv(KEY_ENV, "audit-test-key")
+    monkeypatch.setenv(KEY_ENV, "audit-test-key-0123456789")
     with pytest.raises(JournalError, match="NOT HMAC-protected"):
         Journal(tmp_path / "j.db")
 

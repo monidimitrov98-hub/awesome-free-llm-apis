@@ -183,6 +183,13 @@ def test_hmac_protected_journal(tmp_path, monkeypatch):
     with pytest.raises(JournalError, match="HMAC-protected"):
         Journal(tmp_path / "state.db")
     monkeypatch.setenv("FTS_JOURNAL_KEY", "x" * 40)
+    with pytest.raises(JournalError, match="does not match the key"):  # refused at open (key check)
+        Journal(tmp_path / "state.db")
+    import sqlite3
+    db = sqlite3.connect(tmp_path / "state.db")  # a journal without the key check: the chain still fails
+    db.execute("DELETE FROM meta WHERE k='key_check'")
+    db.commit()
+    db.close()
     with pytest.raises(JournalError, match="hash chain broken"):
         Journal(tmp_path / "state.db").verify()
     monkeypatch.setenv("FTS_JOURNAL_KEY", "k" * 40)

@@ -105,9 +105,17 @@ order has a unique id and a timestamped history.
 - **Brackets (OCO).** An entry fill creates or extends a stop-loss and take-profit. A partial
   exit shrinks the sibling; a complete exit cancels it. Exits never over-close: the broker
   tracks the position across all fills of one event.
-- **Entries need an authorization token.** The broker accepts an entry order only if the
-  EntryAuthorizer issued it, with unchanged terms, once. A direct `broker.submit` of an entry is
-  refused. Fill-time authorization also re-checks the run mode and the session-end cutoff.
+- **Entries need an authorization token.** Only an approved `authorize_signal` creates a token
+  (random, one-time, kept in memory, never persisted). The broker accepts an entry only with that
+  token, for the decision time it was approved at, with exactly the approved terms. The terms are
+  instrument, side, type, quantity, prices, bracket, risk budget, session and quality limits, and
+  the expiry may not be later than the session cutoff. A direct `broker.submit` of an entry is
+  refused. Before every fill the broker re-checks that the entry's terms have not changed since
+  it was accepted (the quantity may only shrink). No order can be submitted for an event that
+  was already processed. Fill-time authorization also re-checks the run mode and the session-end
+  cutoff.
+- **Fill-time refusal after a partial fill.** The filled part stays, protected by its bracket;
+  the remainder is cancelled.
 - **Synthetic bar paths.** When a stop and a target both lie inside one synthetic bar, the stop
   is assumed to fill first (worst case).
 
@@ -149,7 +157,10 @@ until a later commit succeeds.
 4. Reconcile positions, realized PnL, commissions and order fills against the journal's
    executions. Also check that every position has a working stop and that the AccountGuard peak
    is not below the initial balance. Also check that no drawdown breach, permanent lock or
-   high-water mark recorded in the journal was lost. Any mismatch blocks new entries.
+   high-water mark recorded in the journal was lost. Replay the journal's executions through a
+   fresh account and compare RiskManager days, consecutive losses, daily PnL and closed trades.
+   Check that a journaled emergency stop, daily-loss breach, flatten lock and peak (`account_peak`,
+   journaled whenever it rises) survived. Any mismatch blocks new entries.
 5. Cancel working entry orders. Protective orders stay working. A position without a working
    stop gets its stop-loss re-created from the trade record, or is flattened if no stop is known.
 6. Block new entries for the rest of the session in which the restart happened, because the
@@ -157,7 +168,10 @@ until a later commit succeeds.
 7. Never restore a price as live.
 
 **Refusals:**
-- A missing account is never recreated silently.
+- A missing account is never recreated silently. An existing state file with an empty journal
+  and no snapshot is refused (it is never treated as a new account).
+- `FTS_JOURNAL_KEY` must be at least 16 bytes. A key that differs from the one the journal was
+  created with is refused at open (key rotation is not supported).
 - `--new-account` never overwrites an existing one.
 - A stored account of another run kind is refused.
 
@@ -167,9 +181,11 @@ until a later commit succeeds.
 | --- | --- |
 | Disconnect | Journaled. Reconnect with back-off; after the attempts run out, safe shutdown. After reconnect, entries resume only after `resume_after_events` fresh events |
 | Stale data / data gap | Entries blocked (`market_data_stale`, `data_recovery_pending:*`) |
-| Invalid, duplicate or out-of-order events | Rejected and journaled, never used. Duplicates of the last timestamp stay duplicates after a restart |
-| Price jump beyond `max_price_jump_ticks` | Rejected; three consecutive consistent events confirm a new level (journaled `price_level_reset`), after which entries wait for fresh data |
-| Internal error | Journaled `system_error`; entries stop; safe shutdown; CLI exit code 9 |
+| Invalid, duplicate or out-of-order events | Rejected and journaled, never used. This covers non-finite numbers, unknown kinds, missing sizes and quotes wider than `max_spread_ticks`. Duplicates of the last timestamp stay duplicates after a restart |
+| Event stamped in the future (real-time feeds) | Rejected beyond `max_future_skew_seconds` of the clock; otherwise one bad timestamp would make every genuine later event look out of order |
+| Price jump beyond `max_price_jump_ticks` (any price of the event) | Rejected; three consecutive consistent events at distinct, increasing timestamps confirm a new level (journaled `price_level_reset`), after which entries wait for fresh data |
+| Internal error (event processing, feed, clock-driven bars, shutdown) | Journaled `system_error`; entries stop; every open position is checked for a full protective stop; safe shutdown; CLI exit code 9 |
+| Unmarked instrument | AccountGuard and the unrealized daily-loss limit flatten on the known losses alone |
 | Unknown marks | Equity unknown: entries blocked (`account_equity_unknown`) |
 | NewsGuard not ready | Entries blocked with `news_<state>` |
 | Persistence failure | Entries blocked until a commit succeeds |

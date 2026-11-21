@@ -24,8 +24,9 @@ class Pos:
         return self.q
 
 
-def mk(broker, role="entry", otype="market", buy=True, qty=1, seq=0, **kw):
-    o = PaperOrder(broker.new_id(), "MES", role, otype, buy, qty, t0, seq, **kw)
+def mk(broker, role="entry", otype="market", buy=True, qty=1, seq=None, **kw):
+    # like the runtime: an order is created while processing the broker's current event
+    o = PaperOrder(broker.new_id(), "MES", role, otype, buy, qty, t0, broker.seq if seq is None else seq, **kw)
     return broker.submit(o, t0)
 
 

@@ -26,6 +26,7 @@ only the first recorded rejection reason can differ.
 from __future__ import annotations
 
 import math
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -65,22 +66,40 @@ class EntryAuthorizer:
         self.system_state = system_state
         self.flatten_time = flatten_time
         self.allow_reversal = allow_reversal
-        self._issued: dict[str, tuple] = {}
+        # one-time approvals created ONLY by an approved authorize_signal: token -> approved terms
+        self._approved: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ authorization tokens
-    @staticmethod
-    def _fingerprint(o: PaperOrder) -> tuple:
-        return (o.root, o.role, o.order_type, o.is_buy, o.quantity, o.limit_price, o.stop_price, o.stop_loss,
-                o.take_profit, o.risk_budget, o.session_date)
-
-    def issue(self, o: PaperOrder) -> None:
-        """Record that THIS entry order (with exactly these terms) passed authorize_signal."""
-        self._issued[o.order_id] = self._fingerprint(o)
+    def _approve(self, root: str, req: OrderRequest, now: pd.Timestamp, session_date: pd.Timestamp,
+                 out: dict[str, Any]) -> str:
+        # an approval is only usable for the decision it was made for: older ones are dropped
+        self._approved = {k: v for k, v in self._approved.items() if v["now"] >= now}
+        token = secrets.token_hex(16)
+        self._approved[token] = {
+            "root": root, "now": now, "is_buy": req.side is Side.LONG, "order_type": req.order_type.value,
+            "quantity": out["quantity"], "price": out["price"], "stop_loss": out["stop"], "take_profit": out["target"],
+            "risk_budget": out["risk_budget"], "session_date": session_date,
+            "max_stop_distance": req.max_stop_distance, "min_stop_distance": req.min_stop_distance,
+            "min_reward_risk": req.min_reward_risk}
+        return token
 
     def check_token(self, o: PaperOrder) -> bool:
-        """Broker hook: an entry is accepted only once, only if issued here, only with unchanged terms."""
-        fp = self._issued.pop(o.order_id, None)
-        return fp is not None and fp == self._fingerprint(o)
+        """Broker hook. An entry is accepted only with a token that an APPROVED authorize_signal
+        created, only once, only for the decision time it was approved at, and only with exactly
+        the approved terms (instrument, side, type, quantity, prices, bracket, risk budget, session,
+        quality limits) and an expiry no later than the session-end cutoff."""
+        a = self._approved.pop(o.auth_token, None) if o.auth_token else None
+        if a is None or o.role != "entry" or o.created_at != a["now"]:
+            return False
+        t = a["order_type"]
+        expected = (a["root"], a["is_buy"], t, a["quantity"], a["price"] if t == "limit" else None,
+                    a["price"] if t == "stop" else None, a["stop_loss"], a["take_profit"], a["risk_budget"],
+                    a["session_date"], a["max_stop_distance"], a["min_stop_distance"], a["min_reward_risk"])
+        actual = (o.root, o.is_buy, o.order_type, o.quantity, o.limit_price, o.stop_price, o.stop_loss, o.take_profit,
+                  o.risk_budget, o.session_date, o.max_stop_distance, o.min_stop_distance, o.min_reward_risk)
+        if actual != expected:
+            return False
+        return o.expire_at is not None and o.expire_at <= self.flatten_time(a["session_date"])
 
     # ------------------------------------------------------------------ signal time
     def authorize_signal(self, req: OrderRequest, root: str, now: pd.Timestamp, session_date: pd.Timestamp | None,
@@ -158,6 +177,7 @@ class EntryAuthorizer:
         out.update(price=price, stop=stop, target=target, quantity=size.quantity, reference=ref,
                    risk_budget=(self.bt.sizing.risk_per_trade if self.bt.sizing.method == "risk" and req.quantity is None
                                 else None))
+        out["token"] = self._approve(root, req, now, session_date, out)
         return d, out
 
     # ------------------------------------------------------------------ fill time

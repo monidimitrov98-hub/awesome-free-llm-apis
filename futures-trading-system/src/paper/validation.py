@@ -9,6 +9,7 @@ against the processing clock by :class:`DataHealth`.
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,9 +58,12 @@ def _on_grid(price: float, tick: float) -> bool:
 
 class EventValidator:
     def __init__(self, specs: dict[str, ContractSpec], session: SessionConfig, *, dedupe_window: int = 200_000,
-                 max_jump_ticks: int = 400, level_confirm_events: int = 3) -> None:
+                 max_jump_ticks: int = 400, level_confirm_events: int = 3, max_spread_ticks: int = 40,
+                 max_future_skew: pd.Timedelta = pd.Timedelta(seconds=5)) -> None:
         self.level_confirm_events = level_confirm_events
-        self._candidate: dict[str, tuple[float, int]] = {}
+        self.max_spread_ticks = max_spread_ticks
+        self.max_future_skew = max_future_skew
+        self._candidate: dict[str, tuple[float, int, pd.Timestamp]] = {}
         self._ids_at_last: dict[str, set[str]] = {}
         self.specs = specs
         self.session = session
@@ -75,12 +79,23 @@ class EventValidator:
         self.rejected[reason] = self.rejected.get(reason, 0) + 1
         return ValidationResult(False, reason)
 
-    def check(self, ev: MarketEvent) -> ValidationResult:
+    def check(self, ev: MarketEvent, now: pd.Timestamp | None = None) -> ValidationResult:
+        """``now``: the processing clock for real-time feeds. An event stamped further than
+        ``max_future_skew`` in the future is rejected -- accepted, it would make every genuine later
+        event look out of order and blind the system (no marks, no protective stops)."""
         spec = self.specs.get(ev.root)
         if spec is None:
             return self._reject("unknown_instrument")
-        if ev.ts is None or pd.isna(ev.ts) or ev.ts.tzinfo is None:
+        if ev.kind not in ("trade", "quote"):
+            return self._reject("unknown_event_kind")
+        if not isinstance(ev.ts, pd.Timestamp) or pd.isna(ev.ts) or ev.ts.tzinfo is None:
             return self._reject("missing_timestamp")
+        if now is not None and ev.ts > now + self.max_future_skew:
+            return self._reject("timestamp_in_future")
+        numbers = (ev.last, ev.size, ev.bid, ev.ask, ev.bid_size, ev.ask_size)
+        if ev.size is None or any(x is not None and (isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x))
+               for x in numbers):
+            return self._reject("non_finite_number")
         key = f"{ev.root}:{ev.event_id}"
         if key in self._seen or ev.event_id in self._ids_at_last.get(ev.root, set()):
             return self._reject("duplicate_event")
@@ -98,18 +113,25 @@ class EventValidator:
             return self._reject("price_off_tick_grid")
         if ev.bid is not None and ev.ask is not None and ev.bid > ev.ask:
             return self._reject("crossed_quote")
+        if ev.bid is not None and ev.ask is not None and ev.ask - ev.bid > self.max_spread_ticks * spec.tick_size + 1e-9:
+            return self._reject("spread_too_wide")  # never priced against: a wide quote is not a market
         if ev.size < 0 or any(s is not None and s < 0 for s in (ev.bid_size, ev.ask_size)):
             return self._reject("negative_size")
         ref = self._last_price.get(ev.root)
         px = ev.last if ev.last is not None else (ev.bid + ev.ask) / 2
         level_reset = False
-        if ref is not None and abs(px - ref) > self.max_jump_ticks * spec.tick_size:
-            # A single outlier is rejected. A genuine move to a new level is accepted once
-            # ``level_confirm_events`` consecutive events agree on it -- otherwise one real gap would
-            # blind the system forever (no marks, protective stops never triggered).
+        limit = self.max_jump_ticks * spec.tick_size
+        if ref is not None and max(abs(p - ref) for p in prices) > limit:
+            # A single outlier is rejected (every price of the event is checked, not only the mid).
+            # A genuine move to a new level is accepted once ``level_confirm_events`` consecutive
+            # events at DISTINCT, increasing timestamps agree on it -- otherwise one real gap would
+            # blind the system forever. A burst of bad ticks with one timestamp never confirms.
             cand = self._candidate.get(ev.root)
-            n = cand[1] + 1 if cand and abs(px - cand[0]) <= self.max_jump_ticks * spec.tick_size else 1
-            self._candidate[ev.root] = (px, n)
+            if cand and abs(px - cand[0]) <= limit:
+                n = cand[1] + 1 if ev.ts > cand[2] else cand[1]
+            else:
+                n = 1
+            self._candidate[ev.root] = (px, n, ev.ts)
             if n < self.level_confirm_events:
                 return self._reject("implausible_price_jump")
             level_reset = True

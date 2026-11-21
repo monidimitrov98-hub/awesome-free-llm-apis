@@ -60,6 +60,7 @@ class PaperOrder:
     risk_budget: float | None = None
     session_date: pd.Timestamp | None = None
     signal_time: pd.Timestamp | None = None
+    auth_token: str | None = None        # entries: one-time EntryAuthorizer approval (never persisted as valid)
     state: PaperOrderState = PaperOrderState.ACCEPTED
     filled_qty: int = 0
     avg_fill_price: float | None = None

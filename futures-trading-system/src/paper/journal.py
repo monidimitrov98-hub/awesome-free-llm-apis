@@ -35,6 +35,8 @@ import pandas as pd
 
 KEY_ENV = "FTS_JOURNAL_KEY"
 SCHEMA = 1
+MIN_KEY_BYTES = 16
+_KEY_CHECK_MSG = b"FTS-journal-key-check-v1"
 
 
 class JournalError(RuntimeError):
@@ -53,7 +55,11 @@ class Journal:
             raise JournalError(f"no paper account at {self.path} (create one explicitly)")
         if exists and create:
             raise JournalError(f"a paper account already exists at {self.path}; refusing to overwrite it")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        env_key = os.environ.get(KEY_ENV)
+        if env_key is not None and len(env_key.encode()) < MIN_KEY_BYTES:
+            raise JournalError(f"{KEY_ENV} is set but shorter than {MIN_KEY_BYTES} bytes: refusing a weak key")
+        self.created = not exists   # only a journal created by THIS call may be initialized as a new account
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not exists:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(fd)
@@ -72,8 +78,12 @@ class Journal:
                                        close REAL, volume REAL, PRIMARY KEY (root, ts));
                 """)
                 self.db.execute("INSERT INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
-                self.db.execute("INSERT INTO meta VALUES ('keyed', ?)", ("1" if os.environ.get(KEY_ENV) else "0",))
+                self.db.execute("INSERT INTO meta VALUES ('keyed', ?)", ("1" if env_key else "0",))
+                if env_key:
+                    self.db.execute("INSERT INTO meta VALUES ('key_check', ?)",
+                                    (hmac.new(env_key.encode(), _KEY_CHECK_MSG, hashlib.sha256).hexdigest(),))
             keyed = self.db.execute("SELECT v FROM meta WHERE k='keyed'").fetchone()
+            key_check = self.db.execute("SELECT v FROM meta WHERE k='key_check'").fetchone()
         except sqlite3.DatabaseError as exc:
             raise JournalError(f"paper state database {self.path} is unreadable: {exc}") from exc
         if keyed is None:
@@ -85,6 +95,10 @@ class Journal:
             raise JournalError(f"{KEY_ENV} is set but this journal is NOT HMAC-protected: refusing it (an unkeyed "
                                "journal cannot prove it was not rewritten)")
         self._key = os.environ.get(KEY_ENV, "").encode() if self.keyed else b""
+        if self.keyed and key_check is not None and not hmac.compare_digest(
+                key_check[0], hmac.new(self._key, _KEY_CHECK_MSG, hashlib.sha256).hexdigest()):
+            raise JournalError(f"{KEY_ENV} does not match the key this journal was created with (key rotation is "
+                               "not supported: restore the original key)")
         row = self.db.execute("SELECT seq, hash FROM journal ORDER BY seq DESC LIMIT 1").fetchone()
         self.seq, self.last_hash = (row[0], row[1]) if row else (0, "GENESIS")
         self._pending: list[tuple] = []

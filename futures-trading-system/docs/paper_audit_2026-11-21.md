@@ -39,3 +39,35 @@ connection, no live data and no real order path was added.
 - AccountGuard, RiskManager and OOS protections: no rule was relaxed.
 - `PaperBroker.TRANSMITS_REAL_ORDERS = False`. There is no network code in `src/paper`, and
   `UnconfiguredLiveFeed` refuses to connect.
+
+## Second audit (starting commit `f31fbc3`)
+
+| ID | Severity | Finding | Fix |
+| --- | --- | --- | --- |
+| N5 | HIGH | Real-time feeds: one event stamped in the future made every genuine later event `out_of_order`. Marks froze, stops could not fire, and health still looked fresh. | `max_future_skew_seconds` against the clock. |
+| N6 | HIGH | A state file whose journal and snapshot rows were deleted restarted as a NEW account: balance, peak, breach and locks were reset. | Only a journal created by the same call can be initialized. An empty existing one is a `RecoveryError`. |
+| N1 | MEDIUM | `EntryAuthorizer.issue()` minted a token for any order. Terms that were not bound (expiry, activation sequence, quality limits) and any change after submission went unchecked. | Tokens are created only by an approved `authorize_signal` and bound to all approved terms and the decision time. The broker re-checks terms before every fill and refuses activation for processed events. |
+| N2 | MEDIUM | The unrealized daily-loss limit was skipped while an instrument was unmarked. | Known losses flatten (`daily_loss_limit_partial_equity`). |
+| N3 | MEDIUM | A wide quote (mid unchanged) priced fills: the jump check looked only at the mid and there was no spread limit. | Every price is checked, plus `max_spread_ticks`. |
+| N4 | MEDIUM | Malformed events crashed the session (infinite price, unknown kind, missing size) or were accepted (NaN size). | Rejected and journaled. |
+| N7 | MEDIUM | Exceptions outside per-event processing (feed, clock-driven bars, shutdown) escaped without a safe shutdown. A crash between a fill and its bracket left the position unprotected. | The whole loop is guarded. On a fatal error every position gets full stop cover. |
+| N8 | MEDIUM | Restart did not reconcile the RiskManager (daily trades and PnL, consecutive losses, daily-loss breach, emergency stop), flatten locks or the trailing peak against the journal. | Journal replay through a fresh account, plus checks against the journaled protection events. |
+| N10 | MEDIUM | A fill-time refusal of a partially filled entry raised `LifecycleError` (PARTIALLY_FILLED to REJECTED is not a valid transition), crashing the session. | The remainder is cancelled. |
+| N9 | LOW | A burst of agreeing bad ticks at one timestamp could confirm a price-level reset. | Confirmation needs distinct, increasing timestamps. |
+| N11 | LOW | Empty or weak keys were accepted, a wrong key reported "hash chain broken", and the state directory was 0755. | Minimum 16 bytes, key check at open, directory 0700. |
+| N12 | LOW | Take-profit exits were classified by the fill rule. The report file could contain non-standard `NaN`. `--verify` overstated what it checks. | Fixed. |
+
+### Remaining limitations
+
+- **Bad ticks.** Three agreeing bad ticks at distinct timestamps are still accepted as a new
+  price level. They are journaled and block entries until fresh data arrives, but marks,
+  protective fills and the AccountGuard see them.
+- **Rollback.** Replacing the state file with an older, internally consistent copy (a backup)
+  cannot be detected, even with HMAC. There is no external anchor.
+- **Keyed protection** depends on keeping `FTS_JOURNAL_KEY` secret. Key rotation is not supported.
+- **Session-end peak.** If an open position is unmarked at a session change, the end-of-day peak
+  update is skipped for that session.
+- **Bar replay** is not market execution. There is no depth or queue model, and the intrabar
+  order is assumed.
+- **NewsGuard.** The unresolved manual calendar blocks all paper entries.
+- **Live data.** No live market-data provider exists.

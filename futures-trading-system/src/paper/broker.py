@@ -75,6 +75,7 @@ class PaperBroker:
         self.specs = specs
         self.participation = participation
         self.orders: dict[str, PaperOrder] = {}
+        self._entry_terms: dict[str, tuple] = {}  # terms of each accepted entry, re-verified before every fill
         self.books: dict[str, Book] = {r: Book() for r in specs}
         self.seq = 0            # sequence number of the event being processed
         self._next = 1
@@ -97,6 +98,8 @@ class PaperBroker:
             raise LifecycleError(f"duplicate order id {order.order_id}")
         if order.quantity < 1:
             raise ValueError("order quantity must be >= 1")
+        if order.active_after_seq < self.seq:
+            raise LifecycleError(f"order {order.order_id} would be active for an already processed event; refused")
         if order.role == "entry" and not self.entry_token_check(order):
             raise LifecycleError(f"entry {order.order_id} was not issued by the EntryAuthorizer; refused")
         spec = self.specs[order.root]
@@ -106,8 +109,21 @@ class PaperBroker:
             if v is not None and (not math.isfinite(v) or v <= 0 or abs(v / tick - round(v / tick)) > 1e-6):
                 raise ValueError(f"{name} {v} is not a positive price on the tick grid")
         self.orders[order.order_id] = order
+        if order.role == "entry":
+            self._entry_terms[order.order_id] = (self._terms(order), order.quantity)
         self._log("submitted", order, when, details=order.to_dict())
         return order
+
+    @staticmethod
+    def _terms(o: PaperOrder) -> tuple:
+        return (o.root, o.is_buy, o.order_type, o.limit_price, o.stop_price, o.stop_loss, o.take_profit,
+                o.risk_budget, o.session_date, o.max_stop_distance, o.min_stop_distance, o.min_reward_risk,
+                o.active_after_seq, o.expire_at, o.created_at)
+
+    def _entry_unchanged(self, o: PaperOrder) -> bool:
+        """The entry still has exactly the terms it was accepted with (its quantity may only shrink)."""
+        got = self._entry_terms.get(o.order_id)
+        return got is not None and got[0] == self._terms(o) and o.quantity <= got[1]
 
     def cancel(self, order_id: str, when: pd.Timestamp, reason: str) -> bool:
         o = self.orders.get(order_id)
@@ -120,6 +136,14 @@ class PaperBroker:
     def reject(self, order: PaperOrder, when: pd.Timestamp, reason: str) -> None:
         order.transition(St.REJECTED, when, reason)
         self._log("rejected", order, when, reason=reason)
+
+    def _refuse(self, order: PaperOrder, when: pd.Timestamp, reason: str) -> None:
+        """A fill-time refusal: an untouched entry is rejected; a partially filled one keeps its filled
+        part (already protected by its bracket) and the remainder is cancelled -- never filled."""
+        if order.filled_qty > 0:
+            self.cancel(order.order_id, when, f"remainder_refused:{reason}")
+        else:
+            self.reject(order, when, reason)
 
     def working(self, root: str | None = None, roles: tuple[str, ...] | None = None) -> list[PaperOrder]:
         return [o for o in self.orders.values() if o.is_working and (root is None or o.root == root)
@@ -158,13 +182,16 @@ class PaperBroker:
                 continue
             qty, ref, base, reason, quote_based = res
             if o.role == "entry":
+                if not self._entry_unchanged(o):
+                    self._refuse(o, ev.ts, "entry_terms_changed_after_authorization")
+                    continue
                 dec = authorize_entry(o, base, qty, ev)
                 if not dec.approved:
-                    self.reject(o, ev.ts, dec.reason)
+                    self._refuse(o, ev.ts, dec.reason)
                     continue
                 if dec.quantity is not None and dec.quantity < qty:
                     if dec.quantity < 1:
-                        self.reject(o, ev.ts, dec.reason or "fill_quantity_zero")
+                        self._refuse(o, ev.ts, dec.reason or "fill_quantity_zero")
                         continue
                     o.quantity = o.filled_qty + dec.quantity
                     qty = dec.quantity
@@ -183,7 +210,7 @@ class PaperBroker:
         if not ev.synthetic_from_bars or ev.bar_low is None or ev.bar_high is None:
             return False
         for s in self.working(tp.root, ("stop_loss",)):
-            if s.oco_group == tp.oco_group and s.stop_price is not None:
+            if s.is_buy == tp.is_buy and s.stop_price is not None:  # any stop protecting the same position
                 if (not s.is_buy and ev.bar_low <= s.stop_price) or (s.is_buy and ev.bar_high >= s.stop_price):
                     return True
         return False

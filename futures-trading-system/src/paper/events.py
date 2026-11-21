@@ -41,7 +41,8 @@ class MarketEvent:
 
     def ref(self) -> dict[str, Any]:
         """Compact reference for the audit journal."""
-        return {"event_id": self.event_id, "root": self.root, "kind": self.kind, "ts": self.ts.isoformat()}
+        ts = self.ts.isoformat() if isinstance(self.ts, pd.Timestamp) and not pd.isna(self.ts) else str(self.ts)
+        return {"event_id": str(self.event_id)[:200], "root": str(self.root)[:20], "kind": str(self.kind)[:20], "ts": ts}
 
 
 def _num(v: Any, name: str, *, allow_none: bool = True) -> float | None:

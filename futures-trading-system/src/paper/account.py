@@ -152,7 +152,7 @@ class PaperAccount:
             risk = (abs(t.avg_entry - t.stop_loss) * spec.point_value * t.max_qty) if t.stop_loss else math.nan
             rec = {"root": ex.root, "side": t.side, "quantity": t.max_qty, "entry_time": t.entry_time.isoformat(),
                    "exit_time": ex.ts.isoformat(), "entry_price": t.avg_entry, "exit_price": ex.fill_price,
-                   "exit_reason": ex.reason if ex.role != "stop_loss" else "stop_loss",
+                   "exit_reason": ex.role if ex.role in ("stop_loss", "take_profit") else ex.reason,
                    "exit_role": ex.role, "gross_pnl": gross, "commission": t.commission, "slippage_cost": t.slippage,
                    "net_pnl": net, "r_multiple": net / risk if risk and math.isfinite(risk) and risk > 0 else math.nan,
                    "signal_id": t.signal_id, "session_date": str(t.session_date.date()) if t.session_date is not None else None,
