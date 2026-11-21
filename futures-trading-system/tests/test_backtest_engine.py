@@ -31,7 +31,7 @@ def test_long_market_take_profit_hand_calculated():
     # Signal on the 10:00 bar is known at 10:01 -> market fill at the 10:01 open + 1 tick.
     assert t.entry_time == ts("10:01") and t.entry_price == 5000.25 and t.entry_at_open
     assert t.exit_time == ts("10:02") and t.exit_price == 5010.0 and t.exit_reason == "take_profit"
-    assert t.gross_pnl == pytest.approx((5010 - 5000.25) * 5)  # 48.75
+    assert t.gross_pnl == pytest.approx((5010 - 5000) * 5)  # 50.0 before slippage and commission
     assert t.commission == 2.0
     assert t.net_pnl == pytest.approx(46.75)
     assert t.slippage_cost == pytest.approx(1.25)  # one tick on the entry
@@ -43,7 +43,7 @@ def test_long_market_take_profit_hand_calculated():
     assert res.metrics["final_equity"] == pytest.approx(10_046.75)
 
 
-@pytest.mark.parametrize("contract,base,expected_gross", [(MNQ, 20000, -21.0), (MES, 5000, -52.5)])
+@pytest.mark.parametrize("contract,base,expected_gross", [(MNQ, 20000, -20.0), (MES, 5000, -50.0)])
 def test_short_stop_loss_contract_specific(contract, base, expected_gross):
     rows = [("10:00", base, base + 0.5, base - 0.5, base), ("10:01", base, base + 5, base - 5, base + 2),
             ("10:02", base + 3, base + 12, base + 1, base + 11)]
@@ -52,10 +52,12 @@ def test_short_stop_loss_contract_specific(contract, base, expected_gross):
     t = only_trade(res)
     assert t.side == "short" and t.entry_price == base - 0.25  # sell at open - 1 tick
     assert t.exit_price == base + 10.25 and t.exit_reason == "stop_loss"  # buy stop + 1 tick
-    # 10.5 points against the short: MNQ 10.5 * $2 = -21, MES 10.5 * $5 = -52.5
+    # Before costs: 10 points against the short: MNQ 10 * $2 = -20, MES 10 * $5 = -50.
     assert t.gross_pnl == pytest.approx(expected_gross)
-    assert t.net_pnl == pytest.approx(expected_gross - 2.0)
-    assert t.r_multiple == pytest.approx((expected_gross - 2) / (10.25 * contract.point_value))
+    # Slippage 2 ticks = 0.5 points; commission $2. MNQ net -23, MES net -54.5.
+    assert t.slippage_cost == pytest.approx(0.5 * contract.point_value)
+    assert t.net_pnl == pytest.approx(expected_gross - 0.5 * contract.point_value - 2.0)
+    assert t.r_multiple == pytest.approx(t.net_pnl / (10.25 * contract.point_value))
 
 
 def test_zero_costs_gives_pure_price_pnl():
@@ -87,7 +89,8 @@ def test_stop_and_target_in_same_bar_is_ambiguous_worst_case():
     t = only_trade(_long_then(("10:02", 5002, 5012, 4988, 5005)))
     assert t.exit_reason == "stop_loss" and t.ambiguous
     assert t.exit_price == 4989.75  # stop 4990 - 1 tick, never the favorable target
-    assert t.gross_pnl == pytest.approx((4989.75 - 5000.25) * 5)
+    assert t.gross_pnl == pytest.approx((4990 - 5000) * 5)  # before slippage
+    assert t.net_pnl == pytest.approx((4989.75 - 5000.25) * 5 - 2)
 
 
 def test_gap_through_stop_fills_at_open():
@@ -119,7 +122,8 @@ def test_stop_entry_intrabar_conservative_on_entry_bar():
     assert t.entry_price == 5005.25 and not t.entry_at_open
     # Low 4995 may have come before or after the entry: assume the stop was hit, never credit the target.
     assert t.exit_reason == "stop_loss" and t.ambiguous and t.exit_price == 4997.75
-    assert t.gross_pnl == pytest.approx((4997.75 - 5005.25) * 5)  # -37.5
+    assert t.gross_pnl == pytest.approx((4998 - 5005) * 5)  # -35 before slippage
+    assert t.net_pnl == pytest.approx((4997.75 - 5005.25) * 5 - 2)  # -39.5
 
 
 def test_stop_entry_then_target_next_bar():
@@ -127,7 +131,8 @@ def test_stop_entry_then_target_next_bar():
     rows = [("10:00", 5000, 5001, 4999, 5000), ("10:01", 5000, 5006, 4999, 5005), ("10:02", 5005, 5011, 5004, 5010)]
     t = only_trade(run(rows, {"10:00": [req]})[0])
     assert (t.entry_price, t.exit_price, t.exit_reason) == (5005.25, 5010.0, "take_profit")
-    assert t.gross_pnl == pytest.approx(23.75)
+    assert t.gross_pnl == pytest.approx(25.0)  # (5010 - 5005) * 5 before slippage
+    assert t.net_pnl == pytest.approx(23.75 - 2)
 
 
 def test_stop_entry_gap_fills_at_open():

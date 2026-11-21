@@ -50,6 +50,7 @@ class SizingConfig:
     contracts: int = 1
     risk_per_trade: float = 0.0
     include_costs_in_risk: bool = True
+    fill_risk_policy: str = "reduce"  # "reduce" | "reject" (see engine: risk check at fill)
 
 
 @dataclass(frozen=True)
@@ -130,11 +131,15 @@ def load_backtest_config(path: str | Path | None = None) -> BacktestConfig:
     method = str(z.get("method", "fixed"))
     if method not in {"fixed", "risk"}:
         raise ConfigError("sizing.method must be 'fixed' or 'risk'")
+    fill_policy = str(z.get("fill_risk_policy", "reduce"))
+    if fill_policy not in {"reduce", "reject"}:
+        raise ConfigError("sizing.fill_risk_policy must be 'reduce' or 'reject'")
     sizing = SizingConfig(
         method=method,
         contracts=_number(z, "contracts", "sizing", kind=int, minimum=1),
         risk_per_trade=_number(z, "risk_per_trade", "sizing"),
         include_costs_in_risk=bool(z.get("include_costs_in_risk", True)),
+        fill_risk_policy=fill_policy,
     )
     if method == "risk" and sizing.risk_per_trade <= 0:
         raise ConfigError("sizing.risk_per_trade must be positive when method = 'risk'")

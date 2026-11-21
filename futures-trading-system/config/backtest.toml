@@ -46,10 +46,22 @@ contracts = 1
 risk_per_trade = 100.0
 # Add round-trip commission and slippage to the risk per contract (conservative).
 include_costs_in_risk = true
+# Risk-sized entries are re-checked at the ACTUAL fill price (gaps, stop/limit fills):
+#   "reduce" -> lower the quantity to floor(risk_per_trade / actual risk per contract);
+#               rejected if that is 0. Logged in result.adjustments. Never increased.
+#   "reject" -> reject the entry whenever the actual risk exceeds risk_per_trade.
+fill_risk_policy = "reduce"
 
 # Risk limits. A value of 0 disables a numeric limit. Prop-firm rules are NOT assumed.
 [risk]
-max_daily_loss = 300.0          # stop new entries once realized net daily PnL <= -this
+max_daily_loss = 300.0          # daily loss limit in dollars (net of costs), see basis/action below
+# "realized": closed trades only. "realized_and_unrealized": also the open position
+# (mark-to-market, minus its entry commission), evaluated on every execution bar.
+daily_loss_basis = "realized_and_unrealized"
+# With the unrealized basis, what happens to an open position when the limit is hit:
+#   "flatten"       -> closed like a protective stop at the limit price (gap: at the open)
+#   "block_entries" -> kept; only new entries are blocked for the rest of the day
+daily_loss_action = "flatten"
 max_daily_trades = 5            # entries per session date
 max_position_size = 2           # contracts
 max_consecutive_losses = 3      # losing trades in a row

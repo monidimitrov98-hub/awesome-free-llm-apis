@@ -103,6 +103,8 @@ class Order:
     take_profit: float | None = None
     filled_at: pd.Timestamp | None = None
     fill_price: float | None = None
+    risk_budget: float | None = None  # set when sized by the risk method; re-checked at fill
+    requested_quantity: int | None = None  # quantity before any reduction at fill
 
     @property
     def is_active(self) -> bool:
@@ -123,3 +125,4 @@ class Fill:
     commission: float
     slippage_cost: float
     bar_complete: bool
+    base_price: float = float("nan")  # fill price before slippage

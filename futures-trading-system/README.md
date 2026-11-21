@@ -260,6 +260,30 @@ execution bars (1m) ──► ExecutionEvent at bar open ──► housekeeping 
   a stop-loss inside the bar range is assumed hit (also flagged `ambiguous`).
 - Market entries fill at the open, so the rest of that bar can legitimately trigger the bracket.
 
+### Checks at the actual entry fill
+
+Signal-time checks can only use a reference price: the signal bar's close for market orders,
+or the order price otherwise. The next bar can open somewhere else. So when an entry would
+fill, the engine repeats three checks against the **simulated fill price** (slippage
+included) **before** opening anything:
+
+1. **Bracket validity.** A long needs `stop_loss < fill < take_profit`; a short needs
+   `take_profit < fill < stop_loss`. If a gap breaks this, adverse or favorable, the entry is
+   rejected with `invalid_bracket_at_fill` (stage `fill`). An invalid protective bracket is
+   never created, and no position is opened.
+2. **Risk budget**, for entries sized by `sizing.method = "risk"`. The actual risk per
+   contract is `|fill - stop_loss| × point value + round-trip commission + stop-exit
+   slippage`. Entry slippage is already inside the fill price, so it is not counted twice. If
+   `quantity × actual risk > risk_per_trade`, then `fill_risk_policy` decides:
+   - `"reduce"` (the default) lowers the quantity to `floor(risk_per_trade / actual risk)`
+     and logs the change in `result.adjustments`. The entry is rejected
+     (`risk_budget_exceeded_at_fill`) if that is 0.
+   - `"reject"` rejects the entry.
+
+   The quantity is never increased after a favorable gap. Quantities requested explicitly by
+   the strategy, and `fixed` sizing, have no risk budget and are not resized.
+3. **Risk engine:** trading windows, daily limits and position size are checked again.
+
 **Intraday flattening:** positions are closed at market and pending entries cancelled
 `flatten_minutes_before_session_end` before the session end. New entries are rejected from
 that point.
@@ -276,7 +300,8 @@ that point.
 `RiskManager.check_entry()` runs when the signal is processed **and again at fill time**.
 Exits are never blocked. Every limit is configurable in `[risk]`, and `0` disables a limit:
 
-- `max_daily_loss` and `daily_profit_target`: realized net PnL per trade date
+- `max_daily_loss`: see *Daily loss limit* below
+- `daily_profit_target`: realized net PnL per trade date
 - `max_daily_trades`: entries per trade date
 - `max_position_size`
 - `max_consecutive_losses`: a win resets the count; optionally it also resets daily
@@ -284,13 +309,71 @@ Exits are never blocked. Every limit is configurable in `[risk]`, and `0` disabl
 - `emergency_stop`: config flag or `activate_emergency_stop()`. It rejects all entries and
   flattens at the next bar open.
 
+#### Daily loss limit
+
+`daily_loss_basis` controls what counts towards the limit:
+- `"realized"`: closed trades only, net of all costs.
+- `"realized_and_unrealized"` (the shipped config): closed trades plus the open position:
+
+```
+daily PnL = realized net PnL of the trade date
+          + (price − average entry fill) × signed quantity × point value
+          − entry commission already paid for the open position
+```
+
+Entry slippage is already inside the average entry fill. Exit commission and exit slippage
+count only once they happen, and then they appear in the realized net PnL. Nothing is
+counted twice.
+
+**When it is evaluated:**
+- **Each signal and each entry-fill attempt:** the day must not be breached.
+- **Each execution bar while a position is open:** after that bar's fills, the daily PnL is
+  evaluated at the bar's most **adverse** price (low for a long, high for a short). If it
+  reaches `-max_daily_loss`, the trade date is marked breached. It **stays** breached even if
+  prices recover, and all new entries that day are rejected (`max_daily_loss`).
+
+**`daily_loss_action` decides what happens to an open position:**
+- `"flatten"`: the price at which the daily PnL reaches the limit acts as a protective stop.
+  It is rounded to the tick so it triggers no later than the limit. If the bar opens beyond
+  it, the fill is at the open. The exit reason is `daily_loss_limit`, and the bracket stop and
+  this level compete as two stops on the same side.
+- `"block_entries"`: the position is kept, and only new entries are blocked.
+
+Protective exits (stops, targets, strategy exits) are never blocked. The realized loss can
+exceed the limit by the exit commission, the exit slippage and any gap. The limit is a
+trigger, not a guaranteed maximum.
+
+The basis must be set explicitly. `RiskConfig()` built in code defaults to `"realized"` for
+backward compatibility; `config/backtest.toml` uses `"realized_and_unrealized"`.
+
 ### Metrics
 
-`net_profit`, `gross_profit`, `gross_loss`, `win_rate`, `profit_factor`, `average_win`,
-`average_loss`, `max_drawdown` (mark-to-market equity, including starting capital),
-`average_r_multiple` (trades with a stop), `expectancy`, `total_trades`, `long`/`short`
-breakdowns, `daily_pnl`, `equity`, total commission and slippage, and the number of ambiguous
-trades. All PnL figures are **net of commission and slippage**.
+"Gross" always means **before** commission and slippage. "Net" means **after** both.
+
+| Per trade | Definition |
+|---|---|
+| `gross_pnl` | (exit price − entry price) × direction × quantity × point value, using un-slipped prices |
+| `slippage_cost`, `commission`, `total_costs` | Entry + exit slippage, entry + exit commission, and their sum |
+| `net_pnl` | `gross_pnl − commission − slippage_cost` |
+
+| Metric | Definition |
+|---|---|
+| `gross_profit` / `gross_loss` | Sum of positive / negative `gross_pnl` (before costs) |
+| `gross_pnl_before_costs` | Sum of all `gross_pnl` |
+| `total_commission`, `total_slippage_cost`, `total_costs` | Cost totals |
+| `net_profit` | Sum of `net_pnl` (equals `gross_pnl_before_costs − total_costs`) |
+| win / loss | `net_pnl > 0` / `net_pnl < 0`, after costs. Breakeven trades count only in the totals |
+| `net_profit_of_winners` / `net_loss_of_losers` | Sum of `net_pnl` of wins / of losses |
+| `profit_factor` | `net_profit_of_winners / |net_loss_of_losers|`, after costs. inf with no losses, NaN with no trades |
+| `gross_profit_factor` | `gross_profit / |gross_loss|`, before costs |
+| `win_rate`, `average_win`, `average_loss` | Based on net results |
+| `expectancy` | `net_profit / total_trades` |
+| `average_r_multiple` | Mean of `net_pnl / initial risk`, over trades with a stop |
+| `max_drawdown`, `max_drawdown_pct` | Largest peak-to-trough fall of the mark-to-market equity, including the starting capital |
+| `daily_pnl` | `net_pnl` summed by exit trade date |
+
+A trade can be a gross profit and still a net loss once costs are deducted. The metrics keep
+both views.
 
 ### Using the engine
 
@@ -319,9 +402,13 @@ print(result.metrics); result.trades; result.equity; result.rejections
 - **Intrabar timing:** intrabar fill times are unknown inside a bar. `entry_time` and
   `exit_time` are the open of the execution bar (`*_at_open` says whether the fill was at the
   open). The fill-time risk check uses the bar's open time.
-- **Daily figures:** daily figures use the trade date of the exit. The daily-loss and
-  profit-target limits use **realized** PnL. Entries happen only when flat, so nothing is
-  unrealized at check time.
+- **Daily figures:** daily figures use the trade date of the exit.
+  - The profit target uses **realized** PnL.
+  - The daily-loss limit uses the configured basis. The shipped config includes unrealized
+    PnL, evaluated at each execution bar's most adverse price.
+- **Risk budget:** risk-sized entries are re-checked at the actual fill and reduced or
+  rejected, never increased. Exit gaps can still exceed the budget, because a stop is not a
+  guaranteed price.
 - **Positions:** one position at a time, no scaling in or out, and no reversal in one order.
   The `Position` class is general, but the engine limits it.
 - **Win/loss:** a trade with `net_pnl < 0` is a loss, `> 0` a win, and breakeven resets the
@@ -365,3 +452,8 @@ print(result.metrics); result.trades; result.equity; result.rejections
   model, and no prop-firm rules. The risk limits are generic.
 - **Backtest, exits:** the end of data closes any open position at the last close, and the
   run reports a warning.
+- **Backtest, daily loss:**
+  - The unrealized check uses the bar's extreme. Inside one bar the engine cannot tell whether
+    the extreme came before or after a take-profit, so it assumes the worst case.
+  - The exit commission and exit slippage are not part of the trigger, so the realized loss
+    can slightly exceed the limit.

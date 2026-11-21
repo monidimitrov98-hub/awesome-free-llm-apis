@@ -4,6 +4,23 @@ The :class:`RiskManager` can veto any entry before it is executed. The backtest
 engine asks it twice: when the strategy's signal is processed and again at the
 moment the order would fill. Exits are never blocked by risk limits.
 
+Daily loss
+----------
+``daily_loss_basis = "realized"`` counts closed trades only (net of all costs).
+``"realized_and_unrealized"`` also counts the open position:
+
+    daily PnL = realized net PnL of the day
+              + (mark - average entry fill) * signed qty * point value   (entry slippage
+                is already inside the average entry fill)
+              - entry commission already paid for the open position
+
+Exit commission and exit slippage are not counted until they happen (they then
+appear in the realized net PnL), so nothing is counted twice. Once the limit is
+reached for a session date the day is marked as breached and stays breached, even
+if prices recover. ``daily_loss_action`` decides what happens to an open position:
+``"flatten"`` closes it (the engine treats the limit like a protective stop) and
+``"block_entries"`` only blocks new entries.
+
 All limits are configurable; no prop-firm rules are assumed.
 """
 
@@ -51,6 +68,18 @@ class RiskConfig:
     daily_profit_target: float = 0.0
     trading_windows: tuple[TradingWindow, ...] = ()
     emergency_stop: bool = False
+    daily_loss_basis: str = "realized"  # "realized" | "realized_and_unrealized"
+    daily_loss_action: str = "flatten"  # "flatten" | "block_entries" (unrealized basis only)
+
+    def __post_init__(self) -> None:
+        if self.daily_loss_basis not in {"realized", "realized_and_unrealized"}:
+            raise ConfigError("risk.daily_loss_basis must be 'realized' or 'realized_and_unrealized'")
+        if self.daily_loss_action not in {"flatten", "block_entries"}:
+            raise ConfigError("risk.daily_loss_action must be 'flatten' or 'block_entries'")
+
+    @property
+    def tracks_unrealized_loss(self) -> bool:
+        return bool(self.max_daily_loss) and self.daily_loss_basis == "realized_and_unrealized"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RiskConfig":
@@ -72,6 +101,8 @@ class RiskConfig:
             daily_profit_target=non_negative("daily_profit_target", float),
             trading_windows=tuple(TradingWindow.parse(w) for w in raw.get("trading_windows", [])),
             emergency_stop=bool(raw.get("emergency_stop", False)),
+            daily_loss_basis=str(raw.get("daily_loss_basis", "realized")),
+            daily_loss_action=str(raw.get("daily_loss_action", "flatten")),
         )
 
 
@@ -90,6 +121,7 @@ APPROVED = RiskDecision(True)
 class _DayState:
     realized_pnl: float = 0.0
     trades: int = 0
+    loss_limit_breached: bool = False
 
 
 @dataclass
@@ -139,6 +171,51 @@ class RiskManager:
         """Reject all further entries; the engine also flattens open positions."""
         self._emergency_reason = reason or "emergency stop"
 
+    def daily_pnl(self, session_date: pd.Timestamp, open_pnl: float = 0.0) -> float:
+        """Daily PnL on the configured basis. ``open_pnl`` = unrealized gross PnL at the
+        mark minus the entry commission already paid (ignored for the realized basis)."""
+        realized = self._day(session_date).realized_pnl
+        return realized + open_pnl if self.config.daily_loss_basis == "realized_and_unrealized" else realized
+
+    def daily_loss_breached(self, session_date: pd.Timestamp) -> bool:
+        return self._day(session_date).loss_limit_breached
+
+    def mark_daily_loss_breached(self, session_date: pd.Timestamp) -> None:
+        self._day(session_date).loss_limit_breached = True
+
+    def check_daily_loss(self, session_date: pd.Timestamp, open_pnl: float = 0.0) -> bool:
+        """Evaluate the daily loss limit; marks and returns True when it is reached."""
+        limit = self.config.max_daily_loss
+        if limit and self.daily_pnl(session_date, open_pnl) <= -limit + 1e-9:
+            self.mark_daily_loss_breached(session_date)
+        return self.daily_loss_breached(session_date)
+
+    def daily_loss_trigger_price(
+        self,
+        *,
+        session_date: pd.Timestamp,
+        is_long: bool,
+        quantity: int,
+        avg_price: float,
+        paid_costs: float,
+        point_value: float,
+        tick: float,
+    ) -> float | None:
+        """Price at which the open position brings the daily PnL to ``-max_daily_loss``.
+
+        Rounded to the tick so that it triggers no later than the limit (up for a
+        long, down for a short). None when the unrealized basis is not configured.
+        """
+        if not self.config.tracks_unrealized_loss or quantity <= 0:
+            return None
+        from src.backtest.execution import round_to_tick  # local import: risk must not depend on backtest at import
+
+        room = -self.config.max_daily_loss - self._day(session_date).realized_pnl + paid_costs
+        move = room / (quantity * point_value)  # <= 0 normally
+        if is_long:
+            return round_to_tick(avg_price + move, tick, "up")
+        return round_to_tick(avg_price - move, tick, "down")
+
     def on_entry_filled(self, session_date: pd.Timestamp) -> None:
         self._day(session_date).trades += 1
 
@@ -170,7 +247,7 @@ class RiskManager:
             if not any(w.contains(local) for w in c.trading_windows):
                 return RiskDecision(False, "outside_trading_window")
         day = self._day(session_date)
-        if c.max_daily_loss and day.realized_pnl <= -c.max_daily_loss:
+        if c.max_daily_loss and (day.loss_limit_breached or day.realized_pnl <= -c.max_daily_loss):
             return RiskDecision(False, "max_daily_loss")
         if c.daily_profit_target and day.realized_pnl >= c.daily_profit_target:
             return RiskDecision(False, "daily_profit_target")

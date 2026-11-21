@@ -15,7 +15,7 @@ def _trades():
     return pd.DataFrame({
         "side": ["long", "short", "long", "short"],
         "net_pnl": [100.0, -50.0, 30.0, -20.0],
-        "gross_pnl": [103.0, -47.0, 33.0, -17.0],
+        "gross_pnl": [103.25, -46.75, 33.25, -16.75],  # = net + 2.00 commission + 1.25 slippage
         "commission": [2.0, 2.0, 2.0, 2.0],
         "slippage_cost": [1.25, 1.25, 1.25, 1.25],
         "r_multiple": [2.0, -1.0, 0.6, float("nan")],
@@ -29,9 +29,13 @@ def test_hand_calculated_metrics():
     m, daily = compute_metrics(_trades(), eq, 10_000.0)
     assert m["total_trades"] == 4
     assert m["net_profit"] == pytest.approx(60.0)
-    assert m["gross_profit"] == pytest.approx(130.0) and m["gross_loss"] == pytest.approx(-70.0)
+    # gross uses the gross_pnl column (before costs): 103.25 + 33.25 and -46.75 - 16.75
+    assert m["gross_profit"] == pytest.approx(136.5) and m["gross_loss"] == pytest.approx(-63.5)
+    assert m["gross_profit_factor"] == pytest.approx(136.5 / 63.5)
+    assert m["gross_pnl_before_costs"] == pytest.approx(73.0) and m["total_costs"] == pytest.approx(13.0)
+    assert m["net_profit_of_winners"] == pytest.approx(130.0) and m["net_loss_of_losers"] == pytest.approx(-70.0)
     assert m["win_rate"] == pytest.approx(0.5)
-    assert m["profit_factor"] == pytest.approx(130 / 70)
+    assert m["profit_factor"] == pytest.approx(130 / 70)  # net, after costs
     assert m["average_win"] == pytest.approx(65.0) and m["average_loss"] == pytest.approx(-35.0)
     assert m["expectancy"] == pytest.approx(15.0)
     assert m["average_r_multiple"] == pytest.approx((2.0 - 1.0 + 0.6) / 3)  # NaN R excluded

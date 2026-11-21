@@ -16,6 +16,35 @@ At equal timestamps signal events are processed first, so an order created at ti
 T can only fill on an execution bar that opens at or after T: a signal computed at
 the close of bar k executes, at the earliest, at the open of the next bar.
 
+Checks at the actual entry fill
+-------------------------------
+Signal-time checks use a reference price (the signal bar close for market orders,
+the order price otherwise). When an entry would fill, the engine re-checks against
+the simulated fill price (slippage included) BEFORE opening anything:
+
+1. Bracket validity: a long needs ``stop_loss < fill < take_profit``, a short
+   ``take_profit < fill < stop_loss``. A gap that breaks this rejects the entry
+   (``invalid_bracket_at_fill``); an invalid protective bracket is never created.
+2. Risk budget (entries sized by ``sizing.method = "risk"``): the actual risk
+   ``qty * risk_per_contract(fill, stop)`` (round-trip commission and stop-exit
+   slippage included; entry slippage is inside the fill price) must not exceed
+   ``risk_per_trade``. ``sizing.fill_risk_policy = "reduce"`` lowers the quantity to
+   ``floor(risk_per_trade / risk_per_contract)`` (logged in ``adjustments``; rejected
+   if that is 0); ``"reject"`` rejects the entry. The quantity is never increased.
+3. The risk engine (windows, daily limits, size) is asked again.
+
+Daily loss with unrealized PnL
+------------------------------
+With ``risk.daily_loss_basis = "realized_and_unrealized"`` the limit is evaluated on
+every execution event while a position is open, at the bar's most adverse price
+(low for a long, high for a short), after this bar's fills. With
+``daily_loss_action = "flatten"`` the price at which the daily PnL reaches the limit
+is treated like a protective stop (gap rule: fill at the open if the bar opens
+beyond it; exit reason ``daily_loss_limit``). The bracket stop and this level are
+both stops on the same side, so whichever is closer to the market triggers first
+without ambiguity. With ``"block_entries"`` the position is kept but no new entry
+is allowed that day. Exits are never blocked.
+
 Ambiguity
 ---------
 OHLC bars do not tell the order of prices inside a bar. When a stop-loss and a
@@ -38,7 +67,7 @@ from src.backtest.execution import BarPrices, SimFill, conservative_order_price,
 from src.backtest.metrics import compute_metrics
 from src.backtest.orders import Fill, Order, OrderRequest, OrderRole, OrderStatus, OrderType, Side
 from src.backtest.position import Position
-from src.backtest.sizing import position_size
+from src.backtest.sizing import position_size, risk_per_contract
 from src.config import ContractSpec, SessionConfig
 from src.data.errors import DataError
 from src.data.sessions import session_bounds
@@ -61,6 +90,7 @@ class BacktestResult:
     daily_pnl: pd.Series
     metrics: dict[str, Any]
     warnings: list[str] = field(default_factory=list)
+    adjustments: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def _validate_bars(df: pd.DataFrame, name: str) -> None:
@@ -158,6 +188,7 @@ class _Simulation:
         self.fills: list[Fill] = []
         self.trades: list[dict[str, Any]] = []
         self.rejections: list[dict[str, Any]] = []
+        self.adjustments: list[dict[str, Any]] = []
         self.equity_rows: list[dict[str, Any]] = []
         self.warnings: list[str] = []
         self.realized_net = 0.0
@@ -176,10 +207,11 @@ class _Simulation:
     def _flatten_time(self, session_date: pd.Timestamp) -> pd.Timestamp:
         return self._session_end(session_date) - self.cfg.execution.flatten_before_session_end
 
-    def _new_order(self, **kwargs: Any) -> Order:
+    def _new_order(self, *, register: bool = True, **kwargs: Any) -> Order:
         order = Order(id=self._next_id, **kwargs)
         self._next_id += 1
-        self.orders.append(order)
+        if register:
+            self.orders.append(order)
         return order
 
     def _pending(self, roles: tuple[OrderRole, ...]) -> list[Order]:
@@ -301,7 +333,8 @@ class _Simulation:
             self._reject(now, "signal", "invalid_bracket", f"take_profit {target} not beyond entry {ref}")
             return
         size = position_size(self.cfg.sizing, self.spec, entry_price=ref, stop_loss=stop,
-                             requested=req.quantity, cost=self.cost, slippage=self.cfg.slippage)
+                             requested=req.quantity, cost=self.cost, slippage=self.cfg.slippage,
+                             order_type=req.order_type)
         if size.quantity < 1:
             self._reject(now, "signal", size.reason, req.tag)
             return
@@ -316,7 +349,10 @@ class _Simulation:
         self._new_order(role=OrderRole.ENTRY, order_type=req.order_type, is_buy=is_buy,
                         quantity=size.quantity, price=price, created_at=now, active_from=now,
                         signal_time=bar_time, session_date=session_date, expire_at=expire,
-                        tag=req.tag, stop_loss=stop, take_profit=target)
+                        tag=req.tag, stop_loss=stop, take_profit=target,
+                        risk_budget=(self.cfg.sizing.risk_per_trade
+                                     if self.cfg.sizing.method == "risk" and req.quantity is None else None),
+                        requested_quantity=size.quantity)
 
     def _submit_exit(self, now: pd.Timestamp, tag: str) -> None:
         if self.position.is_flat:
@@ -376,6 +412,12 @@ class _Simulation:
                 sim = self._simulate(o, bar)
                 if sim is None:
                     continue
+                problem = self._bracket_problem(o, sim.price)
+                if problem:
+                    self._reject(t, "fill", "invalid_bracket_at_fill", problem, order=o)
+                    continue
+                if not self._fit_risk_budget(o, sim.price, t):
+                    continue
                 decision = self.risk.check_entry(when=t, session_date=session_date, quantity=o.quantity)
                 if not decision.approved:
                     self._reject(t, "fill", decision.reason, o.tag, order=o)
@@ -385,7 +427,14 @@ class _Simulation:
 
         # 3. Exits for the open position.
         if self.open_trade is not None:
-            self._process_exits(t, bar, complete)
+            self._process_exits(t, bar, complete, session_date)
+
+        # 3b. Daily loss incl. unrealized PnL, evaluated at this bar's most adverse price.
+        if self.open_trade is not None and session_date is not None and self.cfg.risk.tracks_unrealized_loss:
+            worst = bar.low if self.position.quantity > 0 else bar.high
+            if self.risk.check_daily_loss(session_date, self._open_pnl(worst)):
+                self.warnings.append(f"{t}: daily loss limit reached with an open position "
+                                     f"(action: {self.cfg.risk.daily_loss_action})")
 
         # 4. Mark to market at this bar's close, recorded when the close is known.
         self._last_mark = bar.close
@@ -399,6 +448,42 @@ class _Simulation:
             "session_date": session_date,
         })
 
+    def _open_pnl(self, mark: float) -> float:
+        """Unrealized gross PnL at ``mark`` minus the entry commission already paid."""
+        assert self.open_trade is not None
+        return self.position.unrealized_pnl(mark) - self.open_trade.entry_fill.commission
+
+    def _bracket_problem(self, order: Order, fill_price: float) -> str:
+        """Why the order's bracket is invalid at ``fill_price`` ('' when valid)."""
+        sgn = 1 if order.is_buy else -1
+        if order.stop_loss is not None and (order.stop_loss - fill_price) * sgn >= 0:
+            return f"stop_loss {order.stop_loss} not beyond fill {fill_price}"
+        if order.take_profit is not None and (order.take_profit - fill_price) * sgn <= 0:
+            return f"take_profit {order.take_profit} not beyond fill {fill_price}"
+        return ""
+
+    def _fit_risk_budget(self, order: Order, fill_price: float, t: pd.Timestamp) -> bool:
+        """Apply sizing.fill_risk_policy at the actual fill. False when the entry is rejected."""
+        if order.risk_budget is None or order.stop_loss is None:
+            return True
+        z = self.cfg.sizing
+        per = risk_per_contract(self.spec, entry_price=fill_price, stop_loss=order.stop_loss, cost=self.cost,
+                                slippage=self.cfg.slippage, include_costs=z.include_costs_in_risk,
+                                entry_slippage_ticks=0)
+        if order.quantity * per <= order.risk_budget + 1e-9:
+            return True
+        detail = (f"actual risk {order.quantity} x {per:.2f} = {order.quantity * per:.2f} "
+                  f"> budget {order.risk_budget:.2f} at fill {fill_price}")
+        fitted = int(order.risk_budget // per + 1e-9) if per > 0 else 0
+        if z.fill_risk_policy == "reject" or fitted < 1:
+            self._reject(t, "fill", "risk_budget_exceeded_at_fill", detail, order=order)
+            return False
+        self.adjustments.append({"time": t, "order_id": order.id, "reason": "quantity_reduced_to_risk_budget",
+                                 "from_quantity": order.quantity, "to_quantity": fitted,
+                                 "risk_per_contract": per, "detail": detail})
+        order.quantity = fitted
+        return True
+
     def _simulate(self, order: Order, bar: BarPrices) -> SimFill | None:
         s = self.cfg.slippage
         ticks = {OrderType.MARKET: s.market_ticks, OrderType.STOP: s.stop_ticks, OrderType.LIMIT: s.limit_ticks}
@@ -410,7 +495,7 @@ class _Simulation:
         commission = self.cost.commission_per_contract_per_side * order.quantity
         slip_cost = abs(sim.price - sim.base_price) * order.quantity * self.spec.point_value
         fill = Fill(order.id, order.role, order.is_buy, order.quantity, sim.price, t, sim.at_open,
-                    commission, slip_cost, complete)
+                    commission, slip_cost, complete, base_price=sim.base_price)
         order.status, order.filled_at, order.fill_price = OrderStatus.FILLED, t, sim.price
         self.fills.append(fill)
         self.realized_net -= commission
@@ -432,7 +517,8 @@ class _Simulation:
         if order.take_profit is not None:
             self._new_order(role=OrderRole.TAKE_PROFIT, order_type=OrderType.LIMIT, price=order.take_profit, **common)
 
-    def _process_exits(self, t: pd.Timestamp, bar: BarPrices, complete: bool) -> None:
+    def _process_exits(self, t: pd.Timestamp, bar: BarPrices, complete: bool,
+                       session_date: pd.Timestamp | None) -> None:
         trade = self.open_trade
         assert trade is not None
         active = [o for o in self._pending(EXIT_ROLES) if o.active_from <= t]
@@ -443,6 +529,23 @@ class _Simulation:
         sl = next((o for o in active if o.role is OrderRole.STOP_LOSS), None)
         tp = next((o for o in active if o.role is OrderRole.TAKE_PROFIT), None)
         intrabar_entry_bar = trade.entry_fill.bar_time == t and not trade.entry_fill.at_open
+        stop_reason = "stop_loss"
+
+        # Daily-loss level as a protective stop; the closer of the two stops governs.
+        if (session_date is not None and self.cfg.risk.tracks_unrealized_loss
+                and self.cfg.risk.daily_loss_action == "flatten"):
+            level = self.risk.daily_loss_trigger_price(
+                session_date=session_date, is_long=self.position.quantity > 0,
+                quantity=abs(self.position.quantity), avg_price=self.position.avg_price,
+                paid_costs=trade.entry_fill.commission, point_value=self.spec.point_value,
+                tick=self.spec.tick_size)
+            long = self.position.quantity > 0
+            if level is not None and (sl is None or (level > sl.price if long else level < sl.price)):
+                sl = self._new_order(register=False, role=OrderRole.EXIT, order_type=OrderType.STOP,
+                                     is_buy=not long, quantity=abs(self.position.quantity), price=level,
+                                     created_at=t, active_from=t, signal_time=None,
+                                     session_date=trade.session_date, tag="daily_loss_limit")
+                stop_reason = "daily_loss_limit"
 
         sl_sim = self._simulate(sl, bar) if sl else None
         if sl_sim is not None and intrabar_entry_bar and sl_sim.at_open:
@@ -452,15 +555,20 @@ class _Simulation:
                              sl.price, False)
         tp_sim = None if (tp is None or intrabar_entry_bar) else self._simulate(tp, bar)
 
+        if sl_sim and stop_reason == "daily_loss_limit":
+            assert sl is not None
+            self.orders.append(sl)  # register the synthetic exit only when it fills
+            if session_date is not None:
+                self.risk.mark_daily_loss_breached(session_date)
         if sl_sim and tp_sim:
             if sl_sim.at_open:
-                self._close(sl, sl_sim, t, complete, "stop_loss", False)
+                self._close(sl, sl_sim, t, complete, stop_reason, False)
             elif tp_sim.at_open:
                 self._close(tp, tp_sim, t, complete, "take_profit", False)
             else:  # both inside the bar, order unknown -> worst case
-                self._close(sl, sl_sim, t, complete, "stop_loss", True)
+                self._close(sl, sl_sim, t, complete, stop_reason, True)
         elif sl_sim:
-            self._close(sl, sl_sim, t, complete, "stop_loss", intrabar_entry_bar)
+            self._close(sl, sl_sim, t, complete, stop_reason, intrabar_entry_bar)
         elif tp_sim:
             self._close(tp, tp_sim, t, complete, "take_profit", False)
 
@@ -485,7 +593,11 @@ class _Simulation:
             self._cancel(o, "oco_cancelled")
         entry = trade.entry_fill
         commission = entry.commission + fill.commission
-        net = gross - commission
+        slippage_cost = entry.slippage_cost + fill.slippage_cost
+        net = gross - commission  # `gross` from fill prices already includes slippage
+        gross_before_costs = ((fill.base_price - entry.base_price) * trade.side.sign
+                              * trade.quantity * self.spec.point_value)
+        assert abs(gross_before_costs - slippage_cost - commission - net) < 1e-6
         initial_risk = (abs(entry.price - trade.stop_loss) * trade.quantity * self.spec.point_value
                         if trade.stop_loss is not None else np.nan)
         exit_session = self._ex_session(t)
@@ -504,9 +616,10 @@ class _Simulation:
             "exit_reason": reason,
             "stop_loss": trade.stop_loss,
             "take_profit": trade.take_profit,
-            "gross_pnl": gross,
+            "gross_pnl": gross_before_costs,
             "commission": commission,
-            "slippage_cost": entry.slippage_cost + fill.slippage_cost,
+            "slippage_cost": slippage_cost,
+            "total_costs": commission + slippage_cost,
             "net_pnl": net,
             "initial_risk": initial_risk,
             "r_multiple": net / initial_risk if initial_risk and not np.isnan(initial_risk) else np.nan,
@@ -541,7 +654,7 @@ class _Simulation:
     def _result(self) -> BacktestResult:
         trade_cols = ["trade_id", "side", "quantity", "signal_time", "entry_order_type", "entry_time",
                       "entry_at_open", "entry_price", "exit_time", "exit_at_open", "exit_price", "exit_reason",
-                      "stop_loss", "take_profit", "gross_pnl", "commission", "slippage_cost", "net_pnl",
+                      "stop_loss", "take_profit", "gross_pnl", "commission", "slippage_cost", "total_costs", "net_pnl",
                       "initial_risk", "r_multiple", "ambiguous", "data_incomplete", "session_date",
                       "exit_session_date"]
         trades = pd.DataFrame(self.trades, columns=trade_cols)
@@ -550,5 +663,7 @@ class _Simulation:
         fills = pd.DataFrame([vars(f) | {"role": f.role.value} for f in self.fills])
         equity = pd.DataFrame(self.equity_rows).set_index("time") if self.equity_rows else pd.DataFrame()
         rejections = pd.DataFrame(self.rejections, columns=["time", "stage", "reason", "detail", "order_id"])
+        adjustments = pd.DataFrame(self.adjustments, columns=["time", "order_id", "reason", "from_quantity",
+                                                              "to_quantity", "risk_per_contract", "detail"])
         metrics, daily = compute_metrics(trades, equity, self.cfg.initial_capital)
-        return BacktestResult(trades, orders, fills, equity, rejections, daily, metrics, self.warnings)
+        return BacktestResult(trades, orders, fills, equity, rejections, daily, metrics, self.warnings, adjustments)

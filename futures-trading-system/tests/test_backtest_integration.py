@@ -40,9 +40,10 @@ def test_runs_and_is_internally_consistent(result):
     res, md = result
     t = res.trades
     assert len(t) > 0
-    # Accounting: equity once flat == capital + sum of net trade PnL; net = gross - commission.
+    # Accounting: equity once flat == capital + sum of net trade PnL;
+    # net = gross (before costs) - commission - slippage.
     assert res.equity["equity"].iloc[-1] == pytest.approx(10_000 + t.net_pnl.sum())
-    assert (t.net_pnl - (t.gross_pnl - t.commission)).abs().max() < 1e-9
+    assert (t.net_pnl - (t.gross_pnl - t.commission - t.slippage_cost)).abs().max() < 1e-9
     assert res.metrics["net_profit"] == pytest.approx(t.net_pnl.sum())
     # Timing: 5m signals are known at bar open + 5 min and fill no earlier.
     assert (t.entry_time >= t.signal_time + pd.Timedelta(minutes=5)).all()
