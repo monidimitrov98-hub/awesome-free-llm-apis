@@ -135,7 +135,7 @@ bars_5m = md.frames["5min"]
 |---|---|
 | Timestamps | Converted to tz-aware UTC. Naive values are localized with DST rules first. Unparseable or ambiguous values are reported, never guessed. |
 | Sessions | Globex runs 18:00 to 17:00 New York time (end exclusive). Each bar's `session_date` is the trade date, so Sunday 18:00 belongs to Monday. RTH 09:30–16:00 is also configured. Each session's start and end are resolved to exact UTC instants, so DST is handled per session. A boundary that falls in the skipped spring hour moves forward. One that falls in the repeated autumn hour uses its first occurrence. |
-| Resampling | Bars are left-labelled: the 09:30 5m bar covers 09:30:00–09:34:59 and is **known only at 09:35** (`available_at`). Empty bins are dropped, never filled, and no valid bar is removed. `n_source_bars` and `is_complete` flag partial bars. |
+| Resampling | Bars are left-labelled: the 09:30 5m bar covers 09:30:00–09:34:59 and is **known only at 09:35** (`available_at`). Empty bins are dropped, never filled, and no valid bar is removed. `is_complete` is `True` only if the bin's source timestamps are exactly the expected base grid (no missing and no off-grid rows). |
 | Session completeness | Expected bars per session come from that session's real elapsed length: 22h, 23h or 24h, not a fixed 23h. Sessions with fewer on-grid bars are reported as `INCOMPLETE_SESSION` (e.g. `500/540 bars`). |
 | EMA | `alpha = 2/(n+1)`, seeded with the SMA of the first n closes. NaN before that. |
 | RSI | Wilder: the first averages are simple means of n changes, then `(prev*(n-1)+x)/n`. If the average loss is 0 the RSI is 100, or 50 when the price is flat. |
@@ -151,8 +151,10 @@ Every resampled frame has these columns:
 
 | Column | Meaning |
 |---|---|
-| `n_source_bars` | Number of 1m bars that went into the bar |
-| `is_complete` | `True` only when `n_source_bars` equals the nominal count (5 for 5m, 15 for 15m) |
+| `n_source_bars` | Number of source rows aggregated into the bar. Off-grid rows are included, so no data is discarded |
+| `n_grid_bars` | Source rows exactly on the base grid (09:30:00, 09:31:00, ...) |
+| `n_off_grid_bars` | Source rows between grid points (e.g. 09:30:30) |
+| `is_complete` | `True` only when the source timestamps are **exactly** the expected grid of the bin: every minute present (5 for 5m, 15 for 15m) **and** no off-grid rows. An off-grid row never stands in for a missing minute. |
 | `available_at` | The earliest instant the bar's values are known (`timestamp + timeframe`) |
 
 Strategy, backtest and dashboard code **must**:

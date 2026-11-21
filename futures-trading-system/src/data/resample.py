@@ -5,8 +5,17 @@ Bars are **left-labelled**: a 5-minute bar stamped 09:30 contains source bars
 instant in ``available_at`` (= ``timestamp + timeframe``).
 
 Empty bins are dropped, never filled, and no valid bar is removed. Each output
-bar records how many source bars it contains (``n_source_bars``) and whether that
-equals the nominal count (``is_complete``).
+bar records:
+
+* ``n_source_bars``   – all source rows aggregated into the bar (off-grid ones included,
+  so no valid OHLCV data is discarded);
+* ``n_grid_bars``     – source rows whose timestamp lies exactly on the base-frequency
+  grid (e.g. 09:30:00, 09:31:00, ... for 1min);
+* ``n_off_grid_bars`` – source rows between grid points (e.g. 09:30:30);
+* ``is_complete``     – True only when the source timestamps are *exactly* the expected
+  grid of the bin: every grid point present (``n_grid_bars == timeframe / base``) and
+  no off-grid timestamps. A count alone is not enough: an off-grid row must never
+  stand in for a missing minute.
 
 RULE FOR DOWNSTREAM CODE (strategy, backtest, dashboard):
     Never generate a signal from a bar with ``is_complete == False``, and never act
@@ -85,8 +94,8 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str, base_frequency: str) -> pd.
         base_frequency: Frequency of the input bars.
 
     Returns:
-        Frame with ``open, high, low, close, volume, n_source_bars, is_complete,
-        available_at``.
+        Frame with ``open, high, low, close, volume, n_source_bars, n_grid_bars,
+        n_off_grid_bars, is_complete, available_at``.
 
     Raises:
         DataError: If the timeframe is not a multiple of the base frequency or
@@ -102,12 +111,21 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str, base_frequency: str) -> pd.
     expected = int(tf / base)
 
     src = df[list(AGGREGATION)].astype("float64")
-    bins = src.resample(timeframe, label="left", closed="left", origin="start_day")
-    out = bins.agg(AGGREGATION)
-    out["n_source_bars"] = bins["close"].count()
+    resampler = dict(rule=timeframe, label="left", closed="left", origin="start_day")
+    out = src.resample(**resampler).agg(AGGREGATION)
+    # Grid membership per source row. Timestamps are unique (checked above), so the
+    # on-grid rows of a bin are distinct grid points of that bin; n_grid_bars equals
+    # `expected` exactly when every grid point of the bin is present.
+    on_grid = pd.Series(
+        (df.index == df.index.floor(base_frequency)).astype(int), index=df.index
+    )
+    out["n_source_bars"] = on_grid.resample(**resampler).size()
+    out["n_grid_bars"] = on_grid.resample(**resampler).sum()
     out = out[out["n_source_bars"] > 0].copy()
-    out["n_source_bars"] = out["n_source_bars"].astype(int)
-    out["is_complete"] = out["n_source_bars"] == expected
+    for col in ("n_source_bars", "n_grid_bars"):
+        out[col] = out[col].astype(int)
+    out["n_off_grid_bars"] = out["n_source_bars"] - out["n_grid_bars"]
+    out["is_complete"] = (out["n_grid_bars"] == expected) & (out["n_off_grid_bars"] == 0)
     out["available_at"] = out.index + tf
     out.index.name = "timestamp"
     return out

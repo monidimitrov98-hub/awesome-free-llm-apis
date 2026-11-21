@@ -139,11 +139,12 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
         bars = resample_ohlcv(base, tf, dcfg.base_frequency)
         frames[tf] = add_indicators(bars, config.indicators, session)
         incomplete = int((~bars["is_complete"]).sum())
-        if incomplete and tf != dcfg.base_frequency:
+        if incomplete:
             report.add(
                 "info",
                 "INCOMPLETE_BARS",
-                f"{tf}: bars built from fewer source bars than nominal; is_complete=False. "
+                f"{tf}: bars whose source timestamps do not exactly match the expected grid "
+                "(missing and/or off-grid source bars); is_complete=False. "
                 "Never generate signals from these bars",
                 count=incomplete,
             )
