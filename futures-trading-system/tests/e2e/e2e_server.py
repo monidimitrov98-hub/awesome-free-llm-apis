@@ -56,15 +56,27 @@ class EveryNthBarTestStrategy(Strategy):
 
 
 def main() -> None:
-    """argv: PORT TOKEN SCENARIO [SPEED]; SCENARIO = replay | replay-nogate | mock | mock-fail."""
+    """argv: PORT TOKEN SCENARIO [SPEED]; SCENARIO = replay | replay-nogate | mock | mock-fail | shadow-analytics."""
     port, token, scenario = int(sys.argv[1]), sys.argv[2], sys.argv[3]
     speed = float(sys.argv[4]) if len(sys.argv) > 4 else 900.0
     if scenario.startswith("replay"):
         opts = ModeOptions(mode="replay", speed=speed, strategy_factory=lambda root: EveryNthBarTestStrategy(),
                            tests_disable_regime_gate=scenario == "replay-nogate")
+    elif scenario == "shadow-analytics":  # a fast replay run with simulated trades, analysed in Shadow Analytics
+        opts = ModeOptions(mode="replay", speed=speed, replay_start="2025-03-12",
+                           strategy_factory=lambda root: EveryNthBarTestStrategy(), tests_disable_regime_gate=True)
     else:
         opts = ModeOptions(mode="mock", mock_rate_hz=10)
     svc = TerminalService(opts)
+    # analyse only this run's own journal (never the developer's data/ journals)
+    import tempfile
+    from pathlib import Path
+
+    cfg = Path(tempfile.mkdtemp(prefix="fts-e2e-")) / "analytics.toml"
+    src = (Path(__file__).resolve().parents[2] / "config" / "analytics.toml").read_text(encoding="utf-8")
+    cfg.write_text("\n".join("journals = []" if line.startswith("journals =") else line for line in src.splitlines()),
+                   encoding="utf-8")
+    svc.analytics_config = cfg
     if scenario == "mock-fail":  # the (mock) provider disappears after 6 s: the GUI must show it
         import threading
 

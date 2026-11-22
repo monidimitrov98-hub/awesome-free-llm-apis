@@ -1252,9 +1252,9 @@ python run_marketdata.py monitor                          # waits for the NinjaT
 ## Sprint 7: FTS Terminal (read-only trading terminal, desktop + browser)
 
 A local professional trading terminal built with React, TypeScript and Lightweight Charts. It runs
-on a read-only FastAPI backend that observes the running paper session. It has 11 screens:
+on a read-only FastAPI backend that observes the running paper session. It has 12 screens:
 Dashboard, Live Charts, AI Market Analysis, Strategy Monitor, Positions, Risk Center, Trade
-Journal, Performance, Market Data, System Health and Settings. **There is no order entry**, and
+Journal, Performance, Shadow Analytics (Sprint 8), Market Data, System Health and Settings. **There is no order entry**, and
 every position is paper / simulated.
 
 ```
@@ -1269,6 +1269,34 @@ The terminal is local only (127.0.0.1), uses a per-start session token and serve
 only. See `docs/sprint7_trading_terminal.md` for the architecture, API, WebSocket contract,
 security, development commands and limitations. The Windows desktop window has not yet been
 verified on Windows.
+
+## Sprint 8: Shadow trading validation and analytics (read-only research)
+
+Analyses the journals that paper sessions already write (MOCK, REPLAY, SHADOW). It reports:
+
+- sessions;
+- live vs replay comparison (one instrument at a time, compatible configurations only);
+- simulated execution quality;
+- performance with confidence intervals and sample-size warnings;
+- cost scenarios;
+- regimes, using only the regime engine's own records;
+- blocked signals, with a hypothetical missed-opportunity analysis;
+- data reliability;
+- account survival under the configured profile;
+- validation status.
+
+Session types are never combined into one figure. Nothing here can trade or change any setting.
+
+```
+python run_shadow_analytics.py sessions
+python run_shadow_analytics.py report --session-type SHADOW --root MES
+python run_shadow_analytics.py compare --root MES
+python run_shadow_analytics.py export trades --session-type SHADOW --format csv
+python run_terminal.py --mode replay --keep-state     # keep a replay run for the Shadow Analytics screen
+```
+
+The terminal has a new **Shadow Analytics** screen. See `docs/sprint8_shadow_analytics.md` for the
+architecture, metric definitions, statistical method, interpretation guide and limitations.
 
 ## Known limitations
 

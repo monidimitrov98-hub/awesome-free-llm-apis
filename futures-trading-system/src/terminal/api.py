@@ -36,6 +36,7 @@ log = logging.getLogger("fts.terminal.api")
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 WS_QUEUE = 256
 Root = Literal["MES", "MNQ"]
+SessionType = Literal["MOCK", "REPLAY", "SHADOW", "MONITOR", "UNKNOWN"]
 
 
 class RateLimiter:
@@ -221,6 +222,51 @@ def create_app(service: TerminalService, *, token: str, port: int, dev: bool = F
                         for c in cols])
         return Response(buf.getvalue(), media_type="text/csv",
                         headers={"Content-Disposition": 'attachment; filename="paper_trade_journal.csv"'})
+
+    # ------------------------------------------------------------------ Shadow Analytics (Sprint 8, read-only)
+    def shadow_filters(root: Root | None = None,
+                       start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                       end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                       session_type: SessionType | None = None,
+                       strategy_version: str | None = Query(None, max_length=80, pattern=r"^[\w.:@\-]+$"),
+                       regime: str | None = Query(None, max_length=60, pattern=r"^[\w\-]+$"),
+                       provider: str | None = Query(None, max_length=60, pattern=r"^[\w.:@\- ]+$"),
+                       session_id: str | None = Query(None, max_length=80, pattern=r"^[\w.:@\-]+$")) -> dict:
+        return {"root": root, "start": start, "end": end, "session_type": session_type,
+                "strategy_version": strategy_version, "regime": regime, "provider": provider, "session_id": session_id}
+
+    def shadow_call(fn):
+        try:
+            out = fn()
+        except ValueError as exc:  # filter validation inside the library
+            raise HTTPException(status_code=422, detail=str(exc)[:200]) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)[:300]) from exc
+        except Exception as exc:  # noqa: BLE001 -- generic message; details only in the local log
+            log.exception("shadow analytics failed")
+            raise HTTPException(status_code=500, detail="analytics failed (see the terminal log)") from exc
+        if isinstance(out, dict) and out.get("unavailable"):
+            raise HTTPException(status_code=503, detail=out["unavailable"])
+        return out
+
+    @app.get("/api/shadow/compare", dependencies=A + [Depends(heavy_limit)])
+    def shadow_compare(root: Root, a: SessionType = "REPLAY", b: SessionType = "SHADOW",
+                       f: dict = Depends(shadow_filters)) -> Any:
+        if a == b:
+            raise HTTPException(status_code=422, detail="compare needs two different session types")
+        return shadow_call(lambda: service.shadow("compare", f, root=root, a=a, b=b))
+
+    @app.get("/api/shadow/export/{kind}.{fmt}", dependencies=A + [Depends(heavy_limit)])
+    def shadow_export(kind: Literal["sessions", "trades", "execution", "reliability", "regimes", "account", "blocked",
+                                    "costs"], fmt: Literal["csv", "json"], f: dict = Depends(shadow_filters)) -> Response:
+        body, name = shadow_call(lambda: service.shadow_export(kind, fmt, f))
+        return Response(body, media_type="text/csv" if fmt == "csv" else "application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    @app.get("/api/shadow/{report}", dependencies=A + [Depends(heavy_limit)])
+    def shadow(report: Literal["sessions", "performance", "costs", "execution", "regimes", "blocked", "reliability",
+                               "account", "validation", "journals"], f: dict = Depends(shadow_filters)) -> Any:
+        return shadow_call(lambda: service.shadow(report, f))
 
     @app.get("/api/performance", dependencies=A)
     def performance(source: Literal["session", "backtest"] = "session") -> Any:

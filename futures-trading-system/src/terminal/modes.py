@@ -293,8 +293,11 @@ def build(opts: ModeOptions, *, clock: Callable[[], pd.Timestamp] | None = None)
         extras = {}
         stop_when_exhausted, idle = False, 0.005
     journal = Journal(db, create=not db.exists())
+    meta = {"session_type": info.label, "data_label": info.data_label,
+            "provider": {"mock": "MOCK bridge (synthetic data)", "replay": "bar replay", "shadow": "NinjaTrader 8"}[opts.mode],
+            "test_strategy": opts.strategy_factory is not None}
     session = PaperSession(pcfg, app, bt, sc, rc, guards, feed, journal, warmup=warm,
                            clock=clock if feed.kind != "replay" else None, news_readiness=readiness,
-                           strategy_factory=opts.strategy_factory)
+                           strategy_factory=opts.strategy_factory, session_meta=meta)
     extras["ephemeral_state"] = ephemeral
     return Built(session, feed, info, extras, contracts, stop_when_exhausted, idle)

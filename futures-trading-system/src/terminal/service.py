@@ -119,6 +119,10 @@ class TerminalService:
         self._prev_health: dict[str, str] = {}
         self._prev_news: dict[str, str] = {}
         self.ws_clients = 0
+        self._analytics = None          # Sprint 8 AnalyticsLibrary (lazy; read-only journal analysis)
+        self._analytics_error: str | None = None
+        self._analytics_lock = threading.Lock()
+        self.analytics_config = None    # tests may point this at another config/analytics.toml
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -163,6 +167,10 @@ class TerminalService:
             self._thread.join(timeout)
         if self._pub is not None:
             self._pub.join(timeout)
+        with self._analytics_lock:
+            if self._analytics is not None:
+                self._analytics.close()  # release read handles before an ephemeral journal is removed
+                self._analytics = None
         if b is not None:
             try:
                 b.feed.disconnect()
@@ -405,6 +413,70 @@ class TerminalService:
         if source == "backtest":
             return views.backtest_performance(self.backtest_dir)
         return self._locked(views.performance)
+
+    # ------------------------------------------------------------------ shadow analytics (Sprint 8, read-only)
+    SHADOW_REPORTS = ("sessions", "performance", "costs", "execution", "regimes", "blocked", "reliability", "account",
+                      "validation")
+
+    def _library(self):
+        """The analytics library: configured journals + this terminal's own session journal."""
+        from src.analytics.shadow.library import AnalyticsLibrary, load_analytics_config, resolve_journals
+
+        if self._analytics is None:
+            cfg = load_analytics_config(self.analytics_config)
+            lib = AnalyticsLibrary(resolve_journals(cfg["journals"], cfg["max_journals"]), cfg)
+            b = self.built
+            if b is not None:
+                cur = b.session.journal.path.resolve()
+                label = f"this terminal ({b.info.label})"
+                src = lib.sources.get(str(cur))
+                if src is not None:
+                    src.label = src.data.label = label
+                else:
+                    lib.add(cur, label=label)
+            self._analytics = lib
+        return self._analytics
+
+    def shadow(self, report: str, filters: dict[str, Any], **kw) -> dict[str, Any]:
+        """One Shadow Analytics report. Never touches the trading session (journals are read separately)."""
+        from src.analytics.shadow.library import Filters, to_json
+
+        f = Filters(**filters)
+        with self._analytics_lock:  # one analysis at a time: bounded CPU, consistent caches
+            try:
+                lib = self._library()
+            except Exception as exc:  # noqa: BLE001 -- configuration problems are shown, never fatal
+                return {"unavailable": f"analytics configuration error: {type(exc).__name__}: {str(exc)[:200]}"}
+            if report == "compare":
+                rep = lib.compare(kw["root"], kw.get("a", "REPLAY"), kw.get("b", "SHADOW"), f)
+            elif report == "validation":
+                rep = lib.validation()
+            elif report == "journals":
+                lib.refresh()
+                rep = {"journals": lib.journal_status()}
+            else:
+                rep = getattr(lib, report)(f)
+            import json
+
+            return json.loads(to_json(rep, {"report": report, "filters": f.describe(),
+                                            "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                                            "terminal_mode": self.built.info.label if self.built else None}))
+
+    def shadow_export(self, kind: str, fmt: str, filters: dict[str, Any]) -> tuple[str, str]:
+        from src.analytics.shadow.library import Filters, export_meta, export_rows, to_csv, to_json
+
+        f = Filters(**filters)
+        with self._analytics_lock:
+            try:
+                lib = self._library()
+            except Exception as exc:  # noqa: BLE001
+                raise LookupError(f"analytics configuration error: {type(exc).__name__}") from exc
+            rows, rep = export_rows(lib, kind, f)
+            if rep.get("refused"):
+                raise LookupError(rep["refused"])
+            meta = export_meta(kind, f, rep)
+            body = to_csv(rows, meta) if fmt == "csv" else to_json({"rows": rows}, meta)
+            return body, f"shadow_{kind}_{(f.session_type or 'all').lower()}.{fmt}"
 
     def system(self) -> dict[str, Any]:
         proc = {}

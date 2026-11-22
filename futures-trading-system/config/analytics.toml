@@ -1,0 +1,67 @@
+# Sprint 8 shadow analytics -- RESEARCH configuration only. Nothing here changes trading, risk,
+# NewsGuard, strategy or execution settings; scenario results are never written back anywhere.
+
+[sources]
+# Journals (paper_state.db) analysed by default. Globs are relative to the project root and must stay
+# inside it. Each run's own identity (MOCK / REPLAY / SHADOW, strategy version) is read from its journal.
+journals = ["data/terminal/shadow/paper_state.db", "data/paper/paper_state.db", "data/analytics/journals/*/paper_state.db"]
+max_journals = 50
+
+[statistics]
+bootstrap_iterations = 2000
+bootstrap_seed = 8
+counterfactual_horizon_minutes = 240     # how far after a blocked signal the hypothetical outcome is followed
+
+# Cost / execution scenarios applied to RECORDED trades (research only).
+[[scenarios]]
+name = "recorded (baseline)"
+extra_slippage_ticks_per_side = 0
+extra_spread_ticks = 0
+extra_stop_ticks = 0
+commission_multiplier = 1.0
+
+[[scenarios]]
+name = "wider spreads (+1 tick per trade)"
+extra_spread_ticks = 1
+
+[[scenarios]]
+name = "higher slippage (+1 tick per side)"
+extra_slippage_ticks_per_side = 1
+
+[[scenarios]]
+name = "volatility expansion (+2 ticks per side, +2 on stops)"
+extra_slippage_ticks_per_side = 2
+extra_stop_ticks = 2
+
+[[scenarios]]
+name = "news volatility (+4 ticks on stops, +1 per side)"
+extra_slippage_ticks_per_side = 1
+extra_stop_ticks = 4
+
+[[scenarios]]
+name = "delayed data (+2 ticks per side)"
+extra_slippage_ticks_per_side = 2
+
+[[scenarios]]
+name = "poor execution (+3 per side, +4 on stops, commission x1.5)"
+extra_slippage_ticks_per_side = 3
+extra_stop_ticks = 4
+commission_multiplier = 1.5
+
+# Account stress scenarios (illustrative; from the last recorded drawdown buffer).
+[[stress]]
+name = "3 consecutive average losses"
+loss_per_trade = "average_loss"
+consecutive_losses = 3
+
+[[stress]]
+name = "5 losses at configured risk per trade + 8-tick gaps"
+loss_per_trade = "risk_per_trade"
+consecutive_losses = 5
+gap_ticks = 8
+
+[[stress]]
+name = "10 losses at configured risk per trade + 4-tick gaps"
+loss_per_trade = "risk_per_trade"
+consecutive_losses = 10
+gap_ticks = 4

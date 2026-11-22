@@ -40,12 +40,30 @@ async function expectText(page, text, timeout = 60000) {
       await expectText(page, "MOCK bridge (synthetic data)");
       await page.evaluate(() => { window.location.hash = "/risk"; });
       await expectText(page, "NEWS CALENDAR:");                       // incomplete calendar blocks entries, visibly
+    } else if (scenario === "shadow-analytics") {
+      await page.evaluate(() => { window.location.hash = "/shadow"; });
+      await expectText(page, "Shadow Analytics");
+      await page.locator("table").getByText("REPLAY").first().waitFor({ timeout: 120000 });  // the run's sessions
+      await expectText(page, "e2e_test_strategy@");                    // strategy identity per session
+      const section = (name) => page.getByRole("group", { name: "Section" }).getByText(name, { exact: true }).click();
+      await section("Performance");
+      await expectText(page, "SIMULATED results of recorded sessions", 120000);
+      await expectText(page, "INSUFFICIENT SAMPLE SIZE");               // small samples are flagged
+      await expectText(page, "RESEARCH SCENARIOS");                     // cost scenarios kept separate
+      await section("Blocked Signals");
+      await expectText(page, "HYPOTHETICAL (never traded; not part of any P&L)");
+      await section("Data Reliability");
+      await expectText(page, "Valid events received");
+      await section("Validation");
+      await expectText(page, "production strategy only");              // the TEST strategy is flagged
+      await section("Live vs Replay");
+      await expectText(page, "no SHADOW observations for MES");         // nothing compared without shadow data
     } else if (scenario === "mock-fail") {
       await expectText(page, "MOCK");
       await expectText(page, "MARKET FEED DEGRADED", 60000);          // degraded feed is never hidden
     }
     const buttons = await page.getByRole("button").allTextContents();
-    const forbidden = buttons.filter((t) => /\b(buy|sell|order|flatten|submit|execute)\b/i.test(t));
+    const forbidden = buttons.filter((t) => /\b(buy|sell|order|flatten|submit|execute|apply|promote)\b/i.test(t));
     if (forbidden.length) throw new Error(`order-like controls found: ${forbidden}`);
     if (errors.length) throw new Error(`page errors: ${errors.join("; ")}`);
     console.log(`E2E ${scenario}: PASS`);

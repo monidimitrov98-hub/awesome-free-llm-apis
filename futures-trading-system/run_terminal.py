@@ -41,6 +41,9 @@ def parse_args(argv=None):
     p.add_argument("--desktop", action="store_true", help="open in a desktop window (pywebview)")
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--dev", action="store_true", help="development: API docs + Vite dev-server origin allowed")
+    p.add_argument("--keep-state", action="store_true",
+                   help="mock/replay: keep the run's journal in data/analytics/journals/ for Shadow Analytics "
+                        "(by default these runs are ephemeral)")
     return p.parse_args(argv)
 
 
@@ -73,6 +76,13 @@ def main(argv=None) -> int:
         return 1
     opts = ModeOptions(mode=a.mode, bars={k.upper(): Path(v) for k, v in (x.split("=", 1) for x in a.bars)},
                        replay_start=a.replay_start, speed=a.speed, news_calendar=a.news_calendar)
+    if a.keep_state and a.mode in ("mock", "replay"):
+        import pandas as pd
+
+        from src.config import PROJECT_ROOT
+
+        opts.state_dir = PROJECT_ROOT / "data" / "analytics" / "journals" / \
+            f"{a.mode}-{pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%S')}"
     problems = prerequisites(opts)
     if problems:  # never fall back to another mode
         print(f"Error: {a.mode.upper()} mode cannot start: " + "; ".join(problems), file=sys.stderr)

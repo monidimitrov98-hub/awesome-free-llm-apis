@@ -226,3 +226,7 @@ table.t td.wrap { white-space: normal; }
 .chart-attrib { position: absolute; right: 64px; bottom: 30px; font-size: 10px; color: var(--text-3); z-index: 4; }
 .cbars { display: flex; flex-direction: column; gap: 4px; }
 .cbar { display: grid; grid-template-columns: 130px 1fr 90px; gap: 8px; align-items: center; font-size: 12px; }
+
+/* Sprint 8: Shadow Analytics */
+ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; color: var(--text-2, inherit); }
+.note.pad { padding: 8px 12px; margin: 0; }

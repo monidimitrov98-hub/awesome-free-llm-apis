@@ -147,8 +147,17 @@ def main(argv=None) -> int:
             feed = SimulatedRealtimeFeed(feed, lambda: pd.Timestamp.now(tz="UTC"), speed=a.realtime_speed)
         guards, readiness = news_guards(pcfg.mode, pcfg.instruments, ncfg, a.news_calendar)
         journal = Journal(db, create=a.new_account)
+        if a.feed == "bridge":
+            meta = {"session_type": "SHADOW", "data_label": "LIVE",
+                    "provider": getattr(feed, "provider_name", None) or feed.name}
+        elif pcfg.mode == "infrastructure_validation":
+            meta = {"session_type": "MONITOR", "data_label": "HISTORICAL", "provider": feed.name}
+        else:
+            synthetic = any("SYNTHETIC" in Path(p).name.upper() for p in bars.values())
+            meta = {"session_type": "REPLAY", "data_label": "SYNTHETIC" if synthetic else "HISTORICAL",
+                    "provider": feed.name}
         session = PaperSession(pcfg, app, bt, sc, rc, guards, feed, journal, warmup=warm,
-                               clock=(lambda: pd.Timestamp.now(tz="UTC")), news_readiness=readiness)
+                               clock=(lambda: pd.Timestamp.now(tz="UTC")), news_readiness=readiness, session_meta=meta)
     except RecoveryError as exc:
         print(f"Error: paper state cannot be recovered: {exc}. Nothing was traded; fix or archive the state.",
               file=sys.stderr)

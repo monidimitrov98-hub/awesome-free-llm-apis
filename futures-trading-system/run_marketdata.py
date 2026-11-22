@@ -135,8 +135,10 @@ def _monitor(a, cfg, app, bt, resolver, secret) -> int:
     try:
         guards, _ = news_guards(pcfg.mode, pcfg.instruments, load_news_config(), None)
         journal = Journal(db, create=not db.exists())
+        meta = {"session_type": "MOCK" if a.mock else "MONITOR", "data_label": "SYNTHETIC" if a.mock else "LIVE",
+                "provider": "MOCK bridge (synthetic data)" if a.mock else "NinjaTrader 8"}
         session = PaperSession(pcfg, app, bt, load_strategy_config(), load_regime_config(), guards, feed, journal,
-                               clock=clock)
+                               clock=clock, session_meta=meta)
     except (RecoveryError, JournalError) as exc:
         print(f"Error: monitor state cannot be used: {exc}", file=sys.stderr)
         return 9

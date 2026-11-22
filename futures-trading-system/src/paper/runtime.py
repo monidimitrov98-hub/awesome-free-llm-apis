@@ -30,6 +30,7 @@ which the restart happened (strategy state cannot be verified). No price is rest
 from __future__ import annotations
 
 import collections
+import logging
 import math
 import threading
 import time
@@ -52,6 +53,8 @@ from src.paper.orders import Execution, PaperOrder
 from src.paper.validation import DataHealth, EventValidator
 from src.strategy.base import PositionSnapshot, StrategyContext
 from src.strategy.vwap_pullback import VwapTrendPullbackStrategy
+
+log = logging.getLogger("fts.paper")
 
 RUN_KINDS = ("infrastructure_validation", "replay", "simulated_realtime", "paper")
 # journal kinds mirrored into the bounded in-memory activity log (read by the terminal GUI; the
@@ -85,7 +88,8 @@ class PaperSession:
                  feed: MarketDataFeed, journal: Journal, *, warmup: dict[str, pd.DataFrame] | None = None,
                  clock: Callable[[], pd.Timestamp] | None = None, sleeper: Callable[[float], None] | None = None,
                  news_readiness: dict[str, Any] | None = None,
-                 strategy_factory: Callable[[str], Any] | None = None) -> None:
+                 strategy_factory: Callable[[str], Any] | None = None,
+                 session_meta: dict[str, Any] | None = None) -> None:
         """``strategy_factory`` exists for TESTS that need deterministic requests to exercise the
         execution engine; production uses the existing VWAP Trend Pullback strategy."""
         self.pcfg, self.app, self.bt, self.scfg, self.regime = pcfg, app, bt, strat_cfg, regime_cfg
@@ -95,6 +99,9 @@ class PaperSession:
         self.activity: collections.deque[dict[str, Any]] = collections.deque(maxlen=3000)
         self._activity_seq = 0
         self.started_at = pd.Timestamp.now(tz="UTC")
+        # what kind of run this is (MOCK / REPLAY / SHADOW / MONITOR), data label and provider: journaled
+        # with the run identity so analytics never mixes session types
+        self.session_meta = dict(session_meta or {})
         self.feed, self.journal = feed, journal
         self.run_kind = run_kind_for(pcfg.mode, feed)
         self.roots = list(pcfg.instruments)
@@ -223,6 +230,7 @@ class PaperSession:
             self._journal("session_created", {"run_kind": self.run_kind, "instruments": self.roots,
                                               "initial_balance": self.account.initial_balance,
                                               "news_readiness": self.news_readiness}, pd.Timestamp.now(tz="UTC"))
+            self._journal_identity(pd.Timestamp.now(tz="UTC"))
             self._snapshot(pd.Timestamp.now(tz="UTC"))
             self.journal.commit()
             return
@@ -265,8 +273,22 @@ class PaperSession:
         self._journal("recovered", {"clean_shutdown_before": was_clean, "reconciliation_problems": problems,
                                     "journal_entries": n, "restart_block_session": str(self.restart_block_session)},
                       pd.Timestamp.now(tz="UTC"))
+        self._journal_identity(pd.Timestamp.now(tz="UTC"))
         self._snapshot(now)
         self.journal.commit()
+
+    def _journal_identity(self, ts: pd.Timestamp) -> None:
+        """Strategy / config / code / regime / cost identity of this run (Sprint 8 analytics)."""
+        from src.analytics.shadow.identity import run_identity
+
+        try:
+            ident = run_identity(self)
+        except Exception as exc:  # noqa: BLE001 -- identity is informative: it must never stop a session
+            log.warning("run identity could not be computed: %s", type(exc).__name__)
+            ident = {"schema": 1, "error": type(exc).__name__, "session_type": self.session_meta.get("session_type", "UNKNOWN"),
+                     "data_label": self.session_meta.get("data_label"), "provider": self.session_meta.get("provider"),
+                     "test_strategy": bool(self.session_meta.get("test_strategy"))}
+        self._journal("run_identity", ident, ts)
 
     def _protect_restored_positions(self, now: pd.Timestamp) -> None:
         """A restored (or interrupted) position must never stay unprotected: every contract needs a
@@ -565,8 +587,12 @@ class PaperSession:
         if ev.received_at is not None:
             self._check_delay(ev)
         self.health.on_event(ev.root, ev.ts)
+        prices = {k: getattr(ev, k) for k in ("last", "size", "bid", "ask", "bid_size", "ask_size")
+                  if getattr(ev, k) is not None}
+        if ev.instrument:
+            prices["instrument"] = ev.instrument
         self._journal("market_event", {**ev.ref(), "seq": self.seq, "warnings": v.warnings,
-                                       "synthetic": ev.synthetic_from_bars}, ev.ts)
+                                       "synthetic": ev.synthetic_from_bars, **prices}, ev.ts)
         sd = v.session_date
         self._session_rollover(sd, ev.ts)
         self._mark(ev)

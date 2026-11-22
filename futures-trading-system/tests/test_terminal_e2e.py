@@ -38,7 +38,7 @@ def _port() -> int:
 
 
 @pytest.mark.parametrize("scenario,speed", [("mock", None), ("mock-fail", None), ("replay", "1200"),
-                                            ("replay-nogate", "1500")])
+                                            ("replay-nogate", "1500"), ("shadow-analytics", "200000")])
 def test_gui_end_to_end(scenario, speed):
     port, token = _port(), secrets.token_urlsafe(24)
     args = [sys.executable, str(ROOT / "tests" / "e2e" / "e2e_server.py"), str(port), token, scenario] + ([speed] if speed else [])
