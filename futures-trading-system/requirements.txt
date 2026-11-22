@@ -1,7 +1,14 @@
 # Runtime + test dependencies.
-# scikit-learn: Sprint 4 regime models (Layer 2). plotly / streamlit arrive with the dashboard.
+# scikit-learn: Sprint 4 regime models (Layer 2).
 pandas>=2.2,<4
 numpy>=1.26
 tzdata>=2024.1   # IANA timezone database; required on Windows
 scikit-learn>=1.4
 pytest>=8.0
+# Sprint 7 terminal (local read-only API + GUI server). Pinned: tested together.
+fastapi==0.128.0
+starlette==0.50.0
+uvicorn==0.38.0
+websockets==15.0.1     # WebSocket support for uvicorn
+httpx==0.28.1          # FastAPI TestClient (tests)
+psutil==7.1.3          # CPU / memory on the System Health screen (optional at runtime)

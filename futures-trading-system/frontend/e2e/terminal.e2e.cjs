@@ -1,0 +1,59 @@
+// End-to-end GUI test (Playwright, Chromium): real backend -> REST/WebSocket -> React UI.
+// Run by tests/test_terminal_e2e.py:  node frontend/e2e/terminal.e2e.cjs PORT TOKEN SCENARIO
+const { chromium } = require("playwright");
+
+const [port, token, scenario] = process.argv.slice(2);
+const base = `http://127.0.0.1:${port}`;
+
+async function expectText(page, text, timeout = 60000) {
+  await page.getByText(text, { exact: false }).first().waitFor({ timeout });
+}
+
+(async () => {
+  const browser = await chromium.launch();
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(String(e)));
+  try {
+    await page.goto(`${base}/#token=${token}`);
+    if (!(await page.evaluate(() => window.location.hash === ""))) throw new Error("token was not removed from the URL");
+    if (scenario === "replay") {
+      await expectText(page, "REPLAY");
+      await expectText(page, "SYNTHETIC DATA — NOT MARKET PRICES");
+      // a real backend rejection reason (regime gate / trading window / news) reaches the UI
+      await page.evaluate(() => { window.location.hash = "/strategy"; });
+      await expectText(page, "Entry authorization decisions");
+      await page.getByText(/regime_|outside_trading_window|news_/).first().waitFor({ timeout: 120000 });
+    } else if (scenario === "replay-nogate") {
+      await page.evaluate(() => { window.location.hash = "/charts"; });
+      await expectText(page, "authorized paper order", 120000);     // signal -> authorization shown with the chart
+      await page.evaluate(() => { window.location.hash = "/journal"; });
+      await expectText(page, "T00001", 120000);                      // simulated trade in the journal
+      await page.evaluate(() => { window.location.hash = "/dashboard"; });
+      await expectText(page, "SIMULATED fill");                       // activity feed
+      await page.evaluate(() => { window.location.hash = "/risk"; });
+      await expectText(page, "AccountGuard");
+      await expectText(page, "allowed by news");                      // research NewsGuard state visible
+    } else if (scenario === "mock") {
+      await expectText(page, "MOCK");
+      await page.evaluate(() => { window.location.hash = "/market"; });
+      await expectText(page, "MOCK bridge (synthetic data)");
+      await page.evaluate(() => { window.location.hash = "/risk"; });
+      await expectText(page, "NEWS CALENDAR:");                       // incomplete calendar blocks entries, visibly
+    } else if (scenario === "mock-fail") {
+      await expectText(page, "MOCK");
+      await expectText(page, "MARKET FEED DEGRADED", 60000);          // degraded feed is never hidden
+    }
+    const buttons = await page.getByRole("button").allTextContents();
+    const forbidden = buttons.filter((t) => /\b(buy|sell|order|flatten|submit|execute)\b/i.test(t));
+    if (forbidden.length) throw new Error(`order-like controls found: ${forbidden}`);
+    if (errors.length) throw new Error(`page errors: ${errors.join("; ")}`);
+    console.log(`E2E ${scenario}: PASS`);
+  } catch (e) {
+    await page.screenshot({ path: `/tmp/fts-e2e-${scenario}-failure.png` }).catch(() => {});
+    console.error(`E2E ${scenario}: FAIL ${e}`);
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();

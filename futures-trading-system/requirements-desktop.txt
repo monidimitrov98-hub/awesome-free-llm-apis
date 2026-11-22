@@ -1,0 +1,4 @@
+# Optional: desktop window for the terminal (python run_terminal.py --desktop).
+# On Windows pywebview uses the Edge WebView2 runtime (preinstalled on Windows 10/11).
+-r requirements.txt
+pywebview==5.4

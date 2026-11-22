@@ -436,6 +436,7 @@ class NinjaTraderBridgeFeed(LiveFeed):
         super().__init__()
         self.server = BridgeServer(cfg, secret, resolver, clock=clock)
         self.cfg = cfg
+        self.provider_name = PROVIDER_NAME   # the terminal's MOCK mode labels its synthetic bridge differently
         self._conn_id: int | None = None
         self._pending_updates: list[HealthUpdate] = []
         self._held: MarketEvent | HealthUpdate | None = None
@@ -502,7 +503,7 @@ class NinjaTraderBridgeFeed(LiveFeed):
         return out
 
     def status(self) -> dict[str, Any]:
-        return {"provider": PROVIDER_NAME, "feed": self.name, **self.server.snapshot()}
+        return {"provider": self.provider_name, "feed": self.name, **self.server.snapshot()}
 
     @property
     def exhausted(self) -> bool:

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import collections
 import math
+import threading
 import time
 from typing import Any, Callable
 
@@ -53,6 +54,14 @@ from src.strategy.base import PositionSnapshot, StrategyContext
 from src.strategy.vwap_pullback import VwapTrendPullbackStrategy
 
 RUN_KINDS = ("infrastructure_validation", "replay", "simulated_realtime", "paper")
+# journal kinds mirrored into the bounded in-memory activity log (read by the terminal GUI; the
+# SQLite journal stays the authoritative audit trail)
+ACTIVITY_KINDS = frozenset({
+    "session_created", "recovered", "entry_decision", "execution", "trade_closed", "flatten_requested",
+    "account_guard", "daily_loss_limit", "emergency_stop", "feed_health", "feed_connected", "feed_disconnected",
+    "feed_connect_failed", "data_rejected", "data_delayed", "price_level_reset", "system_error", "shutdown",
+    "persistence_failure", "persistence_recovered", "protective_stop_restored", "signal_bar_skipped",
+    "order_submitted", "order_filled", "order_cancelled", "order_rejected", "order_expired", "session_change"})
 
 
 class RecoveryError(RuntimeError):
@@ -80,6 +89,12 @@ class PaperSession:
         """``strategy_factory`` exists for TESTS that need deterministic requests to exercise the
         execution engine; production uses the existing VWAP Trend Pullback strategy."""
         self.pcfg, self.app, self.bt, self.scfg, self.regime = pcfg, app, bt, strat_cfg, regime_cfg
+        # guards the whole session state: the run loop holds it while processing; read-only views
+        # (e.g. the terminal API) hold it while building a consistent snapshot
+        self.state_lock = threading.RLock()
+        self.activity: collections.deque[dict[str, Any]] = collections.deque(maxlen=3000)
+        self._activity_seq = 0
+        self.started_at = pd.Timestamp.now(tz="UTC")
         self.feed, self.journal = feed, journal
         self.run_kind = run_kind_for(pcfg.mode, feed)
         self.roots = list(pcfg.instruments)
@@ -179,7 +194,11 @@ class PaperSession:
         return build_status(self)
 
     def _journal(self, kind: str, payload: dict[str, Any], ts: pd.Timestamp | None = None) -> None:
-        self.journal.append(kind, ts or self.now(), payload)
+        t = ts or self.now()
+        self.journal.append(kind, t, payload)
+        if kind in ACTIVITY_KINDS:
+            self._activity_seq += 1
+            self.activity.append({"seq": self._activity_seq, "kind": kind, "time": t, "payload": payload})
 
     # ------------------------------------------------------------------ recovery
     def state(self) -> dict[str, Any]:
@@ -400,10 +419,12 @@ class PaperSession:
             try:
                 self.feed.connect()
             except FeedError as exc:
-                self._journal("feed_connect_failed", {"attempt": attempt, "error": str(exc)[:200]})
+                with self.state_lock:
+                    self._journal("feed_connect_failed", {"attempt": attempt, "error": str(exc)[:200]})
                 continue
-            self.health.on_connect(self.now())
-            self._journal("feed_connected", {"attempt": attempt, "feed": self.feed.name, "kind": self.feed.kind})
+            with self.state_lock:
+                self.health.on_connect(self.now())
+                self._journal("feed_connected", {"attempt": attempt, "feed": self.feed.name, "kind": self.feed.kind})
             return True
         return False
 
@@ -418,54 +439,64 @@ class PaperSession:
             return self._run(max_batches=max_batches, idle_sleep=idle_sleep, stop_when_exhausted=stop_when_exhausted,
                              should_stop=should_stop, on_cycle=on_cycle)
         except Exception as exc:  # noqa: BLE001
-            return self._fatal(exc, None)
+            with self.state_lock:
+                return self._fatal(exc, None)
 
     def _run(self, *, max_batches: int | None, idle_sleep: float, stop_when_exhausted: bool,
              should_stop: Callable[[], bool] | None = None, on_cycle: Callable[["PaperSession"], None] | None = None
              ) -> str:
         if not self.connect(should_stop):
-            self.shutdown("stopped" if should_stop is not None and should_stop() else "feed_unavailable")
+            with self.state_lock:
+                self.shutdown("stopped" if should_stop is not None and should_stop() else "feed_unavailable")
             return self.stopped_reason or "feed_unavailable"
         batches = 0
+        lock = self.state_lock  # held for processing only, never while sleeping or waiting for the feed
         while (max_batches is None or batches < max_batches) and not (should_stop is not None and should_stop()):
             if on_cycle is not None:
                 on_cycle(self)
             try:
                 batch = self.feed.poll(1000)
             except FeedError as exc:
-                self.health.on_disconnect(self.now(), str(exc))
-                self._journal("feed_disconnected", {"error": str(exc)[:200]})
-                self._commit()
+                with lock:
+                    self.health.on_disconnect(self.now(), str(exc))
+                    self._journal("feed_disconnected", {"error": str(exc)[:200]})
+                    self._commit()
                 if should_stop is not None and should_stop():
                     break  # stop requested: shut down safely instead of reconnecting
                 if not self.connect(should_stop):
-                    self.shutdown("feed_unavailable")
+                    with lock:
+                        self.shutdown("feed_unavailable")
                     return "feed_unavailable"
                 continue
-            applied = self._apply_feed_updates()
-            if not batch:
-                if applied:
+            idle = False
+            with lock:
+                applied = self._apply_feed_updates()
+                if not batch:
+                    if applied:
+                        self._commit()
+                        continue  # more data may be right behind the update: no idle sleep
+                    if self.feed.exhausted and stop_when_exhausted:
+                        break
+                    now = self.now()
+                    self.health.check_stale(now)
+                    if self.feed.kind != "replay":  # time passing completes bars even without trades
+                        for r in self.roots:
+                            for minute in self.builders[r].advance(now):
+                                self._bar_completed_by_clock(r, minute, now)
+                        self._commit()
+                    idle = True
+                else:
+                    for ev in batch:
+                        try:
+                            self.process_event(ev)
+                        except Exception as exc:  # noqa: BLE001 -- any internal failure is fatal and fail-closed
+                            return self._fatal(exc, ev)
+                    batches += 1
                     self._commit()
-                    continue  # more data may be right behind the update: no idle sleep
-                if self.feed.exhausted and stop_when_exhausted:
-                    break
-                now = self.now()
-                self.health.check_stale(now)
-                if self.feed.kind != "replay":  # time passing completes bars even without trades
-                    for r in self.roots:
-                        for minute in self.builders[r].advance(now):
-                            self._bar_completed_by_clock(r, minute, now)
-                    self._commit()
+            if idle:
                 self.sleeper(idle_sleep)
-                continue
-            for ev in batch:
-                try:
-                    self.process_event(ev)
-                except Exception as exc:  # noqa: BLE001 -- any internal failure is fatal and fail-closed
-                    return self._fatal(exc, ev)
-            batches += 1
-            self._commit()
-        self.shutdown("end_of_data" if self.feed.exhausted else "stopped")
+        with lock:
+            self.shutdown("end_of_data" if self.feed.exhausted else "stopped")
         return self.stopped_reason or "stopped"
 
     def _fatal(self, exc: BaseException, ev: MarketEvent | None) -> str:

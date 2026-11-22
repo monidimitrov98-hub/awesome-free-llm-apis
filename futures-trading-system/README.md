@@ -1249,6 +1249,27 @@ python run_marketdata.py monitor --mock --duration 30     # whole pipeline, SYNT
 python run_marketdata.py monitor                          # waits for the NinjaTrader add-on
 ```
 
+## Sprint 7: FTS Terminal (read-only trading terminal, desktop + browser)
+
+A local professional trading terminal built with React, TypeScript and Lightweight Charts. It runs
+on a read-only FastAPI backend that observes the running paper session. It has 11 screens:
+Dashboard, Live Charts, AI Market Analysis, Strategy Monitor, Positions, Risk Center, Trade
+Journal, Performance, Market Data, System Health and Settings. **There is no order entry**, and
+every position is paper / simulated.
+
+```
+pip install -r requirements.txt
+python run_terminal.py                     # MOCK mode: synthetic data, no NinjaTrader, opens the browser
+python run_terminal.py --mode replay       # replay of the SYNTHETIC sample bars
+python run_terminal.py --mode shadow       # live NinjaTrader data (Sprint 6 bridge), simulated fills
+python run_terminal.py --desktop           # desktop window (pip install -r requirements-desktop.txt)
+```
+
+The terminal is local only (127.0.0.1), uses a per-start session token and serves GET routes
+only. See `docs/sprint7_trading_terminal.md` for the architecture, API, WebSocket contract,
+security, development commands and limitations. The Windows desktop window has not yet been
+verified on Windows.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.

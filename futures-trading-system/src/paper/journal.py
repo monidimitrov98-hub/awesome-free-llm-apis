@@ -64,7 +64,9 @@ class Journal:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(fd)
         try:
-            self.db = sqlite3.connect(self.path, isolation_level=None)
+            # one connection per journal; the owning session serializes every access (its state_lock),
+            # so it may be created in one thread and used by the session's worker thread
+            self.db = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             if not exists:
