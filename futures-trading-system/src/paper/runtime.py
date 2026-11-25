@@ -220,7 +220,8 @@ class PaperSession:
         return AccountSnapshot(balance=a.initial_balance + a.net_realized, equity=a.equity(),
                                positions={r: a.position_qty(r) for r in self.roots}, pending_entries=pending,
                                # per-instrument freshness is checked by the authorizer's system stage first
-                               data_fresh=bool(self.health.connected), initial_balance=a.initial_balance)
+                               data_fresh=bool(self.health.connected), initial_balance=a.initial_balance,
+                               known_equity=a.known_equity())
 
     def _prop_observe(self, ts: pd.Timestamp) -> str | None:
         """Feed the engine; journal its records; return a flatten reason if it requests protection."""

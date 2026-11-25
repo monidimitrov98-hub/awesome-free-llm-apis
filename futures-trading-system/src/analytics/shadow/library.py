@@ -322,6 +322,16 @@ class AnalyticsLibrary:
         out["root"] = root
         return out
 
+    def session_report(self, f: Filters) -> dict[str, Any]:
+        from src.analytics.shadow.session_report import session_report
+
+        return session_report(self, f)
+
+    def trace(self, run_id: str, seq: int) -> dict[str, Any] | None:
+        from src.analytics.shadow.session_report import trace
+
+        return trace(self, run_id, seq)
+
     def validation(self) -> dict[str, Any]:
         from src.analytics.shadow.validation import validation_status
 

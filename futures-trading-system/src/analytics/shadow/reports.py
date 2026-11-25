@@ -358,7 +358,7 @@ def regimes(src_list: list[JournalSource], tr: list[dict], keep=None) -> dict[st
 
 # ---------------------------------------------------------------------------------------------- blocked signals
 BLOCK_CATEGORIES = [
-    ("NewsGuard", ("news_",)), ("AccountGuard", ("account_",)),
+    ("NewsGuard", ("news_",)), ("AccountGuard", ("account_",)), ("Prop firm compliance", ("prop_",)),
     ("RiskManager", ("max_daily_loss", "max_daily_trades", "max_position_size", "outside_trading_window",
                      "max_consecutive_losses", "daily_profit_target", "emergency_stop", "outside_session")),
     ("Data health", ("data_", "market_data_stale", "feed_disconnected", "no_market_data", "account_equity_unknown")),

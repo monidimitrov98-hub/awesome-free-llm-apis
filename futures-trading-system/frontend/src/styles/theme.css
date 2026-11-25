@@ -230,3 +230,10 @@ table.t td.wrap { white-space: normal; }
 /* Sprint 8: Shadow Analytics */
 ul.notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; color: var(--text-2, inherit); }
 .note.pad { padding: 8px 12px; margin: 0; }
+
+/* Sprint 10: operational readiness */
+.readiness { display: grid; gap: 4px; }
+.readiness-row { display: grid; grid-template-columns: 14px minmax(140px, 220px) 70px 1fr; gap: 8px; align-items: center; font-size: 12px; }
+.readiness-row .rk { color: var(--text); }
+.readiness-row .rs { font-family: var(--mono, monospace); color: var(--text-2); }
+.readiness-row .rd { color: var(--text-2); overflow-wrap: anywhere; }

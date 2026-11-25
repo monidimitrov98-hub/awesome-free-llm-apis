@@ -122,11 +122,18 @@ class TerminalService:
         self._analytics = None          # Sprint 8 AnalyticsLibrary (lazy; read-only journal analysis)
         self._analytics_error: str | None = None
         self._analytics_lock = threading.Lock()
+        self._start_lock = threading.Lock()
         self.analytics_config = None    # tests may point this at another config/analytics.toml
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
-        self.state = "starting"
+        # one session per service, ever: a second start() would build a SECOND PaperSession on the same state
+        # directory (two writers on one journal). Re-entry is refused, never silently restarted.
+        with self._start_lock:
+            if self.state != "created":
+                log.warning("terminal service already %s: start() ignored (one session per service)", self.state)
+                return
+            self.state = "starting"
         try:
             self.built = build(self.opts, clock=self.clock)
         except Exception as exc:  # noqa: BLE001 -- shown in the GUI, never silently replaced by another mode
@@ -171,6 +178,9 @@ class TerminalService:
             if self._analytics is not None:
                 self._analytics.close()  # release read handles before an ephemeral journal is removed
                 self._analytics = None
+            if getattr(self, "_run_lib", None) is not None:
+                self._run_lib.close()
+                self._run_lib = None
         if b is not None:
             try:
                 b.feed.disconnect()
@@ -416,7 +426,7 @@ class TerminalService:
 
     # ------------------------------------------------------------------ shadow analytics (Sprint 8, read-only)
     SHADOW_REPORTS = ("sessions", "performance", "costs", "execution", "regimes", "blocked", "reliability", "account",
-                      "validation")
+                      "validation", "session_report")
 
     def _library(self):
         """The analytics library: configured journals + this terminal's own session journal."""
@@ -454,6 +464,10 @@ class TerminalService:
             elif report == "journals":
                 lib.refresh()
                 rep = {"journals": lib.journal_status()}
+            elif report == "trace":
+                rep = lib.trace(kw["run_id"], kw["seq"])
+                if rep is None:
+                    raise LookupError("no entry decision with this run id and journal sequence")
             else:
                 rep = getattr(lib, report)(f)
             import json
@@ -478,6 +492,96 @@ class TerminalService:
             body = to_csv(rows, meta) if fmt == "csv" else to_json({"rows": rows}, meta)
             return body, f"shadow_{kind}_{(f.session_type or 'all').lower()}.{fmt}"
 
+    # ------------------------------------------------------------------ operational readiness (Sprint 10)
+    def readiness(self) -> dict[str, Any]:
+        """One evidence-based verdict for the running simulation: BLOCKED, INCOMPLETE or OPERATIONAL
+        (SIMULATION). It is never "SAFE": a simulation that is operational is still only a simulation, and
+        any missing or degraded evidence makes the verdict INCOMPLETE."""
+        from src.risk.prop_firms.engine import ComplianceEngine
+
+        checks: list[dict[str, Any]] = []
+
+        def add(name, state, detail):
+            checks.append({"check": name, "state": state, "detail": detail})
+
+        b = self.built
+        if b is None:
+            add("session", "BLOCK", self.error or "session not started")
+        else:
+            def f(s):
+                add("session", "BLOCK" if self.state == "failed" else "OK" if self.state == "running" else "WARN",
+                    f"{self.state}" + (f" ({self.outcome})" if self.outcome else ""))
+                add("persistence", "OK" if s.persistence_ok else "BLOCK",
+                    "journal commits succeed" if s.persistence_ok else "journal commits failing: entries blocked")
+                add("reconciliation", "OK" if s.reconciliation_ok else "BLOCK",
+                    "state reconciled with the journal" if s.reconciliation_ok else "state does not reconcile: entries blocked")
+                now = s.now()
+                for r in s.roots:
+                    ok, why = s.system_state(r, now)
+                    add(f"market data {r}", "OK" if ok else "WARN", "healthy" if ok else why)
+                g = s.account.guard
+                if not g.enabled:
+                    add("AccountGuard", "WARN", "disabled: no account-survival floor")
+                elif g.breached or g.locked_permanently:
+                    add("AccountGuard", "BLOCK", "breached" if g.breached else "locked permanently")
+                else:
+                    add("AccountGuard", "OK", f"enabled ({g.rules.drawdown_type}, {g.rules.max_drawdown:g})")
+                for r, ng in s.news.items():
+                    try:
+                        st = ng.status(now)
+                        add(f"NewsGuard {r}", "OK" if st.safe else "WARN", st.state.value)
+                    except Exception as exc:  # noqa: BLE001
+                        add(f"NewsGuard {r}", "UNKNOWN", f"state unavailable ({type(exc).__name__}): entries blocked")
+                if s.pcfg.mode == "infrastructure_validation":
+                    add("run mode", "INFO", "infrastructure validation: entries are never authorized")
+                if s.prop is None:
+                    add("prop firm profile", "INFO", "none selected (AccountGuard and RiskManager only)")
+                else:
+                    s.prop.refresh_operational()
+                    dec = s.prop.evaluate_entry(s.last_event_ts or now, s.roots[0], 1, s.prop_snapshot(), scope="status",
+                                                record=False)
+                    cls = ComplianceEngine.classify(dec, s.prop.breached)
+                    state = {"SAFE": "OK", "WARNING": "WARN", "BLOCKED": "BLOCK"}.get(cls, "UNKNOWN")
+                    if not s.prop.recovery_ok or s.prop.breached:
+                        state = "BLOCK"
+                    add("prop firm profile", state, f"{s.prop.profile.key}: {cls}"
+                        + ("" if s.prop.operational.get("operational") else
+                           f" (not operational: {s.prop.operational.get('not_operational_reason')})"))
+                return True
+            self._locked(f)
+            add("data", "INFO", f"{b.info.label} mode, {b.info.data_label} data")
+            try:
+                rep = self._run_report()
+                comp = rep.get("completeness", {})
+                add("shadow results", "OK" if comp.get("status") == "COMPLETE" else "WARN",
+                    "complete" if comp.get("status") == "COMPLETE" else "; ".join(comp.get("reasons", []))[:500]
+                    or comp.get("status", "unknown"))
+            except Exception as exc:  # noqa: BLE001 -- unknown evidence is never reported as complete
+                add("shadow results", "UNKNOWN", f"analysis unavailable ({type(exc).__name__})")
+        states = {c["state"] for c in checks}
+        verdict = "BLOCKED" if "BLOCK" in states else "INCOMPLETE" if states & {"WARN", "UNKNOWN"} \
+            else "OPERATIONAL (SIMULATION)"
+        cont = not any(c["state"] == "BLOCK" and c["check"] in ("session", "persistence", "reconciliation")
+                       for c in checks)
+        return {"verdict": verdict, "checks": checks, "continue_simulation": cont,
+                "continue_reason": "protections and persistence intact" if cont else
+                "the simulation is stopped or its state cannot be trusted",
+                "note": "Simulation only: no order can reach a broker. OPERATIONAL means every check passed; it is not a "
+                        "statement that trading would be safe or profitable.",
+                "evaluated_at": pd.Timestamp.now(tz="UTC").isoformat()}
+
+    def _run_report(self) -> dict[str, Any]:
+        """Session report of THIS terminal's own journal (incremental library, cached per journal)."""
+        from src.analytics.shadow.library import AnalyticsLibrary, Filters, load_analytics_config
+
+        b = self.built
+        with self._analytics_lock:
+            lib = getattr(self, "_run_lib", None)
+            if lib is None:
+                lib = self._run_lib = AnalyticsLibrary([], load_analytics_config(self.analytics_config),
+                                                       extra={f"this terminal ({b.info.label})": b.session.journal.path})
+            return lib.session_report(Filters())
+
     # ------------------------------------------------------------------ prop firm center (Sprint 9, read-only)
     def _prop_registry(self):
         from src.risk.prop_firms.versions import Registry
@@ -496,6 +600,7 @@ class TerminalService:
                         "governed by AccountGuard and RiskManager only. Select one in config/prop_firm.toml "
                         "(exact id and version) or with --prop-profile."}
             now = s.last_event_ts or pd.Timestamp.now(tz="UTC")
+            s.prop.refresh_operational()  # a revocation must never stay hidden behind a cached state
             snap = s.prop_snapshot()
             root = s.roots[0]
             dec = s.prop.evaluate_entry(now, root, 1, snap, scope="status", record=False)
@@ -560,12 +665,16 @@ class TerminalService:
         return diff(pa, pb)
 
     def propfirm_history(self) -> dict[str, Any] | None:
-        from src.risk.prop_firms.reports import journal_report
+        from src.risk.prop_firms.reports import ComplianceJournalReader
 
         b = self.built
         if b is None:
             return None
-        return journal_report(b.session.journal.path)
+        with self._analytics_lock:  # one incremental reader per terminal: only new rows are verified / parsed
+            rd = getattr(self, "_prop_reader", None)
+            if rd is None or rd.path != b.session.journal.path:
+                rd = self._prop_reader = ComplianceJournalReader(b.session.journal.path)
+            return rd.refresh().report()
 
     def system(self) -> dict[str, Any]:
         proc = {}

@@ -111,4 +111,9 @@ export const API: Record<string, unknown> = {
   "/api/propfirm/history": { counts: { evaluations: 2, blocks: 1, eod: 1, breaches: 0 }, block_reasons: { prop_contract_limit: 1 }, timezone: "all times UTC",
     evaluations: [{ seq: 5, time: "2026-11-20T15:00:00Z", scope: "pre_trade", root: "MES", allowed: false, reason: "prop_contract_limit", official_buffer: 900, profile: "x@1" }],
     drawdown_history: [{ seq: 9, trading_date: "2026-11-20", eod_reference: 50200, eod_high: 50200, official_floor: 48700 }] },
+  "/api/readiness": { verdict: "INCOMPLETE", continue_simulation: true, continue_reason: "protections and persistence intact",
+    note: "Simulation only: no order can reach a broker.", evaluated_at: "2026-11-25T10:00:00Z",
+    checks: [{ check: "session", state: "OK", detail: "running" }, { check: "market data MES", state: "OK", detail: "healthy" },
+      { check: "prop firm profile", state: "UNKNOWN", detail: "fundednext_futures_flex_50k_challenge@2026-11-25.1: UNVERIFIED (not operational: profile status UNVERIFIED)" },
+      { check: "shadow results", state: "WARN", detail: "production strategy only: WARN" }] },
 };

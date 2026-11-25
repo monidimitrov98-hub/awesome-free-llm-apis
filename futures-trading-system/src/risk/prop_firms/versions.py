@@ -6,13 +6,19 @@
   record approves EXACTLY that file content (its SHA-256). Changing one character of an active
   profile makes it non-operational until a human approves the new content: there is no silent update.
 * Activation records are appended by a human through ``run_prop_firm.py activate`` (never by code
-  paths that trade). The store is append-only JSON lines; a revocation is a new record.
+  paths that trade). The store is append-only JSON lines; a revocation is a new record. Each record is
+  chained to the previous one (``seq``, ``prev``, ``hash``); with ``FTS_JOURNAL_KEY`` set (the same key as
+  the paper journal) the hash is an HMAC. Any edit, deletion, reordering or replayed line breaks the chain
+  and the store then approves NOTHING. Without the key the chain is tamper-evident but can be recomputed by
+  someone with write access to the file.
 * The selection used by a session names an exact ``id`` AND ``version``: nothing ever picks the
   "latest" version or substitutes another profile.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -70,10 +76,22 @@ class Activations:
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path or ACTIVATIONS_FILE)
 
+    @staticmethod
+    def _digest(rec: dict[str, Any]) -> str:
+        from src.paper.journal import KEY_ENV
+
+        body = json.dumps({k: v for k, v in rec.items() if k != "hash"}, sort_keys=True, separators=(",", ":")).encode()
+        key = os.environ.get(KEY_ENV, "")
+        if key:
+            return "hmac:" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+        return "sha256:" + hashlib.sha256(body).hexdigest()
+
     def records(self) -> list[dict[str, Any]]:
+        """All records, chain-verified. Raises ConfigError on any break (the caller then approves nothing)."""
         if not self.path.is_file():
             return []
         out = []
+        prev = "GENESIS"
         for i, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
@@ -83,6 +101,11 @@ class Activations:
                 raise ConfigError(f"activation record {i} is corrupt: {exc}") from exc
             if not isinstance(rec, dict) or rec.get("action") not in ("activate", "revoke"):
                 raise ConfigError(f"activation record {i} is invalid")
+            if rec.get("seq") != len(out) + 1 or rec.get("prev") != prev:
+                raise ConfigError(f"activation record {i} is out of sequence (edited, removed, reordered or replayed)")
+            if not hmac.compare_digest(str(rec.get("hash", "")), self._digest(rec)):
+                raise ConfigError(f"activation record {i} fails its integrity check (edited, or a different key)")
+            prev = rec["hash"]
             out.append(rec)
         return out
 
@@ -124,12 +147,23 @@ class Activations:
                              "by": by, "reason": reason[:500]})
 
     def _append(self, rec: dict[str, Any]) -> dict[str, Any]:
-        rec = {**rec, "at": pd.Timestamp.now(tz="UTC").isoformat()}
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a+", encoding="utf-8") as fh:
+                try:  # serialize concurrent writers (other processes) where the OS supports it
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                except ImportError:  # pragma: no cover - Windows: the in-process lock still applies
+                    pass
+                existing = self.records()  # refuses to extend a broken chain
+                rec = {**rec, "at": pd.Timestamp.now(tz="UTC").isoformat(), "seq": len(existing) + 1,
+                       "prev": existing[-1]["hash"] if existing else "GENESIS"}
+                rec["hash"] = self._digest(rec)
                 fh.write(json.dumps(rec, sort_keys=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
         return rec
 
 
@@ -183,6 +217,13 @@ def _looser(rule_type: str, key: str, old: Any, new: Any) -> bool | None:
     return None
 
 
+def _looser_text(rule_type: str, key: str, old: Any, new: Any) -> bool | None:
+    if rule_type == "max_loss" and key == "lock_verification":
+        # an unverified lock is not applied (floor keeps trailing): stricter; becoming VERIFIED loosens
+        return (new or "VERIFIED") == "VERIFIED" and (old or "VERIFIED") != "VERIFIED"
+    return None
+
+
 def diff(old: Profile, new: Profile) -> dict[str, Any]:
     """Rule-by-rule differences; flags changes that may be UNSAFE (looser or unknown direction on a
     safety-critical rule). Used before any human activation of a new version."""
@@ -208,6 +249,8 @@ def diff(old: Profile, new: Profile) -> dict[str, Any]:
         for k in sorted(set(a.params) | set(b.params)):
             if a.params.get(k) != b.params.get(k):
                 lo = _looser(a.type, k, a.params.get(k), b.params.get(k))
+                if lo is None:
+                    lo = _looser_text(a.type, k, a.params.get(k), b.params.get(k))
                 changes.append({"rule": rid, "change": f"params.{k}", "old": a.params.get(k), "new": b.params.get(k),
                                 "direction": {True: "LOOSER", False: "STRICTER", None: "UNKNOWN"}[lo]})
                 if lo is True or (lo is None and a.safety_critical):

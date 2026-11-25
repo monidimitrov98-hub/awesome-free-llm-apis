@@ -11,7 +11,11 @@ risk, NewsGuard, strategy or execution configuration, and it never trades.
     python run_shadow_analytics.py sessions --journal data/analytics/journals/replay-20261122T100000/paper_state.db
 
 Journals come from config/analytics.toml ([sources] journals) and/or --journal (repeatable, inside the
-project). Exit codes: 0 ok, 1 configuration / input error, 2 report refused (e.g. mixed session types).
+project).     python run_shadow_analytics.py session-report --session-type REPLAY --out output/analytics
+    python run_shadow_analytics.py trace --run-id <16 hex> --seq <journal seq>
+
+Exit codes: 0 ok, 1 configuration / input error, 2 report refused (e.g. mixed session types),
+3 session report INCOMPLETE (evidence missing or inconsistent).
 """
 
 from __future__ import annotations
@@ -33,7 +37,10 @@ def parse_args(argv=None):
     p.add_argument("--config", type=Path, default=None)
     p.add_argument("--journal", action="append", default=[], help="journal path inside the project (repeatable)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("sessions", "report", "validation", "compare", "export"):
+    t = sub.add_parser("trace", help="explain one entry decision (identity, market events, stages, outcome)")
+    t.add_argument("--run-id", required=True)
+    t.add_argument("--seq", type=int, required=True)
+    for name in ("sessions", "report", "validation", "compare", "export", "session-report"):
         s = sub.add_parser(name)
         if name == "export":
             s.add_argument("kind", choices=EXPORTS)
@@ -44,6 +51,8 @@ def parse_args(argv=None):
         if name == "compare":
             s.add_argument("--a", default="REPLAY")
             s.add_argument("--b", default="SHADOW")
+        if name == "session-report":
+            s.add_argument("--out", type=Path, default=None, help="also write the JSON report to this directory")
         s.add_argument("--root", choices=("MES", "MNQ"))
         s.add_argument("--start")
         s.add_argument("--end")
@@ -71,6 +80,21 @@ def _library(a) -> AnalyticsLibrary:
 
 def main(argv=None) -> int:
     a = parse_args(argv)
+    if a.cmd == "trace":
+        try:
+            lib = _library(a)
+        except (ConfigError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        try:
+            rep = lib.trace(a.run_id, a.seq)
+            if rep is None:
+                print("Error: no entry decision with this run id and journal sequence", file=sys.stderr)
+                return 1
+            print(to_json(rep, {"report": "decision trace"}))
+            return 0
+        finally:
+            lib.close()
     try:
         f = Filters(a.root, a.start, a.end, a.session_type, a.strategy_version, a.regime, a.provider)
         lib = _library(a)
@@ -89,6 +113,19 @@ def main(argv=None) -> int:
                 if j["error"]:
                     print(f"  EXCLUDED {j['run']}: {j['error']}")
             return 0
+        if a.cmd == "session-report":
+            rep = lib.session_report(f)
+            if rep.get("refused"):
+                print(f"Refused: {rep['refused']}", file=sys.stderr)
+                return 2
+            body = to_json(rep, {"report": "shadow session report"})
+            print(body)
+            if a.out:
+                a.out.mkdir(parents=True, exist_ok=True)
+                p = a.out / f"session_report_{(f.session_type or 'all').lower()}_{rep['generated_at'][:19].replace(':', '').replace('-', '')}.json"
+                p.write_text(body, encoding="utf-8")
+                print(f"wrote {p}", file=sys.stderr)
+            return 0 if rep["completeness"]["status"] == "COMPLETE" else 3
         if a.cmd == "validation":
             print(to_json(lib.validation(), {"report": "validation"}))
             return 0

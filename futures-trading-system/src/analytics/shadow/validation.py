@@ -33,6 +33,7 @@ def validation_status(srcs: list[JournalSource], tables: dict[str, list[dict]], 
     add("journal integrity", "FAIL" if errors else "PASS",
         {"verified_runs": len(srcs), "excluded": errors} if errors else f"{len(srcs)} journal(s) chain-verified")
     add("duplicate journals", "WARN" if duplicates else "PASS", duplicates or "no run is analysed twice")
+    add("recovery integrity", *_recovery(srcs))
     runs = []
     for s in srcs:
         ids = s.data.identities
@@ -81,6 +82,33 @@ def validation_status(srcs: list[JournalSource], tables: dict[str, list[dict]], 
         "WARN" if any(c["status"] == "WARN" for c in checks) else "PASS")
     return {"overall": worst, "checks": checks, "runs": runs,
             "note": "Passing checks do not prove an edge: they only mean the evidence is not obviously contaminated."}
+
+
+def _recovery(srcs: list[JournalSource]) -> tuple[str, Any]:
+    """Interrupted / recovered runs: a recovery with reconciliation problems or an unrecovered persistence
+    failure is a FAIL (results incomplete); an unclean interruption or a system error is a WARN."""
+    fail, warn = [], []
+    for s in srcs:
+        persistence_open = False
+        for r in s.data.feed:
+            if r.kind == "recovered":
+                if r.payload.get("reconciliation_problems"):
+                    fail.append(f"{s.label}: recovery with reconciliation problems {r.payload['reconciliation_problems'][:3]}")
+                elif not r.payload.get("clean_shutdown_before", True):
+                    warn.append(f"{s.label}: recovered after an unclean interruption (seq {r.seq})")
+            elif r.kind == "system_error":
+                warn.append(f"{s.label}: system error at seq {r.seq}")
+            elif r.kind == "persistence_failure":
+                persistence_open = True
+            elif r.kind == "persistence_recovered":
+                persistence_open = False
+        if persistence_open:
+            fail.append(f"{s.label}: persistence failure never recovered")
+    if fail:
+        return "FAIL", {"problems": fail, "warnings": warn}
+    if warn:
+        return "WARN", warn
+    return "PASS", "no interrupted or unrecovered run"
 
 
 def _oos(tables) -> tuple[str, Any]:

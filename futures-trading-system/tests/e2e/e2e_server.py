@@ -65,7 +65,7 @@ def main() -> None:
     elif scenario == "prop-firm":  # the FundedNext research profile (UNVERIFIED): every entry must be blocked
         opts = ModeOptions(mode="replay", speed=speed, replay_start="2025-03-12",
                            strategy_factory=lambda root: EveryNthBarTestStrategy(), tests_disable_regime_gate=True,
-                           prop_profile="fundednext_futures_flex_50k_challenge@2026-11-22.1",
+                           prop_profile="fundednext_futures_flex_50k_challenge@2026-11-25.1",
                            prop_initial_balance_from_profile=True)
     elif scenario == "shadow-analytics":  # a fast replay run with simulated trades, analysed in Shadow Analytics
         opts = ModeOptions(mode="replay", speed=speed, replay_start="2025-03-12",

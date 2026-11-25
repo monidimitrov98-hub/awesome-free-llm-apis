@@ -47,6 +47,7 @@ _ID = re.compile(r"^[a-z0-9][a-z0-9_\-]{1,79}$")
 _VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.\-]{0,39}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_RULE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")   # ids end up in reason codes, journals and exports
 
 # Required parameters per rule type (the engine's generic evaluators). A mandatory applicable rule
 # without them makes the profile INCOMPLETE.
@@ -238,6 +239,8 @@ def _validate_params(r: RuleSpec, where: str) -> None:
             _num(p["lock_at"], f"{where}: {r.id}.lock_at", positive=True)
         if p.get("reference", "balance") not in ("balance", "equity"):
             raise ConfigError(f"{where}: rule {r.id} reference must be 'balance' or 'equity'")
+        if p.get("lock_verification", "VERIFIED") not in RULE_VERIFICATION:
+            raise ConfigError(f"{where}: rule {r.id} lock_verification must be one of {RULE_VERIFICATION}")
         if p.get("breach_when", "at_or_below") not in ("at_or_below", "below"):
             raise ConfigError(f"{where}: rule {r.id} breach_when must be 'at_or_below' or 'below'")
     elif r.type == "max_contracts":
@@ -318,7 +321,8 @@ def load_profile(path: str | Path) -> Profile:
     for s in raw.get("sources", []):
         if set(s) - _SOURCE_KEYS:
             raise ConfigError(f"{p.name}: unknown source key(s) {sorted(set(s) - _SOURCE_KEYS)}")
-        if not s.get("id") or not str(s.get("url", "")).startswith("https://"):
+        if not _RULE_ID.match(str(s.get("id", ""))) or not str(s.get("url", "")).startswith("https://") \
+                or any(c in str(s.get("url")) for c in "\r\n\t \"'<>"):
             raise ConfigError(f"{p.name}: every source needs an id and an https url")
         sources.append(Source(**{k: str(v) for k, v in s.items()}))
     src_ids = {s.id for s in sources}
@@ -328,7 +332,9 @@ def load_profile(path: str | Path) -> Profile:
     for r in raw.get("rules", []):
         if set(r) - _RULE_KEYS:
             raise ConfigError(f"{p.name}: unknown rule key(s) {sorted(set(r) - _RULE_KEYS)} in {r.get('id')}")
-        if not r.get("id") or r.get("type") not in RULE_TYPES:
+        if not _RULE_ID.match(str(r.get("id", ""))):
+            raise ConfigError(f"{p.name}: rule id {r.get('id')!r} must be 1-64 letters, digits, '_', '-' or '.'")
+        if r.get("type") not in RULE_TYPES:
             raise ConfigError(f"{p.name}: rule {r.get('id')!r} has an unknown type {r.get('type')!r}")
         if r.get("severity", "block") not in SEVERITIES:
             raise ConfigError(f"{p.name}: rule {r['id']} severity must be one of {SEVERITIES}")
@@ -347,6 +353,8 @@ def load_profile(path: str | Path) -> Profile:
                         effective=str(r.get("effective", "")), ambiguity=str(r.get("ambiguity", "")), stages=stages,
                         params=dict(r.get("params", {})))
         _validate_params(spec, p.name)
+        if spec.applicable and spec.mandatory and not spec.description.strip():
+            raise ConfigError(f"{p.name}: mandatory rule {spec.id} needs a description")
         if spec.applicable and spec.verification == "VERIFIED" and not refs:
             raise ConfigError(f"{p.name}: rule {spec.id} is VERIFIED but cites no source")
         rules.append(spec)

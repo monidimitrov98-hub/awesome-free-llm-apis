@@ -72,6 +72,10 @@ async function expectText(page, text, timeout = 60000) {
       await expectText(page, "NOT REVIEWED");
       await v("History");
       await page.getByText("prop_profile_not_operational").first().waitFor({ timeout: 120000 });  // real blocks
+      await page.evaluate(() => { window.location.hash = "/dashboard"; });        // Sprint 10 readiness verdict
+      await expectText(page, "Operational readiness");
+      await page.getByText(/^(INCOMPLETE|BLOCKED)$/).first().waitFor({ timeout: 60000 });
+      if (await page.getByText("OPERATIONAL (SIMULATION)", { exact: true }).count()) throw new Error("unverified profile shown as operational");
     } else if (scenario === "mock-fail") {
       await expectText(page, "MOCK");
       await expectText(page, "MARKET FEED DEGRADED", 60000);          // degraded feed is never hidden

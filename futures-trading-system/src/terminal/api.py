@@ -264,9 +264,14 @@ def create_app(service: TerminalService, *, token: str, port: int, dev: bool = F
         return Response(body, media_type="text/csv" if fmt == "csv" else "application/json",
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
+    @app.get("/api/shadow/trace", dependencies=A + [Depends(heavy_limit)])
+    def shadow_trace(run_id: str = Query(..., pattern=r"^[0-9a-f]{16}$"), seq: int = Query(..., ge=1, le=10**12)) -> Any:
+        return shadow_call(lambda: service.shadow("trace", {}, run_id=run_id, seq=seq))
+
     @app.get("/api/shadow/{report}", dependencies=A + [Depends(heavy_limit)])
     def shadow(report: Literal["sessions", "performance", "costs", "execution", "regimes", "blocked", "reliability",
-                               "account", "validation", "journals"], f: dict = Depends(shadow_filters)) -> Any:
+                               "account", "validation", "journals", "session_report"],
+               f: dict = Depends(shadow_filters)) -> Any:
         return shadow_call(lambda: service.shadow(report, f))
 
     # ------------------------------------------------------------------ Prop Firm Center (Sprint 9, read-only)
@@ -284,6 +289,10 @@ def create_app(service: TerminalService, *, token: str, port: int, dev: bool = F
         from src.analytics.shadow.library import _jsonable
 
         return _jsonable(out)
+
+    @app.get("/api/readiness", dependencies=A + [Depends(heavy_limit)])
+    def readiness() -> Any:
+        return prop_call(service.readiness)
 
     @app.get("/api/propfirm/status", dependencies=A)
     def propfirm_status() -> Any:

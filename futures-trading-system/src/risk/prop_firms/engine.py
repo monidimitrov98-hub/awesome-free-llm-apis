@@ -70,6 +70,7 @@ class AccountSnapshot:
     pending_entries: dict[str, int] = field(default_factory=dict)  # root -> working entry quantity
     data_fresh: bool = True              # market data healthy for every instrument with a position / entry
     initial_balance: float | None = None
+    known_equity: float | None = None    # balance + open P&L of the MARKED positions only (protective use)
 
     @property
     def unrealized(self) -> float:
@@ -217,6 +218,17 @@ class ComplianceEngine:
         v = snap.equity if ref == "equity" else snap.balance
         return v if _finite(v) else None
 
+    def lock_level(self) -> float | None:
+        """The level at which the trailing floor stops, ONLY when both the loss rule and its lock are VERIFIED.
+        An unverified / conflicting lock is never applied: without it the floor keeps trailing, which can only
+        be stricter than any interpretation with a lock."""
+        ml = self.profile.rule("max_loss")
+        if ml is None or ml.params.get("lock_at") is None or ml.params.get("model") == "static":
+            return None
+        if ml.verification != "VERIFIED" or ml.params.get("lock_verification", "VERIFIED") != "VERIFIED":
+            return None
+        return float(ml.params["lock_at"])
+
     def official_floor(self) -> float | None:
         ml = self.profile.rule("max_loss")
         if ml is None or ml.missing_params:
@@ -225,9 +237,9 @@ class ComplianceEngine:
         base = {"static": self.profile.initial_balance, "trailing_eod": self.eod_high,
                 "trailing_intraday": self.intraday_high}[model]
         floor = base - amount
-        lock = ml.params.get("lock_at")
-        if lock is not None and model != "static":
-            floor = min(floor, float(lock))
+        lock = self.lock_level()
+        if lock is not None:
+            floor = min(floor, lock)
         self.floor_max = max(self.floor_max, floor)
         return self.floor_max
 
@@ -290,10 +302,15 @@ class ComplianceEngine:
                     out.append({"action": "journal", "kind": "prop_firm_breach", "payload": dict(self.breach)})
                 if snap.any_position and (self.breached or b["estimated_buffer"] <= self.profile.internal.flatten_reserve + EPS):
                     out.append({"action": "flatten", "reason": "prop_firm_max_loss_protection"})
-            elif snap.any_position and ml is not None:
-                # equity unknown with a position open: no breach recorded from partial information; the
-                # runtime's AccountGuard partial-equity protection still applies. Entries stay blocked.
-                pass
+            elif snap.any_position and ml is not None and b["official_floor"] is not None \
+                    and _finite(snap.known_equity):
+                # Full equity unknown (an open position has no valid mark, e.g. after a restart). The losses that
+                # ARE known must still protect the account even when AccountGuard is disabled: flatten when they
+                # alone reach the flatten reserve. No breach is recorded from partial information; entries stay
+                # blocked (prop_equity_unavailable).
+                known = snap.known_equity - b["official_floor"] - self.profile.internal.uncertainty_reserve
+                if known <= self.profile.internal.flatten_reserve + EPS:
+                    out.append({"action": "flatten", "reason": "prop_firm_max_loss_protection_partial_equity"})
             if snap.any_position and self._must_be_flat(ts):
                 out.append({"action": "flatten", "reason": "prop_firm_flat_by"})
             return out
@@ -390,12 +407,8 @@ class ComplianceEngine:
                 self._roll(self.trading_date(ts), snap.balance, ts, self._pending_journal)
             p, it = self.profile, self.profile.internal
             res: list[RuleResult] = []
-            if record and self.operational_check is not None:
-                try:
-                    self.operational = dict(self.operational_check())
-                except Exception as exc:  # noqa: BLE001 -- an unreadable approval store approves nothing
-                    self.operational = {"operational": False, "status": "UNKNOWN",
-                                        "not_operational_reason": f"activation state unreadable ({type(exc).__name__})"}
+            if record:
+                self.refresh_operational()
             op = self.operational
             res.append(RuleResult("engine:profile_operational", "profile", PASS if op.get("operational") else BLOCK,
                                   "" if op.get("operational") else "prop_profile_not_operational",
@@ -635,16 +648,28 @@ class ComplianceEngine:
                               "enforces the firm's loss limit (AccountGuard remains the survival authority when on)")]
         model_map = {"static": "static", "trailing_eod": "trailing_eod", "trailing_intraday": "trailing_intraday"}
         looser = ag.max_drawdown > float(ml.params["amount"]) + EPS or ag.drawdown_type != model_map[ml.params["model"]]
-        lock = ml.params.get("lock_at")
-        if not looser and lock is not None and ml.params["model"] != "static" and ag.floor_lock_offset is not None:
-            # AccountGuard's floor stops trailing at initial + offset; below the firm's lock level it is looser
-            looser = self.profile.initial_balance + float(ag.floor_lock_offset) < float(lock) - EPS
+        lock = self.lock_level()
+        if not looser and ml.params["model"] != "static" and ag.floor_lock_offset is not None:
+            # AccountGuard's floor stops trailing at initial + offset: looser when below the firm's (applied) lock
+            # level, or when the firm floor is modelled without a lock at all
+            looser = lock is None or self.profile.initial_balance + float(ag.floor_lock_offset) < lock - EPS
         if looser:
             return [self._res(None, "account_guard", WARNING, "",
                               f"AccountGuard ({ag.drawdown_type}, {ag.max_drawdown:g}) is not at least as strict as the "
                               f"firm rule ({ml.params['model']}, {ml.params['amount']}); this engine still enforces the "
                               "firm threshold for entries and requests protective flattening")]
         return [self._res(None, "account_guard", PASS, "", "AccountGuard is at least as strict as the firm loss rule")]
+
+    def refresh_operational(self) -> dict[str, Any]:
+        """Re-read the human activation state (a revocation is visible immediately, also in read-only views)."""
+        with self._lock:
+            if self.operational_check is not None:
+                try:
+                    self.operational = dict(self.operational_check())
+                except Exception as exc:  # noqa: BLE001 -- an unreadable approval store approves nothing
+                    self.operational = {"operational": False, "status": "UNKNOWN",
+                                        "not_operational_reason": f"activation state unreadable ({type(exc).__name__})"}
+            return self.operational
 
     @staticmethod
     def classify(dec: ComplianceDecision, breached: bool) -> str:
@@ -751,9 +776,12 @@ class ComplianceEngine:
                 "drawdown_model": ml.params.get("model") if ml else None,
                 "official_threshold": {"floor": b["official_floor"], "amount": ml.params.get("amount") if ml else None,
                                        "lock_at": ml.params.get("lock_at") if ml else None,
+                                       "lock_applied": self.lock_level() is not None,
+                                       "lock_verification": (ml.params.get("lock_verification", ml.verification)
+                                                             if ml and ml.params.get("lock_at") is not None else None),
                                        "rule": ml.id if ml else None, "verification": ml.verification if ml else None,
-                                       "locked": bool(ml and ml.params.get("lock_at") is not None and b["official_floor"]
-                                                      is not None and b["official_floor"] >= float(ml.params["lock_at"]) - EPS)},
+                                       "locked": bool(self.lock_level() is not None and b["official_floor"] is not None
+                                                      and b["official_floor"] >= self.lock_level() - EPS)},
                 "official_buffer": b["official_buffer"], "uncertainty_reserve": p.internal.uncertainty_reserve,
                 "estimated_buffer": b["estimated_buffer"], "internal_safety_reserve": p.internal.safety_reserve,
                 "internal_flatten_reserve": p.internal.flatten_reserve,

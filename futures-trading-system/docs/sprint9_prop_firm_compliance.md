@@ -1,5 +1,8 @@
 # Sprint 9: Prop firm account protection and compliance engine
 
+> Sprint 10 update: FundedNext versions `2026-11-25.1` supersede `2026-11-22.1` (kept unchanged). A conflict on
+> when the MLL locks was found; an unverified lock is no longer applied. See `docs/sprint10_compliance_validation.md`.
+
 This is compliance and simulation tooling. It decides whether a **new simulated entry** complies
 with a configured prop firm profile, and it watches the account against that profile. It sends no
 orders, has no broker methods, never changes an account at a firm, never submits payouts, and

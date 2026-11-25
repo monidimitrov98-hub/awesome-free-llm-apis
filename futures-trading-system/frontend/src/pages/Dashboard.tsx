@@ -26,6 +26,31 @@ export function ActivityFeed({ items, tz, limit = 30 }: { items: Activity[]; tz:
 const INTERESTING = new Set(["entry_decision", "execution", "trade_closed", "flatten_requested", "account_guard", "daily_loss_limit",
   "feed_health", "data_delayed", "feed_disconnected", "feed_connected", "system_error", "emergency_stop", "price_level_reset"]);
 
+const readinessTone = (v?: string) => (v === "BLOCKED" ? "neg" : v === "INCOMPLETE" ? "warn" : v ? "info" : "off");
+const checkTone = (s: string) => (s === "OK" ? "pos" : s === "BLOCK" ? "neg" : s === "WARN" ? "warn" : s === "UNKNOWN" ? "warn" : "off");
+
+/** Sprint 10: evidence-based readiness of the running SIMULATION. Never shows "SAFE". */
+export function Readiness({ tick }: { tick: unknown }) {
+  const { data, error } = useApi<any>("/api/readiness", tick, 10000);
+  if (error) return <Panel title="Operational readiness"><Badge tone="warn">UNKNOWN</Badge> <span className="note">Readiness unavailable: {error}</span></Panel>;
+  if (!data) return null;
+  return (
+    <Panel title="Operational readiness" right={<Badge tone={readinessTone(data.verdict) as never}>{data.verdict}</Badge>}>
+      <div className="readiness">
+        {data.checks.map((c: any) => (
+          <div key={c.check} className="readiness-row">
+            <Dot tone={checkTone(c.state) as never} title={c.state} />
+            <span className="rk">{c.check}</span>
+            <span className="rs">{c.state}</span>
+            <span className="rd">{c.detail}</span>
+          </div>
+        ))}
+      </div>
+      <p className="note">{data.continue_simulation ? "The simulation can continue: " : "Do not rely on this simulation: "}{data.continue_reason}. {data.note}</p>
+    </Panel>
+  );
+}
+
 export function Dashboard() {
   const { state, prefs } = useTerminal();
   const tz = tzOf(prefs);
@@ -37,6 +62,7 @@ export function Dashboard() {
   return (
     <div className="stack">
       <div className="page-head"><h1>Dashboard</h1><span className="sub">{meta?.description}</span></div>
+      <Readiness tick={state.statusTick} />
       <div className="grid g2">
         {(meta?.instruments ?? []).map((r) => {
           const m = market?.instruments[r];

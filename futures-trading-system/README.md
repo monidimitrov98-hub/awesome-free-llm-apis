@@ -1325,6 +1325,29 @@ python run_prop_firm.py show fundednext_futures_flex_50k_challenge 2026-11-22.1
 python run_prop_firm.py evaluate fundednext_futures_flex_50k_challenge 2026-11-22.1 --balance 50000 --equity 49900 --root MES
 ```
 
+## Sprint 10: Compliance validation, adversarial testing and shadow verification
+
+- **FundedNext re-verification:** done with FundedNext's knowledge base. The full pages were
+  unreachable from the build environment. A newly found conflict on when the Maximum Loss Limit
+  locks gave rise to new, still UNVERIFIED profile versions `2026-11-25.1`. In them the $50,100
+  lock is not applied, which keeps the floor trailing and is stricter.
+- **Adversarial audit:** nine defects were reproduced against the Sprint 9 code and fixed with
+  regression tests (none critical or high). They include a hash-chained, HMAC-capable activation
+  store, a protective flatten on known losses when equity is unknown, an incremental compliance
+  journal reader, and a terminal service that never starts a second session.
+- **Shadow verification:** a reproducible session report with a COMPLETE / INCOMPLETE verdict, a
+  per-decision trace (identity, market data, stages, outcome), and recovery-integrity checks.
+- **Readiness:** an operational readiness verdict on the Dashboard (`/api/readiness`). It is never
+  "SAFE".
+
+See `docs/sprint10_compliance_validation.md` and `docs/sprint10_quant_integration_assessment.md`.
+
+```
+python run_shadow_analytics.py session-report --session-type SHADOW --out output/analytics
+python run_shadow_analytics.py trace --run-id <16 hex> --seq <journal seq>
+python run_prop_firm.py diff fundednext_futures_flex_50k_challenge 2026-11-22.1 2026-11-25.1
+```
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.

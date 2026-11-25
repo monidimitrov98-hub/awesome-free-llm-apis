@@ -1,0 +1,61 @@
+# Sprint 10 re-verification of the FundedNext Futures Flex $50K rules (retrieved 2026-11-25).
+#
+# ACCESS ATTEMPTS (full pages):
+#   1. Direct HTTPS from the build environment -> refused by the environment proxy (CONNECT 403).
+#   2. helpfutures.fundednext.com and help.fundednext.com were added to the environment's allowed hosts;
+#      the direct download was then refused by the session's permission policy (not bypassed).
+#   3. The page-fetch service could not resolve helpfutures.fundednext.com (ENOTFOUND).
+#   => The full help-center pages remain UNREAD. Only FundedNext's official knowledge-base search (excerpts
+#      with article URLs) was available. No effective dates were shown in any excerpt.
+#
+# Excerpts are quoted exactly as returned (excerpts end mid-sentence where the source was truncated).
+
+[[findings]]
+point = "1. End-of-day trailing time"
+status = "UNVERIFIED"
+evidence = ["S4 17230292: 'It updates once per day at the end of…' (truncated, unchanged since 2026-11-22)"]
+
+[[findings]]
+point = "2. Equity exactly at the loss limit"
+status = "UNVERIFIED"
+evidence = ["S4 17230292 (daily loss limit context, not MLL): 'So on the next day, equity reaching $50,500 or lower triggers the soft breach.'",
+            "No MLL-specific wording found."]
+
+[[findings]]
+point = "3. Holiday / early-close schedule"
+status = "NOT_FOUND"
+evidence = ["S10 17225754: 'Holiday trading hours — including any early market closes and the handling of open positions — will be communicated to traders in advance.'",
+            "S16 14297791: 'During full or partial market holidays, trading may be disabled either for the entire server or for specific exchanges/instruments. ... To confirm if a market holiday is in effect: Check your email for recent notifications from FundedNext regarding…'"]
+
+[[findings]]
+point = "4. Daily profit for the consistency rule"
+status = "UNVERIFIED"
+evidence = ["Futures Bolt / Legacy examples (14281897, 14282421): 'Formula: 40% x Profit Target = Daily Profit Threshold ... a trader must keep daily profits below $1,200 to stay within the rule.'",
+            "No definition of net/gross, realized/open P&L or the day boundary for 'daily profit'."]
+
+[[findings]]
+point = "5. Benchmark Day definition"
+status = "UNVERIFIED"
+evidence = ["17230209: 'A day qualifies as a Benchmark Day if you achieve at least the minimum…' (truncated)",
+            "CFD article 16033786 (FNL:001, NOT Futures): 'a specific minimum profit target based on closed trades, and profit is attributed to the day the trade closes' -- not applied to Futures."]
+
+[[findings]]
+point = "6. Cycle reset after a withdrawal"
+status = "UNVERIFIED"
+evidence = ["S11 14878865: 'you can withdraw up to 50% of your accumulated profit (up to a maximum cap depending on account size) after every 5 benchmark days.'",
+            "Legacy FundedNext Account (17229581, other product): 'Trade and accumulate at least 5 Benchmark Days and $500 profit in the cycle.'"]
+
+[[findings]]
+point = "7. Loss limit and payouts"
+status = "CONFLICTING"
+evidence = ["S11 14878865 Key Takeaway: 'Maximum Loss Limit Locks — Locks at $50,100 after first payout ... The first withdrawal resets the maximum loss limit (MLL) back to $50,100, $100,100 & $150,100 for $50K, $100K and $150K accounts.'",
+            "S4 17230292: 'the MLL locks at your initial balance (initial + $100 for Flex and Rapid Pro…'; 'Flex: $50,100 / $100,100 / $150,100.'",
+            "S17 17242064: 'If this is your first Performance Reward, your maximum loss limit will be set to your initial account balance. For example, if your account size is $50,000, after the withdrawal of your Performance Reward (Rapid & Legacy), the Maximum Loss Limit will also lock…'"]
+consequence = "Profile versions 2026-11-25.1 mark the lock CONFLICTING; the engine no longer applies the $50,100 lock (stricter)."
+
+[[findings]]
+point = "8. Challenge vs Funded vs Road to Live"
+status = "DOCUMENTED, live stage not applied"
+evidence = ["S18 16522296 / S14 15430139: 'Account Size Starting Balance Max Loss Limit (MLL) ... 50K $2,000 Starts from $0'; 'Contracts (After MLL Locks) 50K ... 6 Mini | 60 Micro'; 'The MLL locks in any of two situations: When you request a payout; When your…'",
+            "14269280: 'Note: You can move to live trading as early as 5 withdrawals of…'",
+            "S11: 'After 5 Performance Reward Withdrawals, the Flex FundedNext…' (truncated)"]
