@@ -213,3 +213,14 @@ def test_mean_reversion_runs_are_deterministic_and_scoped(env):
     one = replace(pv.params, scope=replace(pv.params.scope, instruments=("MNQ",)))
     with pytest.raises(ConfigError, match="scoped to"):
         run_spec(mds["MES"], app, bt, spec, one, label="c")
+
+
+def test_compat_frames_helper_works_without_an_app_config(env):
+    """Regression (full suite): src.backtest.runner._frames(md, cfg) is called by existing code without an
+    AppConfig; the registry refactor must keep that working."""
+    from src.backtest.runner import _frames
+
+    app, bt, cfg, relaxed, mds = env
+    signal, execution, context = _frames(mds["MNQ"], cfg)
+    assert signal is mds["MNQ"].frames[cfg.signal_timeframe] and execution is mds["MNQ"].frames[cfg.execution_timeframe]
+    assert list(context) == [cfg.context_timeframe]

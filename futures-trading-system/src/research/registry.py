@@ -92,7 +92,8 @@ def _tp_prepare(md, app, cfg, regime=None) -> Prepared:
         # strategy context first, then the regime context (same keys -> the regime-featured frame, as before)
         context = {**context, **rctx}
         return Prepared(signal, execution, context, app.session, regime.enforcement)
-    return Prepared(signal, execution, context, app.session, None)
+    # app may be None for the frames-only compatibility helper src.backtest.runner._frames (no session needed)
+    return Prepared(signal, execution, context, app.session if app is not None else None, None)
 
 
 def _tp_build(cfg, app, session: SessionConfig):
