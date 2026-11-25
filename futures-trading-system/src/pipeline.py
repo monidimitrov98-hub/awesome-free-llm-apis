@@ -104,6 +104,15 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
             "series, roll gaps may distort indicators",
         )
 
+    return build_market_data_from_bars(df, config, contract=contract, contract_source=source, report=report,
+                                       is_synthetic=is_synthetic, notes=notes)
+
+
+def build_market_data_from_bars(df: pd.DataFrame, config: AppConfig, *, contract: ContractInfo, contract_source: str,
+                                report: DataQualityReport, is_synthetic: bool, notes: list[str]) -> MarketData:
+    """Validation -> optional out-of-session removal -> resampling -> indicators, for bars that are already
+    loaded with a UTC index (a CSV via :func:`build_market_data`, or a Sprint 12 dataset)."""
+    dcfg = config.data
     # Validation.
     session = config.session
     report, invalid = validate_ohlcv(
@@ -151,7 +160,7 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
 
     return MarketData(
         contract=contract,
-        contract_source=source,
+        contract_source=contract_source,
         base=base,
         frames=frames,
         report=report,
@@ -160,4 +169,4 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
     )
 
 
-__all__ = ["MarketData", "build_market_data"]
+__all__ = ["MarketData", "build_market_data", "build_market_data_from_bars"]

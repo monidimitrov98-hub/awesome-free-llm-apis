@@ -11,6 +11,12 @@ export const API: Record<string, unknown> = {
     experiments: { total: 3, failed: 1, unfinished: 0, integrity_ok: true, recent: [
       { attempt: "aaaaaaaaaaaaaaaa", at: "2026-11-25T10:00:00Z", strategy: "vwap_mean_reversion", version: "V1-C2-SWING", instrument: "MES", purpose: "train", status: "failed", period: { start: "2024-01-02", end: "2024-06-28" }, evidence: null, registered: true, error: "ConfigError: no data" }] },
     oos: { ledger_ok: true, reveals: [] },
+    data: { registry_ok: true, note: "Data quality view only. Nothing here downloads, ingests, validates or promotes.", datasets: [
+      { ref: "syn.mes.cont@v1", status: "VALIDATED", kind: "continuous", adjustment: "none", synthetic: true, provider: "derived_continuous",
+        contracts: ["MESH25", "MESM25"], first_bar_utc: "2025-03-05T22:00:00Z", last_bar_utc: "2025-03-20T19:59:00Z", resolution: "1min", trade_dates: 11,
+        readiness: { indicators: "NOT_READY", backtesting: "NOT_READY", walk_forward: "NOT_READY", oos_validation: "NOT_READY", monte_carlo: "NOT_READY" },
+        blocking: ["SYNTHETIC data: never evidence of market behaviour"], integrity_ok: true },
+      { ref: "broken.mes@v1", status: "INTEGRITY FAILURE", integrity_ok: false, error: "file bars.csv.gz was modified (hash mismatch)" }] },
     runs: [{ attempt: "0123456789abcdef", strategy: "vwap_mean_reversion", version: "V1-C2-SWING", overrides: null, registered: true, purpose: "train", instrument: "MES:synthetic",
       period: { start: "2025-03-10", end: "2025-03-14" }, synthetic: true, evidence: "INSUFFICIENT EVIDENCE", trades: 3, mean_daily: -26.5, mean_daily_ci95: [-45, -8], p_holm: 0.71, family_size: 5,
       compliance: "INCOMPLETE -- RESEARCH ONLY", code_trusted: false, monte_carlo: true }],

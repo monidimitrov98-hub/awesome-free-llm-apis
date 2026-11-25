@@ -24,7 +24,15 @@ export function stateTone(s?: string | null): Tone {
 const coverageTone = (v?: string | null): Tone => (v === "COMPLETE FOR SUPPORTED RULES" ? "info" : v === "NO PROP PROFILE" ? "off" : "warn");
 const frac = (x: unknown) => (isNum(x) ? pct(x * 100) : "—");    // backend sends fractions (0..1)
 const ci = (x?: number[] | null) => (x && x.length === 2 ? `[${money(x[0])}, ${money(x[1])}]` : "—");
-type View = "runs" | "versions" | "experiments" | "oos";
+type View = "runs" | "versions" | "experiments" | "oos" | "datasets";
+export function dataStatusTone(s?: string | null): Tone {
+  // even CROSS_SOURCE_VALIDATED is information, never a green "safe to trade"
+  if (s === "VALIDATION_FAILED" || s === "INTEGRITY FAILURE") return "neg";
+  if (s === "VALIDATED" || s === "CROSS_SOURCE_VALIDATED") return "info";
+  if (s === "INGESTED" || s === "UNVERIFIED") return "warn";
+  return "off";
+}
+const readyTone = (v?: string): Tone => (v === "READY" ? "info" : v === "READY_WITH_LIMITATIONS" ? "warn" : "neg");
 
 export function Research() {
   const { prefs } = useTerminal();
@@ -54,11 +62,13 @@ export function Research() {
         </Panel>
         <Seg<View> value={view} onChange={setView} label="Research view" options={[
           { value: "runs", label: "Runs" }, { value: "versions", label: "Versions & promotion" },
-          { value: "experiments", label: "Experiments" }, { value: "oos", label: "Out-of-sample ledger" }]} />
+          { value: "experiments", label: "Experiments" }, { value: "oos", label: "Out-of-sample ledger" },
+          { value: "datasets", label: "Datasets" }]} />
         {view === "runs" && <RunsView runs={d.runs ?? []} sel={sel} setSel={setSel} tz={tz} />}
         {view === "versions" && <VersionsView rows={d.versions ?? []} error={d.versions_error} />}
         {view === "experiments" && <ExperimentsView e={d.experiments} tz={tz} />}
         {view === "oos" && <OosView o={d.oos} tz={tz} />}
+        {view === "datasets" && <DatasetsView d={d.data} />}
       </>}
     </div>
   );
@@ -196,6 +206,27 @@ function OosView({ o, tz }: { o: any; tz: string }) {
         { key: "strategy", label: "Configuration", render: (r: any) => (r.strategy ? <span className="mono">{r.strategy}@{r.version}</span> : "run_backtest.py") },
         { key: "evidence", label: "Evidence", render: (r: any) => (r.evidence ? <Badge tone={evidenceTone(r.evidence)}>{r.evidence}</Badge> : "—") }]} />
         : <Empty title="No out-of-sample reveal recorded">Revealed dates can never be used for research again.</Empty>}
+    </Panel>
+  );
+}
+
+function DatasetsView({ d }: { d: any }) {
+  if (!d) return null;
+  const uses = ["indicators", "backtesting", "walk_forward", "oos_validation", "monte_carlo"];
+  return (
+    <Panel title="Historical datasets (immutable versions; read-only)" flush>
+      {!d.registry_ok && <ErrorBox error={`Dataset registry unavailable: ${d.error}`} />}
+      {d.datasets?.length ? <Table rows={d.datasets} rowKey={(r: any) => r.ref} columns={[
+        { key: "ref", label: "Dataset", render: (r: any) => <span className="mono">{r.ref}</span> },
+        { key: "status", label: "Status", render: (r: any) => <Badge tone={dataStatusTone(r.status)}>{r.status}</Badge> },
+        { key: "kind", label: "Kind", render: (r: any) => <>{r.kind ?? "—"}{r.adjustment && r.adjustment !== "none" && <Badge tone="warn">ADJUSTED</Badge>}{r.synthetic && <Badge tone="warn">SYNTHETIC</Badge>}</> },
+        { key: "provider", label: "Provider" },
+        { key: "contracts", label: "Contracts", render: (r: any) => (r.contracts ?? []).join(", ") || "—" },
+        { key: "span", label: "Bars (UTC)", render: (r: any) => (r.first_bar_utc ? `${String(r.first_bar_utc).slice(0, 10)} … ${String(r.last_bar_utc).slice(0, 10)}` : r.error ?? "—") },
+        { key: "trade_dates", label: "Trade dates", num: true, render: (r: any) => int(r.trade_dates) },
+        ...uses.map((u) => ({ key: u, label: u.replace("_", " "), render: (r: any) => (r.readiness ? <Badge tone={readyTone(r.readiness[u])}>{r.readiness[u]}</Badge> : "—") }))]} />
+        : <Empty title="No dataset ingested">Datasets are ingested with run_data.py from provider files (no real market data is in the repository).</Empty>}
+      <p className="note">{d.note}</p>
     </Panel>
   );
 }

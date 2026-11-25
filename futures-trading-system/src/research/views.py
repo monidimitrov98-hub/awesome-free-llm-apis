@@ -18,6 +18,7 @@ from src.config import PROJECT_ROOT
 RESEARCH_ROOT = PROJECT_ROOT / "output" / "research"
 _ATTEMPT = re.compile(r"^[0-9a-f]{16}$")
 MAX_RUNS = 500
+MAX_DATASETS = 100
 LIMITATIONS = [
     "Research results are historical simulations; none is evidence of future profitability.",
     "VWAP Mean Reversion V1 is a RESEARCH candidate: confirmation methods C1-C4 and the stop methods are "
@@ -64,8 +65,38 @@ def _mc_summary(folder: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def datasets_view(datasets_root: Path | None = None) -> dict[str, Any]:
+    """Sprint 12: registered datasets with status, provenance summary and readiness verdicts (read-only)."""
+    from src.histdata.readiness import assess
+    from src.histdata.store import DatasetStore
+
+    try:
+        store = DatasetStore(datasets_root)
+        rows = []
+        for v in store.versions()[-MAX_DATASETS:][::-1]:
+            ref = f"{v['dataset_id']}@{v['version']}"
+            try:
+                ds = store.load(ref)
+                r = assess(ds)
+                rows.append({"ref": ref, "status": ds.status, "kind": ds.manifest["kind"],
+                             "adjustment": ds.manifest["adjustment"], "synthetic": ds.manifest["synthetic"],
+                             "provider": ds.manifest["provider"]["adapter"], "contracts": sorted(ds.manifest["contracts"]),
+                             "first_bar_utc": ds.manifest["first_bar_utc"], "last_bar_utc": ds.manifest["last_bar_utc"],
+                             "resolution": ds.manifest["resolution"], "trade_dates": r["trade_dates"],
+                             "readiness": {k: u["verdict"] for k, u in r["uses"].items()},
+                             "blocking": sorted({b for u in r["uses"].values() for b in u["blocking"]}),
+                             "integrity_ok": True})
+            except Exception as exc:  # noqa: BLE001 -- a failed verification is shown, never hidden
+                rows.append({"ref": ref, "status": "INTEGRITY FAILURE", "integrity_ok": False, "error": str(exc)[:300]})
+        return {"datasets": rows, "registry_ok": True,
+                "note": "Data quality view only. Nothing here downloads, ingests, validates or promotes."}
+    except Exception as exc:  # noqa: BLE001
+        return {"datasets": [], "registry_ok": False, "error": str(exc)[:300]}
+
+
 def overview(app, *, root: Path | None = None, governance_path: Path | None = None,
-             ledger_path: Path | None = None, experiments_path: Path | None = None) -> dict[str, Any]:
+             ledger_path: Path | None = None, experiments_path: Path | None = None,
+             datasets_root: Path | None = None) -> dict[str, Any]:
     from src.research import governance
     from src.research.experiments import ExperimentRegistry
     from src.research.registry import REGISTRY
@@ -110,8 +141,10 @@ def overview(app, *, root: Path | None = None, governance_path: Path | None = No
                      "family_size": (ev.get("tests") or {}).get("family_size"),
                      "compliance": (m.get("compliance_coverage") or {}).get("verdict") or "NO PROP PROFILE",
                      "code_trusted": (m.get("code") or {}).get("trusted"),
+                     "dataset": ((m.get("data") or {}).get("dataset") or {}).get("ref"),
                      "monte_carlo": bool(list(folder.glob("monte_carlo_*.json")))})
     out["runs"] = runs[::-1]
+    out["data"] = datasets_view(datasets_root)
     return out
 
 

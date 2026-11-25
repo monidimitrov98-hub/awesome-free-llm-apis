@@ -49,6 +49,10 @@ COST_SCENARIOS = (("as_configured", 1.0, 0), ("commission_x1.5", 1.5, 0), ("comm
                   ("slippage_+1_tick", 1.0, 1), ("slippage_+2_ticks", 1.0, 2), ("stress_x2_+2_ticks", 2.0, 2))
 
 
+def is_dataset(source: str | Path) -> bool:
+    return str(source).startswith("dataset:")
+
+
 class ResearchError(ConfigError):
     """A research request was refused (the reason is in the message)."""
 
@@ -64,15 +68,39 @@ class ResearchEnv:
     registry: ExperimentRegistry = field(default_factory=ExperimentRegistry)
     regime: Any = None
     news: Any = None
+    store: Any = None                          # Sprint 12 DatasetStore (default location when None)
     _md: dict[str, Any] = field(default_factory=dict)
 
     def market_data(self, csv: str | Path):
+        """A CSV path, or ``dataset:<id>@v<N>[#CONTRACT]`` (Sprint 12 dataset, verified on every load)."""
         from src.pipeline import build_market_data
 
+        if is_dataset(csv):
+            key = str(csv)
+            if key not in self._md:
+                ds, contract = self.dataset(csv)
+                from src.histdata.market import market_data_from_dataset
+
+                self._md[key] = (market_data_from_dataset(ds, self.app, contract=contract),
+                                 ds.manifest["manifest_sha256"])
+            return self._md[key]
         key = str(Path(csv).resolve())
         if key not in self._md:
             self._md[key] = (build_market_data(csv, self.app), file_sha256(csv))
         return self._md[key]
+
+    def dataset(self, source: str):
+        """(Dataset, contract) for a dataset source; refuses datasets that are not VALIDATED."""
+        from src.histdata.store import RANK, DatasetStore
+
+        if self.store is None:
+            self.store = DatasetStore()
+        ref, _, contract = str(source)[len("dataset:"):].partition("#")
+        ds = self.store.load(ref)
+        if RANK[ds.status] < RANK["VALIDATED"]:
+            raise ResearchError(f"dataset {ds.ref} is {ds.status}: research needs a VALIDATED dataset "
+                                "(see `run_data.py show`)")
+        return ds, contract or None
 
     def config_hashes(self) -> dict[str, str]:
         return {"settings_sha256": file_sha256(self.settings_path), "backtest_sha256": file_sha256(self.backtest_path)}
@@ -244,6 +272,18 @@ def _refuse_revealed(env: ResearchEnv, root: str, p0: str, p1: str) -> None:
         spans = sorted({f"{r.get('start')}..{r.get('end')}" for r in burned})
         raise ResearchError(f"{p0}..{p1} overlaps out-of-sample dates {spans} of {root} that were already "
                             "revealed: revealed data can never be used for research again (no override)")
+    from src.research.plans import reserved_oos
+
+    held = [r for r in reserved_oos() if r["instrument"] == root and _overlap(p0, p1, r["start"], r["end"])]
+    if held:
+        raise ResearchError(f"{p0}..{p1} overlaps the OOS segment {held[0]['start']}..{held[0]['end']} that plan "
+                            f"{held[0]['plan']} reserved for {root}: it stays untouched until its one-time reveal")
+
+
+def _no_synthetic_optimisation(env: ResearchEnv, source) -> None:
+    """Sprint 12: parameters are never optimised on a SYNTHETIC dataset (legacy CSV paths are unchanged)."""
+    if is_dataset(source) and env.dataset(source)[0].manifest["synthetic"]:
+        raise ResearchError("parameter selection on a SYNTHETIC dataset is refused (not market data)")
 
 
 def guard_period(env: ResearchEnv, csv: str | Path, purpose: str, start: str | None, end: str | None) -> None:
@@ -277,7 +317,8 @@ def run_research(env: ResearchEnv, strategy_id: str, version: str, csv: str | Pa
                                  data_sha256=data_sha, period={"start": p0, "end": p1, "kind": period.kind,
                                                                "fold": fold},
                                  purpose=purpose, family=family or f"{strategy_id}:{root}",
-                                 detail={"overrides": rs.overrides, "prop_profile": prop_profile})
+                                 detail={"overrides": rs.overrides, "prop_profile": prop_profile,
+                                         "dataset": str(csv)[len("dataset:"):] if is_dataset(csv) else None})
     try:
         run, trades, prop = _execute(env, rs, md, period, prop_profile=prop_profile)
         dv = daily_pnl(trades).tolist()
@@ -301,7 +342,7 @@ def run_research(env: ResearchEnv, strategy_id: str, version: str, csv: str | Pa
                "evidence": ev["evidence"]}
     out = {"attempt": attempt, "resolved": rs, "run": run, "trades": trades, "evaluation": ev, "root": root,
            "period": {"start": p0, "end": p1, "kind": period.kind, "fold": fold}, "data_sha256": data_sha,
-           "md": md, "cost_sensitivity": costs, "folder": None, "prop": prop}
+           "md": md, "cost_sensitivity": costs, "folder": None, "prop": prop, "source": str(csv)}
     if write:
         out["folder"] = _write(env, out, purpose, prop, _oos)
     env.registry.finish(attempt, status="ok", summary=summary)
@@ -338,7 +379,9 @@ def _write(env: ResearchEnv, out: dict[str, Any], purpose: str, prop, oos: dict[
         "kind": "research_run", "schema": 1, "purpose": purpose, "attempt": out["attempt"],
         "strategy": rs.identity(), "params": rs.params_dict, "summary": rs.spec.summary(rs.params),
         "instrument": out["root"], "contract": md.contract.label, "synthetic_data": bool(md.is_synthetic),
-        "data": {"sha256": out["data_sha256"], "source": md.report.source}, "period": out["period"],
+        "data": {"sha256": out["data_sha256"], "source": md.report.source,
+                 "dataset": env.dataset(out["source"])[0].identity() if is_dataset(out["source"]) else None},
+        "period": out["period"],
         "config": env.config_hashes(), "code": code_identity(), "environment": environment_info(),
         "experiments_registry": env.registry.identity(),
         "ledger": {"path": str(resolve_ledger_path(env.ledger_path)[0]),
@@ -439,6 +482,7 @@ def sweep(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path, gri
     pts = grid_points(grid)
     for p in pts:                      # every value checked BEFORE anything runs
         check_bounds(strategy_id, p)
+    _no_synthetic_optimisation(env, csv)
     guard_period(env, csv, purpose, start, end)
     family = f"sweep:{strategy_id}@{version}:{hashlib.sha256(json.dumps(grid, sort_keys=True).encode()).hexdigest()[:12]}"
     rows = []
@@ -558,6 +602,8 @@ def run_folds(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path,
     for p in pts:
         if p:
             check_bounds(strategy_id, p)
+    if grid:
+        _no_synthetic_optimisation(env, csv)
     starts = [a for segs, _ in folds for a, _b in segs] + [t[0] for _, t in folds]
     ends = [b for segs, _ in folds for _a, b in segs] + [t[1] for _, t in folds]
     if starts:
@@ -606,8 +652,34 @@ def oos_fingerprint(env: ResearchEnv, rs: Resolved, code: dict[str, Any], prop_p
                                   sort_keys=True, default=str))
 
 
+def _check_plan(env: ResearchEnv, plan: str | None, strategy_id: str, version: str, csv, root: str, start: str,
+                end: str) -> dict[str, Any] | None:
+    """Dates reserved by a registered plan are revealed only through that plan, exactly as frozen."""
+    from src.research.plans import load_plan, reserved_oos
+
+    held = [r for r in reserved_oos() if r["instrument"] == root and _overlap(start, end, r["start"], r["end"])]
+    if plan is None:
+        if held:
+            raise ResearchError(f"{start}..{end} is the OOS segment reserved by plan {held[0]['plan']}: reveal it "
+                                "with --plan, exactly as frozen")
+        return None
+    from src.histdata.store import DatasetStore
+
+    p = load_plan(plan, env.app, env.store or DatasetStore())
+    mine = [d for d in p["datasets"] if d["key"] == root]
+    if not mine:
+        raise ResearchError(f"plan {plan} has no dataset for {root}")
+    if not is_dataset(csv) or str(csv)[len("dataset:"):].split("#")[0] != mine[0]["ref"]:
+        raise ResearchError(f"plan {plan} freezes dataset {mine[0]['ref']} for {root}")
+    if [start, end] != p["oos"]:
+        raise ResearchError(f"plan {plan} freezes the OOS segment {p['oos'][0]}..{p['oos'][1]}")
+    if f"{strategy_id}@{version}" not in p["strategies"]:
+        raise ResearchError(f"{strategy_id}@{version} is not one of the strategy versions frozen by plan {plan}")
+    return {"plan": plan, "plan_sha256": p["sha256"], "dataset": mine[0]["ref"]}
+
+
 def reveal_oos(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path, start: str, end: str, *,
-               prop_profile: str | None = None) -> dict[str, Any]:
+               prop_profile: str | None = None, plan: str | None = None) -> dict[str, Any]:
     """The ONE-TIME out-of-sample reveal of a registered version (see the module docstring)."""
     if not start or not end:
         raise ResearchError("an out-of-sample reveal needs explicit --start and --end dates")
@@ -620,6 +692,9 @@ def reveal_oos(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path
                             f"{', '.join(code['untrusted_reasons'])}. Commit your changes first.")
     md, data_sha = env.market_data(csv)
     root = instrument_key(md.contract.root, md.is_synthetic)
+    if is_dataset(csv) and env.dataset(csv)[0].manifest["synthetic"]:
+        raise ResearchError("a SYNTHETIC dataset is never revealed as out-of-sample evidence")
+    plan_info = _check_plan(env, plan, strategy_id, version, csv, root, start, end)
     period = _period("oos", start, end)
     led, records = env.ledger()
     fp = oos_fingerprint(env, rs, code, prop_profile)
@@ -658,9 +733,9 @@ def reveal_oos(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path
                       "version_sha256": rs.pv.sha256, "source_sha256": code["source_sha256"], "commit": code["commit"],
                       "results_fingerprint": results_fingerprint(res["run"].result.trades, res["run"].result.equity),
                       "p_raw": res["evaluation"]["tests"]["p_raw"], "evidence": res["evaluation"]["evidence"],
-                      "experiments_registry": env.registry.identity()})
+                      "experiments_registry": env.registry.identity(), "plan": plan_info})
     oos = {"ledger_record_hash": rec["record_hash"], "ledger_seq": rec["seq"], "replay": False, "fingerprint": fp,
-           "family_size": len(fam) + 1}
+           "family_size": len(fam) + 1, "plan": plan_info}
     res["folder"] = _write(env, res, "oos", res["prop"], oos)
     res["oos"] = oos
     return res

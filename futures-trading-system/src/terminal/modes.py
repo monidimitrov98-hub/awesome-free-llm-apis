@@ -58,6 +58,7 @@ class ModeOptions:
     prop_activations: Any = None                       # tests only (alternative activation store)
     research_root: Any = None                          # tests only (alternative research output folder)
     governance_path: Any = None                        # tests only (alternative promotion store)
+    datasets_root: Any = None                          # tests only (alternative dataset store)
 
 
 @dataclass

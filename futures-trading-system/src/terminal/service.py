@@ -588,7 +588,8 @@ class TerminalService:
         from src.research.views import overview
 
         return overview(load_config(), root=getattr(self.opts, "research_root", None),
-                        governance_path=getattr(self.opts, "governance_path", None))
+                        governance_path=getattr(self.opts, "governance_path", None),
+                        datasets_root=getattr(self.opts, "datasets_root", None))
 
     def research_run(self, attempt: str) -> dict[str, Any] | None:
         from src.research.views import run_detail

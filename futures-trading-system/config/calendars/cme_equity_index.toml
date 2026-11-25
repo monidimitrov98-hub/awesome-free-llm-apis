@@ -1,0 +1,54 @@
+# CME Globex equity index futures (MES / MNQ) trading calendar used by the Sprint 12 data layer.
+# Versioned: a change of any value needs a new [calendar] version (the version is recorded in every
+# dataset manifest and validation report).
+#
+# Times are America/Chicago (exchange time). Sources (accessed 2026-11-25 through search-index excerpts;
+# the CME pages themselves could not be fetched from the build environment):
+#   * CME education page for Micro E-mini futures: trading "Sunday 5 p.m. Central Time (CT) through Friday
+#     4 p.m. CT" -- https://www.cmegroup.com/education/courses/micro-e-mini-futures/micro-e-mini-futures-products-overview.html
+#   * Expiring contracts: last trading day = 3rd Friday of the contract month, trading terminates
+#     8:30 a.m. CT -- TradeStation contract specification summary (secondary source)
+#   * Daily maintenance halt 16:00-17:00 CT Monday-Thursday: consistent with the hours above (UNCONFIRMED
+#     against a primary CME page in this environment; marked accordingly).
+# RTH ("regular trading hours") 08:30-15:00 CT is the cash-equity session convention used for research
+# (NYSE 09:30-16:00 New York), NOT an exchange session of the futures contract.
+
+[calendar]
+id = "cme_equity_index"
+version = "2026-11-25.1"
+timezone = "America/Chicago"
+verification = "PARTIAL"   # hours from secondary / indexed sources; holidays NOT verified (see below)
+
+[eth]                      # one Globex trading day: opens the previous evening, closes in the afternoon
+open = "17:00"
+close = "16:00"
+
+[rth]
+open = "08:30"
+close = "15:00"
+
+[weekend]
+closes = "Friday 16:00"
+opens = "Sunday 17:00"
+
+[[daily_halts]]
+start = "16:00"
+end = "17:00"
+weekdays = ["Mon", "Tue", "Wed", "Thu"]
+verification = "UNCONFIRMED"
+
+[expiry]
+rule = "third_friday"
+termination = "08:30"
+months = "HMUZ"
+
+# Holiday closures and early closes. NONE is verified: CME publishes holiday hours shortly before each
+# holiday and the schedules could not be read from this environment. Gaps on the rule-based US holiday
+# candidates are therefore classified HOLIDAY_CANDIDATE_UNVERIFIED (never silently "expected").
+# Add verified entries like:
+#   [[holidays]]
+#   date = "2025-11-27"          # trade date
+#   kind = "early_close"         # or "closed"
+#   close = "12:00"              # for early_close (CT)
+#   source = "https://www.cmegroup.com/..."
+#   verification = "VERIFIED"    # only VERIFIED entries turn gaps into expected closures

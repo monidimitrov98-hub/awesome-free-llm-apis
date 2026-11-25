@@ -1,0 +1,30 @@
+# DRAFT -- not a registered plan. Placeholders (<...>) must be replaced by real, VALIDATED datasets.
+# Rename to real-data-v1.toml, run `run_research.py plan-check real-data-v1`, review, then `plan-register`.
+
+[plan]
+id = "real-data-v1"
+description = "First real-data comparison: VWAP Trend Pullback V0 vs VWAP Mean Reversion V1 variants, MES and MNQ, 1-minute bars, unadjusted continuous series (volume roll, previous-day volume, 1 confirmation day)."
+
+[[datasets]]
+instrument = "MES"
+ref = "<provider>.mes.1m.cont@v1"
+manifest_sha256 = "<64 hex>"
+
+[[datasets]]
+instrument = "MNQ"
+ref = "<provider>.mnq.1m.cont@v1"
+manifest_sha256 = "<64 hex>"
+
+[segments]
+# Proposed, to be adjusted to the data actually obtained (Globex trade dates):
+train = ["2021-01-04", "2023-06-30"]
+validation = ["2023-07-17", "2024-06-28"]
+oos = ["2024-07-15", "2025-06-27"]
+purge_trade_dates = 10
+embargo_trade_dates = 10
+
+[frozen]
+strategies = ["vwap_trend_pullback@V0", "vwap_mean_reversion@V1-C1-SWING", "vwap_mean_reversion@V1-C2-SWING",
+              "vwap_mean_reversion@V1-C3-SWING", "vwap_mean_reversion@V1-C4-SWING", "vwap_mean_reversion@V1-C2-ATR",
+              "vwap_mean_reversion@V1-C2-BAND"]
+backtest_config_sha256 = "<sha256 of config/backtest.toml once costs are set to the user's real all-in costs>"

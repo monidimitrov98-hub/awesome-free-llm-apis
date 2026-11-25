@@ -119,7 +119,14 @@ def _research_fixture() -> dict:
     root = Path(__file__).resolve().parents[2]
     run_research(env, "vwap_mean_reversion", "V1-C2-SWING", root / "data/samples/SYNTHETIC_MES_1m.csv",
                  prop_profile="fundednext_futures_flex_50k_challenge@2026-11-25.1")
-    return {"research_root": d / "out", "governance_path": d / "promotions.jsonl"}
+    from src.histdata.calendar import load_calendar
+    from src.histdata.providers import make_adapter
+    from src.histdata.store import DatasetStore
+
+    DatasetStore(d / "datasets").ingest("synthetic.mes.1m", make_adapter("generic_csv", timezone="America/New_York"),
+                                        [root / "data/samples/SYNTHETIC_MES_1m.csv"], specs=env.app.contracts,
+                                        calendar=load_calendar())
+    return {"research_root": d / "out", "governance_path": d / "promotions.jsonl", "datasets_root": d / "datasets"}
 
 
 if __name__ == "__main__":

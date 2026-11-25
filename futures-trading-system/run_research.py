@@ -45,7 +45,10 @@ def _common(s: argparse.ArgumentParser, *, csv: bool = True) -> None:
     s.add_argument("--strategy", required=True)
     s.add_argument("--version", required=True)
     if csv:
-        s.add_argument("--csv", type=Path, required=True)
+        g = s.add_mutually_exclusive_group(required=True)
+        g.add_argument("--csv", type=Path, help="legacy CSV file (exploration; not a registered dataset)")
+        g.add_argument("--dataset", default=None, metavar="ID@vN[#CONTRACT]",
+                       help="Sprint 12 dataset (VALIDATED or better; verified on load)")
     s.add_argument("--prop-profile", default=None, metavar="ID@VERSION",
                    help="simulate a prop firm profile (UNVERIFIED profiles block every entry: fail closed)")
     s.add_argument("--regime", action="store_true", help="label trades with the regime engine (observe only)")
@@ -107,6 +110,8 @@ def parse_args(argv=None):
         _common(w)
         w.add_argument("--grid", action="append", default=[], metavar="KEY=V1,V2")
         w.add_argument("--purge", type=int, default=1, help="sessions removed between training and test data")
+        w.add_argument("--start", default=None, help="first session used by the folds (e.g. a plan's train start)")
+        w.add_argument("--end", default=None, help="last session used by the folds (e.g. a plan's validation end)")
         if name == "walk-forward":
             w.add_argument("--train", type=int, required=True)
             w.add_argument("--test", type=int, required=True)
@@ -118,6 +123,11 @@ def parse_args(argv=None):
     _common(o)
     o.add_argument("--start", required=True)
     o.add_argument("--end", required=True)
+    o.add_argument("--plan", default=None, help="the registered plan that reserved these OOS dates")
+    for name in ("plan-check", "plan-register"):
+        pc = sub.add_parser(name)
+        pc.add_argument("plan_id")
+    sub.add_parser("plans")
     m = sub.add_parser("monte-carlo")
     m.add_argument("--run", type=Path, required=True)
     m.add_argument("--paths", type=int, default=2000)
@@ -190,6 +200,8 @@ def _run_summary(res) -> dict:
 
 def main(argv=None) -> int:
     a = parse_args(argv)
+    if getattr(a, "dataset", None):
+        a.csv = f"dataset:{a.dataset}"
     try:
         app = load_config(a.settings)
         if a.cmd == "strategies":
@@ -240,6 +252,20 @@ def main(argv=None) -> int:
             print(f"recorded: {rec['strategy']}@{rec['version']} {rec['from']} -> {rec['to']} by {rec['approved_by']} "
                   f"(seq {rec['seq']}). Live trading is never approved by this system.")
             return 0
+        if a.cmd in ("plan-check", "plan-register", "plans"):
+            from src.histdata.store import DatasetStore
+            from src.research import plans as P
+
+            if a.cmd == "plans":
+                _print([{"plan": k, **v} for k, v in P.load_index().items()], a.json)
+                return 0
+            path = P.plans_dir() / f"{a.plan_id}.toml"
+            out = P.parse_plan(path, app, DatasetStore()) if a.cmd == "plan-check" else \
+                P.register(a.plan_id, app, DatasetStore())
+            _print(out, a.json)
+            if a.cmd == "plan-register":
+                print(f"plan {a.plan_id} registered: its OOS segment is now reserved until the one-time reveal")
+            return 0
         if a.cmd == "compare":
             from src.research.runs import compare
 
@@ -270,6 +296,11 @@ def main(argv=None) -> int:
             rs = R.resolve(env, a.strategy, a.version)
             md, _ = env.market_data(a.csv)
             dates = R.selected_sessions(env, rs, md)
+            if a.start or a.end:
+                import pandas as pd
+
+                lo, hi = pd.Timestamp(a.start or "1900-01-01"), pd.Timestamp(a.end or "2262-01-01")
+                dates = [d for d in dates if lo <= pd.Timestamp(d) <= hi]
             if a.cmd == "walk-forward":
                 folds = R.walk_forward_folds(dates, a.train, a.test, a.purge, a.step)
             else:
@@ -283,7 +314,8 @@ def main(argv=None) -> int:
                     "aggregate_ci95": out["aggregate"]["mean_daily_pnl_ci95_day_bootstrap"]}, a.json)
             return 0
         if a.cmd == "reveal-oos":
-            res = R.reveal_oos(env, a.strategy, a.version, a.csv, a.start, a.end, prop_profile=a.prop_profile)
+            res = R.reveal_oos(env, a.strategy, a.version, a.csv, a.start, a.end, prop_profile=a.prop_profile,
+                               plan=a.plan)
             s = _run_summary(res)
             if res.get("replay_identical") is not None:
                 s["replay_identical"] = res["replay_identical"]

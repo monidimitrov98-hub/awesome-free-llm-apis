@@ -23,6 +23,7 @@ futures-trading-system/
 ├── config/account_profiles/    # generic account-protection (drawdown) rule profiles
 ├── run_backtest.py             # run the strategy on a CSV and write all result files
 ├── run_research.py             # Sprint 11 research engine CLI (research, OOS reveal, Monte Carlo, promotion)
+├── run_data.py                 # Sprint 12 historical datasets (ingest, validate, continuous, cross-validate)
 ├── config/strategies/          # immutable, registered strategy parameter versions (Sprint 11)
 ├── data/samples/               # SYNTHETIC sample CSVs (clearly marked) + README
 ├── run_pipeline.py             # command-line entry point
@@ -1391,6 +1392,34 @@ python run_research.py monte-carlo --run output/research/<...>/<run folder> --pa
 python run_research.py promote --strategy ... --version ... --to BACKTESTED --approved-by "Your Name" \
     --confirm <sha16> --statement "..." --run <run folder>
 python run_paper.py --mode replay --bars MES=... --strategy vwap_mean_reversion@V1-C2-SWING   (needs SHADOW_APPROVED)
+```
+
+## Sprint 12: Historical market-data infrastructure (no real data yet)
+
+- **Provider-neutral ingestion:** adapters parse provider files (Databento OHLCV CSV, NinjaTrader 8 exports,
+  generic CSV). There is no network client and no credentials.
+- **Immutable datasets:** versioned with raw copies, deterministic normalized bars, validation reports, a
+  manifest and a hash-chained registry. Every load is verified, nothing is ever overwritten, and an
+  interrupted ingestion can be recovered.
+- **Validation and calendar:** a CME equity calendar in America/Chicago (DST-safe), gap classification
+  (expected closure / scheduled break / missing vendor data / error), and explicit statuses (INGESTED,
+  VALIDATION_FAILED, VALIDATED, CROSS_SOURCE_VALIDATED) with documented evidence.
+- **Contracts:** individual contracts stay the source of truth. Continuous series are derived with no
+  look-ahead (calendar or previous-day-volume rolls) and are unadjusted. Adjusted series are refused for
+  simulation.
+- **Research integration:** `run_research.py --dataset`, plus frozen train / validation / OOS plans that
+  reserve the OOS segment until a one-time plan-bound reveal.
+- **Readiness report:** per dataset, and shown read-only in the terminal.
+
+See `docs/sprint12_historical_market_data.md` (provider comparison, sources, methodology, the first real-data
+research plan and the decisions that need your approval).
+
+```
+python run_data.py ingest --dataset-id databento.mes.1m --adapter databento_ohlcv_csv --file <downloaded.csv>
+python run_data.py continuous --dataset-id databento.mes.1m.cont --source databento.mes.1m@v1 --rule volume
+python run_data.py cross-validate databento.mes.1m@v1 nt.mes.1m@v1 --start 2025-01-02 --end 2025-01-31
+python run_data.py readiness databento.mes.1m.cont@v1
+python run_research.py run --strategy vwap_mean_reversion --version V1-C2-SWING --dataset databento.mes.1m.cont@v1 ...
 ```
 
 ## Known limitations

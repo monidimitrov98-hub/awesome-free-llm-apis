@@ -3,7 +3,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/App";
-import { evidenceTone, stateTone } from "../src/pages/Research";
+import { dataStatusTone, evidenceTone, stateTone } from "../src/pages/Research";
 import { TerminalContext, type TerminalState } from "../src/state/store";
 import { DEFAULT_PREFS } from "../src/state/prefs";
 import { API } from "./api-fixtures";
@@ -75,5 +75,19 @@ describe("Quant Research", () => {
     expect(screen.getByText("ConfigError: no data")).toBeInTheDocument();
     await view("Out-of-sample ledger");
     expect(screen.getByText("No out-of-sample reveal recorded")).toBeInTheDocument();
+  });
+
+  it("shows datasets with status, readiness and integrity failures, never in green (Sprint 12)", async () => {
+    renderPage();
+    await waitFor(() => expect(screen.getByRole("group", { name: "Research view" })).toBeInTheDocument());
+    await view("Datasets");
+    expect(screen.getByText("syn.mes.cont@v1")).toBeInTheDocument();
+    expect(screen.getAllByText("SYNTHETIC").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("NOT_READY").length).toBe(5);
+    expect(screen.getByText("INTEGRITY FAILURE")).toBeInTheDocument();
+    expect(screen.getByText(/hash mismatch/)).toBeInTheDocument();
+    for (const st of ["UNVERIFIED", "INGESTED", "VALIDATION_FAILED", "VALIDATED", "CROSS_SOURCE_VALIDATED"]) expect(dataStatusTone(st)).not.toBe("pos");
+    const buttons = screen.getAllByRole("button").map((b) => b.textContent?.toLowerCase() ?? "");
+    expect(buttons.filter((t) => /\b(ingest|download|validate|delete|run|promote|buy|sell|order)\b/.test(t))).toEqual([]);
   });
 });

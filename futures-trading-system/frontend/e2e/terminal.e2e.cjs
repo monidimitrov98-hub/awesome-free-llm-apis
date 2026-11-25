@@ -96,6 +96,10 @@ async function expectText(page, text, timeout = 60000) {
       await expectText(page, "Every attempt counts in the multiple-testing family");
       await v("Out-of-sample ledger");
       await expectText(page, "No out-of-sample reveal recorded");
+      await v("Datasets");                                              // Sprint 12 historical datasets
+      await expectText(page, "synthetic.mes.1m@v1");
+      await expectText(page, "SYNTHETIC");
+      await page.getByText("NOT_READY").first().waitFor({ timeout: 30000 });   // synthetic is never ready
     } else if (scenario === "mock-fail") {
       await expectText(page, "MOCK");
       await expectText(page, "MARKET FEED DEGRADED", 60000);          // degraded feed is never hidden
