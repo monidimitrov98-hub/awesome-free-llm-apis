@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -267,6 +268,65 @@ def create_app(service: TerminalService, *, token: str, port: int, dev: bool = F
     def shadow(report: Literal["sessions", "performance", "costs", "execution", "regimes", "blocked", "reliability",
                                "account", "validation", "journals"], f: dict = Depends(shadow_filters)) -> Any:
         return shadow_call(lambda: service.shadow(report, f))
+
+    # ------------------------------------------------------------------ Prop Firm Center (Sprint 9, read-only)
+    def profile_key():
+        return Query(..., max_length=130, pattern=r"^[a-z0-9][a-z0-9_\-]{1,79}@[0-9A-Za-z][0-9A-Za-z.\-]{0,39}$")
+
+    def prop_call(fn):
+        try:
+            out = fn()
+        except Exception as exc:  # noqa: BLE001 -- generic message; details only in the local log
+            log.exception("prop firm view failed")
+            raise HTTPException(status_code=500, detail="prop firm view failed (see the terminal log)") from exc
+        if out is None:
+            raise HTTPException(status_code=404, detail="not available")
+        from src.analytics.shadow.library import _jsonable
+
+        return _jsonable(out)
+
+    @app.get("/api/propfirm/status", dependencies=A)
+    def propfirm_status() -> Any:
+        return prop_call(service.propfirm_status)
+
+    @app.get("/api/propfirm/profiles", dependencies=A)
+    def propfirm_profiles() -> Any:
+        return prop_call(service.propfirm_profiles)
+
+    @app.get("/api/propfirm/profile", dependencies=A)
+    def propfirm_profile(key: str = profile_key()) -> Any:
+        return prop_call(lambda: service.propfirm_profile(key))
+
+    @app.get("/api/propfirm/compare", dependencies=A)
+    def propfirm_compare(a: str = profile_key(), b: str = profile_key()) -> Any:
+        return prop_call(lambda: service.propfirm_compare(a, b))
+
+    @app.get("/api/propfirm/history", dependencies=A + [Depends(heavy_limit)])
+    def propfirm_history() -> Any:
+        return prop_call(service.propfirm_history)
+
+    @app.get("/api/propfirm/export/{kind}.{fmt}", dependencies=A + [Depends(heavy_limit)])
+    def propfirm_export(kind: Literal["evaluations", "drawdown", "breaches", "flattens", "account", "rules"],
+                        fmt: Literal["csv", "json"]) -> Response:
+        from src.analytics.shadow.library import to_csv, to_json
+        from src.risk.prop_firms.reports import rows_for_export
+
+        st = prop_call(service.propfirm_status)
+        prof = (st.get("summary") or {}) if st.get("selected") else {}
+        meta = {"report": f"prop firm {kind}", "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                "timezone": "UTC", "profile": prof.get("profile"), "ruleset_sha256": prof.get("ruleset_sha256"),
+                "profile_status": (prof.get("operational") or {}).get("status"),
+                "label": "SIMULATED account; rule evaluation is not a firm decision"}
+        if kind == "rules":
+            if not prof:
+                raise HTTPException(status_code=404, detail="no profile selected")
+            p = prop_call(lambda: service.propfirm_profile(prof["profile"]))
+            rows = [{k: v for k, v in r.items() if k != "params"} | {"params": r.get("params")} for r in p["rules"]]
+        else:
+            rows = rows_for_export(prop_call(service.propfirm_history), kind)
+        body = to_csv(rows, meta) if fmt == "csv" else to_json({"rows": rows}, meta)
+        return Response(body, media_type="text/csv" if fmt == "csv" else "application/json",
+                        headers={"Content-Disposition": f'attachment; filename="prop_firm_{kind}.{fmt}"'})
 
     @app.get("/api/performance", dependencies=A)
     def performance(source: Literal["session", "backtest"] = "session") -> Any:

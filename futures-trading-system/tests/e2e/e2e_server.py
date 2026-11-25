@@ -56,12 +56,17 @@ class EveryNthBarTestStrategy(Strategy):
 
 
 def main() -> None:
-    """argv: PORT TOKEN SCENARIO [SPEED]; SCENARIO = replay | replay-nogate | mock | mock-fail | shadow-analytics."""
+    """argv: PORT TOKEN SCENARIO [SPEED]; SCENARIO = replay | replay-nogate | mock | mock-fail | shadow-analytics | prop-firm."""
     port, token, scenario = int(sys.argv[1]), sys.argv[2], sys.argv[3]
     speed = float(sys.argv[4]) if len(sys.argv) > 4 else 900.0
     if scenario.startswith("replay"):
         opts = ModeOptions(mode="replay", speed=speed, strategy_factory=lambda root: EveryNthBarTestStrategy(),
                            tests_disable_regime_gate=scenario == "replay-nogate")
+    elif scenario == "prop-firm":  # the FundedNext research profile (UNVERIFIED): every entry must be blocked
+        opts = ModeOptions(mode="replay", speed=speed, replay_start="2025-03-12",
+                           strategy_factory=lambda root: EveryNthBarTestStrategy(), tests_disable_regime_gate=True,
+                           prop_profile="fundednext_futures_flex_50k_challenge@2026-11-22.1",
+                           prop_initial_balance_from_profile=True)
     elif scenario == "shadow-analytics":  # a fast replay run with simulated trades, analysed in Shadow Analytics
         opts = ModeOptions(mode="replay", speed=speed, replay_start="2025-03-12",
                            strategy_factory=lambda root: EveryNthBarTestStrategy(), tests_disable_regime_gate=True)

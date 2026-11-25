@@ -1,0 +1,12 @@
+# Prop firm profile used by paper / shadow sessions (Sprint 9).
+#
+# Empty = no prop firm engine (AccountGuard + RiskManager protect the account as before).
+# A selection names an EXACT profile id AND version from config/prop_firms/profiles/<id>/<version>.toml;
+# the latest version is never picked implicitly and no other profile is ever substituted.
+#
+# A profile only authorizes entries when its computed status is VERIFIED and a human activated its
+# exact content (run_prop_firm.py activate). Selecting an UNVERIFIED profile (such as the FundedNext
+# Flex research profiles) therefore BLOCKS EVERY NEW ENTRY: useful to see its evaluation, never to trade.
+[selection]
+profile = ""
+version = ""

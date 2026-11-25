@@ -75,4 +75,8 @@ def run_identity(session) -> dict[str, Any]:
         "data_label": meta.get("data_label"),
         "provider": meta.get("provider"),
         "test_strategy": bool(meta.get("test_strategy")),
+        "prop_firm": ({"profile": session.prop.profile.key, "profile_sha256": session.prop.profile.sha256,
+                       "ruleset_sha256": session.prop.profile.ruleset_sha256,
+                       "operational": bool(session.prop.operational.get("operational"))}
+                      if getattr(session, "prop", None) is not None else None),
     }

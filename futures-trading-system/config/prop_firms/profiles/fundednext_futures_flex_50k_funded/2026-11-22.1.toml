@@ -1,0 +1,270 @@
+# FundedNext Futures — Flex — $50,000 — FUNDED (FundedNext Account) stage.
+# RESEARCH / SIMULATION PROFILE. NOT approved for any live or funded account.
+# Status is UNVERIFIED: safety-relevant details could not be confirmed from the retrieved official
+# excerpts (see the rules marked UNVERIFIED / NOT_FOUND). The engine therefore refuses to treat it as
+# operational: every new entry is blocked while it is selected, until a human reads the full official
+# pages, resolves the open points, records the review and activates the exact file content.
+
+[profile]
+id = "fundednext_futures_flex_50k_funded"
+version = "2026-11-22.1"
+firm = "FundedNext Futures"
+product = "Futures Flex"
+stage = "funded"
+account_size = 50000
+account_type = "Flex FundedNext Account (simulated funded)"
+initial_balance = 50000.0
+currency = "USD"
+timezone = "America/Chicago"
+day_start = "17:00"                 # trading resumes 5:00 PM CT (S6); times after it belong to the next trading day
+status = "UNVERIFIED"
+description = "FundedNext Futures Flex $50K FundedNext Account rules from FundedNext's official knowledge base (excerpts)."
+
+[verification]
+retrieved = "2026-11-22"
+method = "FundedNext official knowledge base search (help-center FAQ excerpts with article URLs); full help-center pages not reachable from the build environment"
+reviewed_by = ""
+reviewed_on = ""
+notes = "Human review required: read the full pages S1-S15, confirm the UNVERIFIED items, then set status, reviewed_by and reviewed_on in a NEW version file."
+
+# Our own margins (NOT firm rules).
+[internal]
+safety_reserve = 300.0              # no new entry when the estimated official buffer is at or below $300
+flatten_reserve = 150.0             # flatten open positions at or below $150 of estimated buffer
+uncertainty_reserve = 50.0          # fees / fills / data may differ from the firm's own figures
+entry_cutoff_minutes = 15           # no new entries after 2:55 PM CT
+flatten_lead_minutes = 5            # flatten from 3:05 PM CT (the firm auto-closes at 3:10 PM CT)
+gap_reserve_ticks = 8               # per contract, added to each trade's risk at the fill
+quantity_policy = "reject"
+require_trade_risk_within_buffer = true
+
+[[sources]]
+id = "S1"
+title = "FundedNext Futures Flex Challenge All Rules"
+url = "https://helpfutures.fundednext.com/en/articles/17229829-fundednext-futures-flex-challenge-all-rules"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S2"
+title = "FundedNext Futures Flex FundedNext Account All Rules"
+url = "https://helpfutures.fundednext.com/en/articles/17229848-fundednext-futures-flex-fundednext-account-all-rules"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S11"
+title = "What are the Performance Reward eligibility criteria for Flex FundedNext Account?"
+url = "https://helpfutures.fundednext.com/en/articles/14878865-what-are-the-performance-reward-eligibility-criteria-for-flex-fundednext-account"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S12"
+title = "What are Benchmark Days at FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/17230209-what-are-benchmark-days-at-fundednext-futures"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S3"
+title = "What is FundedNext Futures Flex Challenge?"
+url = "https://helpfutures.fundednext.com/en/articles/17229807-what-is-fundednext-futures-flex-challenge"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S4"
+title = "Daily Loss Limit and Maximum Loss Limit at FundedNext Futures"
+url = "https://helpfutures.fundednext.com/en/articles/17230292-daily-loss-limit-and-maximum-loss-limit-at-fundednext-futures"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S5"
+title = "Contract Limits and Contract Types at FundedNext Futures"
+url = "https://helpfutures.fundednext.com/en/articles/17230194-contract-limits-and-contract-types-at-fundednext-futures"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S6"
+title = "Does FundedNext Futures allow overnight and weekend trade holding?"
+url = "https://helpfutures.fundednext.com/en/articles/14268506-does-fundednext-futures-allow-overnight-and-weekend-trade-holding"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S7"
+title = "Are there any news trading rules for FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/14298245-are-there-any-news-trading-rules-for-fundednext-futures"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S8"
+title = "Is there any consistency rule to be followed in the FundedNext Futures Challenge & FundedNext Account?"
+url = "https://helpfutures.fundednext.com/en/articles/17230245-is-there-any-consistency-rule-to-be-followed-in-the-fundednext-futures-challenge-fundednext-account"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S9"
+title = "Which symbols/instruments can I trade on FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/17225740-which-symbols-instruments-can-i-trade-on-fundednext-futures"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S10"
+title = "What Are the Trading Hours in FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/17225754-what-are-the-trading-hours-in-fundednext-futures"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S13"
+title = "What is the profit target in the FundedNext Futures Flex Challenge?"
+url = "https://helpfutures.fundednext.com/en/articles/14878840-what-is-the-profit-target-in-the-fundednext-futures-flex-challenge"
+retrieved = "2026-11-22"
+[[sources]]
+id = "S14"
+title = "Road To Live Trading - Flex Challenge"
+url = "https://helpfutures.fundednext.com/en/articles/15430139-road-to-live-trading-flex-challenge"
+retrieved = "2026-11-22"
+note = "Live-account stage; not applied to this profile."
+[[sources]]
+id = "S15"
+title = "What are the prohibited trading strategies of FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/14298337-what-are-the-prohibited-trading-strategies-of-fundednext-futures"
+retrieved = "2026-11-22"
+
+[[rules]]
+id = "FNF-FLEX50-MLL"
+type = "max_loss"
+description = "Maximum Loss Limit $1,500, trailing end-of-day on the balance, never moves down, locks at $50,100; floating (open) losses can breach it intraday (permanent breach)."
+mandatory = true
+safety_critical = true
+severity = "block"
+verification = "VERIFIED"
+sources = ["S2", "S3", "S4"]
+ambiguity = "The funded account uses the same trailing EOD MLL as the Challenge (S2). The live-account stage (S14) also mentions the MLL locking when a payout is requested; that would leave the floor lower than modelled here (this model is the more conservative one). The excerpts state $1,500, trailing EOD on the balance, lock at $50,100 and intraday breach by floating losses; see FNF-FLEX50-MLL-EOD for the unresolved update time / boundary."
+params = { amount = 1500.0, model = "trailing_eod", reference = "balance", lock_at = 50100.0, includes_unrealized = true, breach_when = "at_or_below" }
+
+[[rules]]
+id = "FNF-FLEX50-MLL-EOD"
+type = "other"
+description = "Exact end-of-day time at which the MLL trails, and whether equity EXACTLY at the MLL is a breach."
+mandatory = true
+safety_critical = true
+severity = "block"
+verification = "UNVERIFIED"
+sources = ["S1", "S4"]
+ambiguity = "The excerpts are cut off ('updates once per day at the end of…'). The engine trails at its trading-day start (5:00 PM CT, after the mandatory 3:10 PM CT flat time, so the balance is final) and treats equity AT the MLL as a breach (conservative). Confirm on the full pages."
+
+[[rules]]
+id = "FNF-FLEX50-NO-DLL"
+type = "daily_loss"
+description = "No daily loss limit on the Flex FundedNext Account (stated by FundedNext). Not enforced; internal RiskManager limits still apply."
+applicable = false
+verification = "VERIFIED"
+sources = ["S2"]
+
+[[rules]]
+id = "FNF-FLEX50-CONTRACTS"
+type = "max_contracts"
+description = "At most 3 e-mini or 30 micro e-mini contracts held at once, mixed at 1:10 (micro-equivalent 30). Same for Challenge and FundedNext Account."
+mandatory = true
+safety_critical = true
+severity = "block"
+verification = "VERIFIED"
+sources = ["S1", "S5"]
+ambiguity = "The firm deducts profit from excess contracts rather than breaching; this engine BLOCKS any entry that would exceed the limit (stricter). The live-account stage (S14) lists different limits and is not applied."
+params = { limit_micro_equivalent = 30, weights = { MES = 1, MNQ = 1, M2K = 1, ES = 10, NQ = 10, RTY = 10 } }
+
+[[rules]]
+id = "FNF-FLEX50-INSTRUMENTS"
+type = "instrument_allowlist"
+description = "CME equity index futures listed by FundedNext Futures (only MES and MNQ are configured in this system)."
+mandatory = true
+safety_critical = false
+verification = "VERIFIED"
+sources = ["S9"]
+ambiguity = "Excerpt lists CME equity futures only; other asset classes are outside this system's scope."
+params = { roots = ["MES", "MNQ", "ES", "NQ", "M2K", "RTY"] }
+
+[[rules]]
+id = "FNF-FLEX50-FLAT-BY"
+type = "flat_by"
+description = "No overnight or weekend holding: all positions closed by 3:10 PM CT each trading day (the firm auto-closes)."
+mandatory = true
+safety_critical = true
+verification = "VERIFIED"
+sources = ["S6"]
+params = { time = "15:10" }
+
+[[rules]]
+id = "FNF-FLEX50-HOURS"
+type = "trading_hours"
+description = "Trading resumes at 5:00 PM CT (Sunday 5:00 PM CT after the weekend)."
+mandatory = true
+safety_critical = true
+verification = "VERIFIED"
+sources = ["S6"]
+params = { day_start = "17:00" }
+
+[[rules]]
+id = "FNF-FLEX50-HOLIDAYS"
+type = "holiday_schedule"
+description = "Holiday hours and early closes are communicated by the firm in advance; automatic closure may not apply at an early close."
+mandatory = true
+safety_critical = true
+verification = "NOT_FOUND"
+sources = ["S10"]
+ambiguity = "No published schedule was retrieved. Without config/prop_firms/holidays/fundednext_futures.toml covering the trading date, new entries fail closed."
+params = { calendar = "fundednext_futures" }
+
+[[rules]]
+id = "FNF-FLEX50-NEWS"
+type = "news_restriction"
+description = "FundedNext Futures imposes no news trading rule (Challenge and FundedNext Account). The system's own NewsGuard remains active independently."
+applicable = false
+verification = "VERIFIED"
+sources = ["S7"]
+
+[[rules]]
+id = "FNF-FLEX50-PROHIBITED"
+type = "other"
+description = "Prohibited practices (e.g. platform error exploitation, account sharing, multi-order spam, spoofing, layering, grid trading, wash trading, latency exploitation). Not machine-checkable here; this system places no real orders."
+mandatory = false
+severity = "info"
+verification = "VERIFIED"
+sources = ["S15"]
+[[rules]]
+id = "FNF-FLEX50-NO-CONSISTENCY"
+type = "consistency"
+description = "No consistency rule on the Flex FundedNext Account."
+applicable = false
+verification = "VERIFIED"
+sources = ["S2", "S8"]
+
+[[rules]]
+id = "FNF-FLEX50-BENCHMARK-DAYS"
+type = "payout_benchmark_days"
+description = "At least 5 Benchmark Days of $200 before each Performance Reward withdrawal."
+mandatory = true
+severity = "info"
+verification = "UNVERIFIED"
+sources = ["S2", "S11", "S12"]
+stages = ["funded"]
+ambiguity = "The excerpt defining a Benchmark Day is cut off ('achieve at least the minimum…'): whether the $200 is net of commissions, realized only, and how the counter resets after a withdrawal is not confirmed. The tracker uses the net realized balance change per trading day."
+params = { days = 5, min_day_profit = 200.0 }
+
+[[rules]]
+id = "FNF-FLEX50-MIN-PROFIT"
+type = "payout_min_profit"
+description = "Minimum profit of $500 in the current cycle before a withdrawal."
+mandatory = true
+severity = "info"
+verification = "VERIFIED"
+sources = ["S2", "S11"]
+stages = ["funded"]
+params = { amount = 500.0 }
+
+[[rules]]
+id = "FNF-FLEX50-MIN-WITHDRAWAL"
+type = "payout_min_withdrawal"
+description = "Minimum withdrawal $250."
+mandatory = true
+severity = "info"
+verification = "VERIFIED"
+sources = ["S2", "S11"]
+stages = ["funded"]
+params = { amount = 250.0 }
+
+[[rules]]
+id = "FNF-FLEX50-MAX-WITHDRAWAL"
+type = "payout_max_withdrawal"
+description = "Maximum withdrawal: up to 50% of profit, capped at $1,500, after every 5 Benchmark Days."
+mandatory = true
+severity = "info"
+verification = "VERIFIED"
+sources = ["S11"]
+stages = ["funded"]
+params = { share_of_profit = 0.5, cap = 1500.0 }

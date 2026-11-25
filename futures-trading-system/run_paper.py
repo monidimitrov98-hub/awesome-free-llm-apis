@@ -63,6 +63,11 @@ def parse_args(argv=None):
                    help="bridge: live market data from the read-only market-data bridge configured in "
                         "config/marketdata.toml (paper mode only; with --bars the bars are warm-up history only)")
     p.add_argument("--marketdata-config", type=Path, default=None)
+    p.add_argument("--prop-profile", default=None, metavar="ID@VERSION",
+                   help="prop firm profile (default: config/prop_firm.toml; '' = none). An unverified or not "
+                        "activated profile blocks every new entry")
+    p.add_argument("--prop-initial-balance-from-profile", action="store_true",
+                   help="size the simulated account with the profile's initial balance (new accounts)")
     return p.parse_args(argv)
 
 
@@ -146,6 +151,20 @@ def main(argv=None) -> int:
         if a.realtime_speed and a.feed != "bridge":
             feed = SimulatedRealtimeFeed(feed, lambda: pd.Timestamp.now(tz="UTC"), speed=a.realtime_speed)
         guards, readiness = news_guards(pcfg.mode, pcfg.instruments, ncfg, a.news_calendar)
+        from src.risk.prop_firms.runtime import build_engine
+
+        specs = {r: app.contracts[r] for r in pcfg.instruments}
+        if a.prop_profile is None:
+            prop = build_engine(bt=bt, specs=specs)
+        elif a.prop_profile == "":
+            prop = None
+        else:
+            pid, _, ver = a.prop_profile.partition("@")
+            if not ver:
+                raise ConfigError("--prop-profile needs ID@VERSION (an exact version)")
+            prop = build_engine(bt=bt, specs=specs, profile_id=pid, version=ver)
+        if prop is not None and a.prop_initial_balance_from_profile:
+            bt = replace(bt, initial_capital=prop.profile.initial_balance)
         journal = Journal(db, create=a.new_account)
         if a.feed == "bridge":
             meta = {"session_type": "SHADOW", "data_label": "LIVE",
@@ -157,7 +176,8 @@ def main(argv=None) -> int:
             meta = {"session_type": "REPLAY", "data_label": "SYNTHETIC" if synthetic else "HISTORICAL",
                     "provider": feed.name}
         session = PaperSession(pcfg, app, bt, sc, rc, guards, feed, journal, warmup=warm,
-                               clock=(lambda: pd.Timestamp.now(tz="UTC")), news_readiness=readiness, session_meta=meta)
+                               clock=(lambda: pd.Timestamp.now(tz="UTC")), news_readiness=readiness, session_meta=meta,
+                               prop_engine=prop)
     except RecoveryError as exc:
         print(f"Error: paper state cannot be recovered: {exc}. Nothing was traded; fix or archive the state.",
               file=sys.stderr)

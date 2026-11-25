@@ -51,6 +51,11 @@ class ModeOptions:
     tests_disable_regime_gate: bool = False                 # TESTS ONLY (exercise fills end to end)
     mock_seed: int = 7
     mock_rate_hz: float = 4.0
+    # Sprint 9 prop firm profile: None = config/prop_firm.toml, "" = none, "id@version" = explicit
+    prop_profile: str | None = None
+    prop_initial_balance_from_profile: bool = False   # explicit: size the simulated account like the profile
+    prop_registry: Any = None                          # tests only (alternative profile directory)
+    prop_activations: Any = None                       # tests only (alternative activation store)
 
 
 @dataclass
@@ -194,6 +199,21 @@ class Built:
     idle_sleep: float
 
 
+def _prop_engine(opts: ModeOptions, bt, app):
+    from src.risk.prop_firms.runtime import build_engine
+
+    specs = {r: app.contracts[r] for r in app.contracts}
+    if opts.prop_profile is None:
+        return build_engine(bt=bt, specs=specs, registry=opts.prop_registry, activations=opts.prop_activations)
+    if opts.prop_profile == "":
+        return None
+    pid, _, ver = opts.prop_profile.partition("@")
+    if not ver:
+        raise ConfigError("--prop-profile needs ID@VERSION (an exact version)")
+    return build_engine(bt=bt, specs=specs, profile_id=pid, version=ver, registry=opts.prop_registry,
+                        activations=opts.prop_activations)
+
+
 def build(opts: ModeOptions, *, clock: Callable[[], pd.Timestamp] | None = None) -> Built:
     from src.ai.market_regime.config import load_regime_config
     from src.backtest.config import load_backtest_config
@@ -213,6 +233,9 @@ def build(opts: ModeOptions, *, clock: Callable[[], pd.Timestamp] | None = None)
         if opts.strategy_factory is None:
             raise ConfigError("the regime gate can only be disabled for test strategies")
         rc = replace(rc, enabled=False)
+    prop = _prop_engine(opts, bt, app)
+    if prop is not None and opts.prop_initial_balance_from_profile:
+        bt = replace(bt, initial_capital=prop.profile.initial_balance)
     base_pcfg = load_paper_config()
     clock = clock or (lambda: pd.Timestamp.now(tz="UTC"))
     ephemeral = opts.state_dir is None and opts.mode in ("mock", "replay")
@@ -298,6 +321,6 @@ def build(opts: ModeOptions, *, clock: Callable[[], pd.Timestamp] | None = None)
             "test_strategy": opts.strategy_factory is not None}
     session = PaperSession(pcfg, app, bt, sc, rc, guards, feed, journal, warmup=warm,
                            clock=clock if feed.kind != "replay" else None, news_readiness=readiness,
-                           strategy_factory=opts.strategy_factory, session_meta=meta)
+                           strategy_factory=opts.strategy_factory, session_meta=meta, prop_engine=prop)
     extras["ephemeral_state"] = ephemeral
     return Built(session, feed, info, extras, contracts, stop_when_exhausted, idle)

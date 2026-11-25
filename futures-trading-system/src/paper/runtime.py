@@ -89,7 +89,7 @@ class PaperSession:
                  clock: Callable[[], pd.Timestamp] | None = None, sleeper: Callable[[float], None] | None = None,
                  news_readiness: dict[str, Any] | None = None,
                  strategy_factory: Callable[[str], Any] | None = None,
-                 session_meta: dict[str, Any] | None = None) -> None:
+                 session_meta: dict[str, Any] | None = None, prop_engine: Any = None) -> None:
         """``strategy_factory`` exists for TESTS that need deterministic requests to exercise the
         execution engine; production uses the existing VWAP Trend Pullback strategy."""
         self.pcfg, self.app, self.bt, self.scfg, self.regime = pcfg, app, bt, strat_cfg, regime_cfg
@@ -121,9 +121,12 @@ class PaperSession:
                                   quote_max_age=pcfg.quote_max_age)
         self.news = news_guards
         self.news_readiness = news_readiness
+        # Sprint 9: prop firm compliance engine of the EXPLICITLY selected profile (None = not selected)
+        self.prop = prop_engine
         self.authorizer = EntryAuthorizer(mode=pcfg.mode, bt=bt, specs=self.specs, account=self.account,
                                           broker=self.broker, news_guards=news_guards, system_state=self.system_state,
-                                          flatten_time=self.flatten_time, allow_reversal=pcfg.allow_reversal)
+                                          flatten_time=self.flatten_time, allow_reversal=pcfg.allow_reversal,
+                                          prop_engine=prop_engine, prop_snapshot=self.prop_snapshot)
         self.broker.entry_token_check = self.authorizer.check_token
         self.strategies, self.inner = {}, {}
         for r in self.roots:
@@ -207,9 +210,34 @@ class PaperSession:
             self._activity_seq += 1
             self.activity.append({"seq": self._activity_seq, "kind": kind, "time": t, "payload": payload})
 
+    # ------------------------------------------------------------------ prop firm (Sprint 9)
+    def prop_snapshot(self):
+        """Backend account values for the compliance engine (never client-provided)."""
+        from src.risk.prop_firms.engine import AccountSnapshot
+
+        a = self.account
+        pending = {r: sum(o.remaining for o in self.broker.working(r, ("entry",))) for r in self.roots}
+        return AccountSnapshot(balance=a.initial_balance + a.net_realized, equity=a.equity(),
+                               positions={r: a.position_qty(r) for r in self.roots}, pending_entries=pending,
+                               # per-instrument freshness is checked by the authorizer's system stage first
+                               data_fresh=bool(self.health.connected), initial_balance=a.initial_balance)
+
+    def _prop_observe(self, ts: pd.Timestamp) -> str | None:
+        """Feed the engine; journal its records; return a flatten reason if it requests protection."""
+        if self.prop is None:
+            return None
+        reason = None
+        for act in self.prop.observe(ts, self.prop_snapshot()):
+            if act["action"] == "journal":
+                self._journal(act["kind"], act["payload"], ts)
+            elif act["action"] == "flatten":
+                reason = reason or act["reason"]
+        return reason
+
     # ------------------------------------------------------------------ recovery
     def state(self) -> dict[str, Any]:
         return {"account": self.account.state(), "broker": self.broker.state(), "validator": self.validator.state(),
+                "prop_firm": self.prop.state() if self.prop is not None else None,
                 "session": {"run_kind": self.run_kind, "seq": self.seq,
                             "last_event_ts": self.last_event_ts.isoformat() if self.last_event_ts is not None else None,
                             "account_session": str(self.account_session) if self.account_session is not None else None,
@@ -245,6 +273,7 @@ class PaperSession:
             self.validator.restore(st["validator"])
         except (KeyError, ValueError, TypeError, AccountStateError) as exc:
             raise RecoveryError(f"stored state invalid: {exc}") from exc
+        self._restore_prop(st.get("prop_firm"))
         s = st["session"]
         if s["run_kind"] != self.run_kind:
             raise RecoveryError(f"stored account belongs to a {s['run_kind']} run, not {self.run_kind}")
@@ -276,6 +305,27 @@ class PaperSession:
         self._journal_identity(pd.Timestamp.now(tz="UTC"))
         self._snapshot(now)
         self.journal.commit()
+
+    def _restore_prop(self, pst: dict[str, Any] | None) -> None:
+        """Compliance state is never reset or substituted on restart (blocks entries when untrustworthy)."""
+        journaled = any(True for _ in self.journal.entries("prop_firm_eod")) or \
+            any(True for _ in self.journal.entries("prop_firm_breach"))
+        if self.prop is None:
+            if pst is not None or journaled:
+                self._prop_deselected = True  # a reconciliation problem: entries stay blocked
+            return
+        if pst is None:
+            if journaled or any(True for _ in self.journal.entries("execution")):
+                self.prop.recovery_ok = False
+                self.prop.recovery_problems.append(
+                    "this account has history without compliance state for the selected profile: its high-water "
+                    "mark and daily counters cannot be established")
+            return
+        self.prop.restore(pst)
+        highs = [float(e["payload"]["eod_high"]) for e in self.journal.entries("prop_firm_eod")
+                 if e["payload"].get("profile") == self.prop.profile.key and e["payload"].get("eod_high") is not None]
+        breach = any(True for _ in self.journal.entries("prop_firm_breach"))
+        self.prop.check_journal_consistency(highs, breach)
 
     def _journal_identity(self, ts: pd.Timestamp) -> None:
         """Strategy / config / code / regime / cost identity of this run (Sprint 8 analytics)."""
@@ -348,6 +398,9 @@ class PaperSession:
                 problems.append(f"{r}: open position without a working stop-loss")
         if a.guard.enabled and a.guard.peak < a.initial_balance - 1e-9:
             problems.append("drawdown peak below the initial balance")
+        if getattr(self, "_prop_deselected", False):
+            problems.append("this account has prop firm compliance history but no profile is selected now "
+                            "(a profile is never silently dropped or substituted)")
         # protection state must not be lost or reset: compare with what the journal recorded
         for e in self.journal.entries("account_guard"):
             if e["payload"].get("state") == "breach" and not a.guard.breached:
@@ -682,6 +735,8 @@ class PaperSession:
         closed = self.account.apply(ex, sd if o.role != "entry" else (o.session_date or sd),
                                     self.entry_meta.get(ex.order_id))
         self._journal("execution", ex.to_dict(), ex.ts)
+        if self.prop is not None:
+            self.prop.on_execution(ex.exec_id, ex.ts)
         self._journal("account_update", {"exec_id": ex.exec_id, **{k: v for k, v in self.account.summary().items()
                                                                      if k != "daily_net"}}, ex.ts)
         if closed:
@@ -731,6 +786,9 @@ class PaperSession:
                 reason = "account_protection_partial_equity"
         if a.risk.emergency_active:
             reason = reason or "emergency_stop"
+        prop_reason = self._prop_observe(ev.ts)
+        if prop_reason and any_pos:
+            reason = reason or prop_reason
         if sd is not None and a.risk.config.tracks_unrealized_loss and any_pos:
             paid = sum(t.commission for t in a.open_trades.values())  # entry costs already paid
             if math.isfinite(eq):

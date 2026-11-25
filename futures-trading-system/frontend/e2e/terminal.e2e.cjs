@@ -58,12 +58,26 @@ async function expectText(page, text, timeout = 60000) {
       await expectText(page, "production strategy only");              // the TEST strategy is flagged
       await section("Live vs Replay");
       await expectText(page, "no SHADOW observations for MES");         // nothing compared without shadow data
+    } else if (scenario === "prop-firm") {
+      await page.evaluate(() => { window.location.hash = "/propfirm"; });
+      await expectText(page, "Prop Firm Center");
+      await expectText(page, "FundedNext Futures — Futures Flex");
+      await expectText(page, "NOT OPERATIONAL: UNVERIFIED");          // never presented as operational
+      await expectText(page, "FNF-FLEX50-MLL-EOD");                   // unresolved safety-critical rule listed
+      await expectText(page, "Official floor");
+      if (await page.getByText("SAFE", { exact: true }).count()) throw new Error("an unverified profile was shown as SAFE");
+      const v = (name) => page.getByRole("group", { name: "Prop firm view" }).getByText(name, { exact: true }).click();
+      await v("Rules & sources");
+      await expectText(page, "helpfutures.fundednext.com");            // official sources shown
+      await expectText(page, "NOT REVIEWED");
+      await v("History");
+      await page.getByText("prop_profile_not_operational").first().waitFor({ timeout: 120000 });  // real blocks
     } else if (scenario === "mock-fail") {
       await expectText(page, "MOCK");
       await expectText(page, "MARKET FEED DEGRADED", 60000);          // degraded feed is never hidden
     }
     const buttons = await page.getByRole("button").allTextContents();
-    const forbidden = buttons.filter((t) => /\b(buy|sell|order|flatten|submit|execute|apply|promote)\b/i.test(t));
+    const forbidden = buttons.filter((t) => /\b(buy|sell|order|flatten|submit|execute|apply|promote|activate|approve|override|withdraw)\b/i.test(t));
     if (forbidden.length) throw new Error(`order-like controls found: ${forbidden}`);
     if (errors.length) throw new Error(`page errors: ${errors.join("; ")}`);
     console.log(`E2E ${scenario}: PASS`);

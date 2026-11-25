@@ -1,0 +1,127 @@
+# Official FundedNext sources used for the Futures Flex $50K profiles (retrieved 2026-11-22).
+#
+# Retrieval method: FundedNext's own knowledge base (the official help-center FAQ, queried through
+# FundedNext's knowledge-base search). Each result returned the article title, a text excerpt and the
+# article URL below. The help-center web pages themselves could NOT be opened from the build
+# environment (network policy), so only excerpts were read: a human must read the full pages before
+# any profile is marked VERIFIED and activated. No effective dates were shown in the excerpts.
+#
+# This file is reference material for humans; the profiles carry their own [[sources]] copies.
+
+[[sources]]
+id = "S1"
+title = "FundedNext Futures Flex Challenge All Rules"
+url = "https://helpfutures.fundednext.com/en/articles/17229829-fundednext-futures-flex-challenge-all-rules"
+excerpts = [
+  "The Maximum Loss Limit (MLL) is the total amount you can lose before your account is permanently breached. It follows a Trailing End-of-Day (EOD) system, updating once per day based on your highest…",
+  "If your floating loss breaches the MLL during a live trade, your account is breached instantly.",
+  "No. The Flex Challenge has no daily loss limit at any stage, giving you more flexibility in trade management.",
+  "Your contract limit is the maximum number of contracts you can hold at once. It's fixed at account creation and does not increase with profit. Flex applies the same limits across the Challenge Account…",
+  "If you exceed the limit, only the excess contracts count as violations: profit from them is deducted, while losses still count.",
+  "Yes. The Consistency Rule applies throughout the Challenge Phase. Your profit on any single day cannot exceed 40% of your total profit target. Formula: 40% × Profit Target = Daily Profit Threshold…",
+]
+
+[[sources]]
+id = "S2"
+title = "FundedNext Futures Flex FundedNext Account All Rules"
+url = "https://helpfutures.fundednext.com/en/articles/17229848-fundednext-futures-flex-fundednext-account-all-rules"
+excerpts = [
+  "The Maximum Loss Limit (MLL) continues to apply on your funded account, using the same Trailing End-of-Day (EOD) system as the Challenge: Account Size Maximum Loss Limit MLL Locks At $50,000 $1,500 $50,100…",
+  "No. There is no daily loss limit on the Flex FundedNext Account.",
+  "Before each withdrawal, you must meet the criteria for your account size: Criteria $50K Account ... Benchmark Days 5 days of $200 ... Minimum Profit (current cycle) $500 ... Minimum Withdrawal $250 ...",
+  "No. Unlike the Challenge Phase, there is no Consistency Rule on the Flex FundedNext Account.",
+  "No. The Flex FundedNext Account does not use a buffer rule. Withdrawal eligibility is based on Benchmark Days instead.",
+]
+
+[[sources]]
+id = "S3"
+title = "What is FundedNext Futures Flex Challenge?"
+url = "https://helpfutures.fundednext.com/en/articles/17229807-what-is-fundednext-futures-flex-challenge"
+excerpts = [
+  "Account Size Profit Target Maximum Loss Limit Maximum Loss Limit Locks Flex 50K $2,500 $1,500 $50,100 ...",
+  "The maximum loss limit in the FundedNext Futures Flex Challenge is calculated based on your account balance and follows a trailing drawdown method.",
+  "Yes, the consistency rule applies during the Challenge Phase of the FundedNext Futures Flex Account. Traders are required to keep their profits within 40% of the total profit target. If this rule is not followed, the Challenge Phase profit target will be increased accordingly.",
+]
+
+[[sources]]
+id = "S4"
+title = "Daily Loss Limit and Maximum Loss Limit at FundedNext Futures"
+url = "https://helpfutures.fundednext.com/en/articles/17230292-daily-loss-limit-and-maximum-loss-limit-at-fundednext-futures"
+excerpts = [
+  "The MLL follows a trailing EOD system: It moves up as your balance increases, but never moves down with losses. It updates once per day at the end of…",
+  "Both include floating losses — an open trade can trigger either limit intraday. Both trail with EOD profit; the MLL locks at your initial balance (initial + $100 for Flex and Rapid Pro…",
+  "Flex: $50,100 / $100,100 / $150,100.",
+  "Day 1: Balance rises to $101,000 → MLL = $101,000 − $3,000 = $98,000. (Legacy $100K example)",
+]
+
+[[sources]]
+id = "S5"
+title = "Contract Limits and Contract Types at FundedNext Futures"
+url = "https://helpfutures.fundednext.com/en/articles/17230194-contract-limits-and-contract-types-at-fundednext-futures"
+excerpts = [
+  "Flex uses the same limits for the Challenge and FundedNext Account: Account Size Maximum Contracts $50,000 3 e-mini / 30 micro ... Mixing ratio: 1:10",
+  "You can mix e-mini and micro e-mini contracts using your model's ratio (1:10 for Legacy, Flex, and Rapid Pro & Daily).",
+]
+
+[[sources]]
+id = "S6"
+title = "Does FundedNext Futures allow overnight and weekend trade holding?"
+url = "https://helpfutures.fundednext.com/en/articles/14268506-does-fundednext-futures-allow-overnight-and-weekend-trade-holding"
+excerpts = [
+  "FundedNext Futures does not allow overnight or weekend trade holding. Traders must close all positions by 3:10 PM Central Time (CT) each trading day. Positions not closed by this time are automatically closed. Trading can resume at 5:00 PM CT, and after the weekend, trading resumes on Sunday at 5:00 PM CT.",
+]
+
+[[sources]]
+id = "S7"
+title = "Are there any news trading rules for FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/14298245-are-there-any-news-trading-rules-for-fundednext-futures"
+excerpts = ["FundedNext Futures does not impose any news trading rules. Traders are allowed to trade during news events on both the Challenge and the FundedNext Account."]
+
+[[sources]]
+id = "S8"
+title = "Is there any consistency rule to be followed in the FundedNext Futures Challenge & FundedNext Account?"
+url = "https://helpfutures.fundednext.com/en/articles/17230245-is-there-any-consistency-rule-to-be-followed-in-the-fundednext-futures-challenge-fundednext-account"
+excerpts = ["Model Challenge Phase FundedNext Account ... Flex ✅ 40% ❌ None ... If it does, the total profit required to pass is recalculated."]
+
+[[sources]]
+id = "S9"
+title = "Which symbols/instruments can I trade on FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/17225740-which-symbols-instruments-can-i-trade-on-fundednext-futures"
+excerpts = ["CME Equity Futures: E-mini NASDAQ 100 (NQ), Micro E-mini NASDAQ 100 (MNQ), E-mini S&P 500 (ES), Micro E-mini S&P 500 (MES), E-mini Russell 2000 (RTY), Micro E-mini Russell 2000 (M2K)"]
+
+[[sources]]
+id = "S10"
+title = "What Are the Trading Hours in FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/17225754-what-are-the-trading-hours-in-fundednext-futures"
+excerpts = ["Holiday trading hours — including any early market closes and the handling of open positions — will be communicated to traders in advance. ... automatic closure may not apply at an early (half-day) close"]
+
+[[sources]]
+id = "S11"
+title = "What are the Performance Reward eligibility criteria for Flex FundedNext Account?"
+url = "https://helpfutures.fundednext.com/en/articles/14878865-what-are-the-performance-reward-eligibility-criteria-for-flex-fundednext-account"
+excerpts = ["At FundedNext Futures, you can withdraw up to 50% of your accumulated profit (up to a maximum cap depending on account size) after every 5 benchmark days. ... Flex 50K: Benchmark Days 5 days of $200, Minimum Profit $500, Minimum Withdrawal $250, Maximum Withdrawal Up to 50% of profit (max $1,500)"]
+
+[[sources]]
+id = "S12"
+title = "What are Benchmark Days at FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/17230209-what-are-benchmark-days-at-fundednext-futures"
+excerpts = ["Benchmark Days are the withdrawal gate for the Legacy and Flex FundedNext Accounts only. ... A day qualifies as a Benchmark Day if you achieve at least the minimum…"]
+
+[[sources]]
+id = "S13"
+title = "What is the profit target in the FundedNext Futures Flex Challenge?"
+url = "https://helpfutures.fundednext.com/en/articles/14878840-what-is-the-profit-target-in-the-fundednext-futures-flex-challenge"
+excerpts = ["traders must reach a fixed profit target based on Challenge size: $2,500 for $50,000 ... there is no time limit"]
+
+[[sources]]
+id = "S14"
+title = "Road To Live Trading - Flex Challenge"
+url = "https://helpfutures.fundednext.com/en/articles/15430139-road-to-live-trading-flex-challenge"
+excerpts = ["Account Size Contracts (Standard) Contracts (After MLL Locks) 50K 3 Mini | 30 Micro 6 Mini | 60 Micro ... The MLL locks in any of two situations: When you request a payout; When your…"]
+note = "Describes the LIVE-account stage; differs from the Challenge / FundedNext Account excerpts. Not used for the Challenge or Funded profiles; recorded as an unresolved difference."
+
+[[sources]]
+id = "S15"
+title = "What are the prohibited trading strategies of FundedNext Futures?"
+url = "https://helpfutures.fundednext.com/en/articles/14298337-what-are-the-prohibited-trading-strategies-of-fundednext-futures"
+excerpts = ["Prohibited practices include platform error exploitation, account sharing, account rolling, multi-order spam, slow data feed abuse, spoofing, layering, grid trading, wash trading, latency…"]

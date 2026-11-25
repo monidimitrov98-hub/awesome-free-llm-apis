@@ -11,11 +11,14 @@ Signal time (after the strategy and the regime gate produced an entry request):
   7. sizing + bracket    existing position_size / bracket validity at the reference price
   8. session cutoff      no entry at/after the configured pre-session-end flatten time
   9. AccountGuard        existing drawdown/lock/safety-buffer checks
- 10. RiskManager         existing daily limits, size, windows, emergency stop
+ 10. Prop firm engine    (Sprint 9, only when a profile is selected) firm rules of the selected profile;
+                         an unverified / not activated profile blocks every entry (fail closed)
+ 11. RiskManager         existing daily limits, size, windows, emergency stop
 
 Fill time (before any entry fill is executed): system state, NewsGuard at the fill time,
 bracket validity and fill-quality limits at the ACTUAL fill price, risk budget (reduce or
-reject), AccountGuard with the actual trade risk + gap reserve, RiskManager. Any failure
+reject), AccountGuard with the actual trade risk + gap reserve, prop firm engine with the actual
+trade risk, RiskManager. Any failure
 rejects the order. Exits and protective orders never pass through here.
 
 Order note: the backtest engine asks RiskManager before AccountGuard; here AccountGuard is asked
@@ -56,7 +59,8 @@ class Decision:
 class EntryAuthorizer:
     def __init__(self, *, mode: str, bt: BacktestConfig, specs: dict[str, ContractSpec], account, broker,
                  news_guards: dict[str, Any], system_state: Callable[[str, pd.Timestamp], tuple[bool, str]],
-                 flatten_time: Callable[[pd.Timestamp], pd.Timestamp], allow_reversal: bool = False) -> None:
+                 flatten_time: Callable[[pd.Timestamp], pd.Timestamp], allow_reversal: bool = False,
+                 prop_engine: Any = None, prop_snapshot: Callable[[], Any] | None = None) -> None:
         self.mode = mode
         self.bt = bt
         self.specs = specs
@@ -66,6 +70,8 @@ class EntryAuthorizer:
         self.system_state = system_state
         self.flatten_time = flatten_time
         self.allow_reversal = allow_reversal
+        self.prop = prop_engine          # Sprint 9 compliance engine (None = no profile selected)
+        self.prop_snapshot = prop_snapshot
         # one-time approvals created ONLY by an approved authorize_signal: token -> approved terms
         self._approved: dict[str, dict[str, Any]] = {}
 
@@ -171,10 +177,27 @@ class EntryAuthorizer:
         blocked = self.account.guard.entry_block_reason(equity, session_date)
         if not d.add("account_guard", blocked is None, blocked or "", equity=equity if math.isfinite(equity) else None):
             return d, out
-        rd = self.account.risk.check_entry(when=now, session_date=session_date, quantity=size.quantity)
+        quantity = size.quantity
+        if self.prop is not None:
+            risk = None
+            if stop is not None:
+                per = risk_per_contract(spec, entry_price=ref, stop_loss=stop, cost=self.bt.cost_for(root),
+                                        slippage=self.bt.slippage, include_costs=True,
+                                        entry_slippage_ticks=entry_slippage_ticks(req.order_type, self.bt.slippage))
+                risk = per * quantity if math.isfinite(per) else None
+            pd_ = self.prop.evaluate_entry(now, root, quantity, self.prop_snapshot(), trade_risk=risk,
+                                           news={"available": True, "allowed": nd.allowed, "reason": nd.status.state.value},
+                                           scope="pre_trade")
+            if not d.add("prop_firm", pd_.allowed, pd_.reason, profile=pd_.profile, ruleset=pd_.ruleset_sha256[:16],
+                         reasons=pd_.reasons, official_buffer=pd_.official_buffer, estimated_buffer=pd_.estimated_buffer,
+                         state=pd_.account_state_sha256[:16]):
+                return d, out
+            if pd_.allowed_quantity is not None and pd_.allowed_quantity < quantity:
+                quantity = pd_.allowed_quantity  # explicit profile policy: reduce only, never increase
+        rd = self.account.risk.check_entry(when=now, session_date=session_date, quantity=quantity)
         if not d.add("risk_manager", rd.approved, rd.reason):
             return d, out
-        out.update(price=price, stop=stop, target=target, quantity=size.quantity, reference=ref,
+        out.update(price=price, stop=stop, target=target, quantity=quantity, reference=ref,
                    risk_budget=(self.bt.sizing.risk_per_trade if self.bt.sizing.method == "risk" and req.quantity is None
                                 else None))
         out["token"] = self._approve(root, req, now, session_date, out)
@@ -237,6 +260,17 @@ class EntryAuthorizer:
         blocked = self.account.guard.fill_block_reason(equity, o.session_date, account_risk)
         if not d.add("account_guard", blocked is None, blocked or "", account_risk=account_risk):
             return d, None
+        if self.prop is not None:
+            snap = self.prop_snapshot()
+            # this order's own unfilled quantity is the one being decided: not counted twice as pending
+            snap.pending_entries = {r: q - (o.remaining if r == o.root else 0) for r, q in snap.pending_entries.items()}
+            trade_risk = total * per if math.isfinite(per) else None
+            pd_ = self.prop.evaluate_entry(ev.ts, o.root, qty, snap, trade_risk=trade_risk,
+                                           news={"available": True, "allowed": nd.allowed, "reason": nd.status.state.value},
+                                           scope="fill")
+            if not d.add("prop_firm", pd_.allowed, pd_.reason, profile=pd_.profile, reasons=pd_.reasons,
+                         official_buffer=pd_.official_buffer, estimated_buffer=pd_.estimated_buffer):
+                return d, None
         rd = self.account.risk.check_entry(when=ev.ts, session_date=o.session_date, quantity=total)
         if not d.add("risk_manager", rd.approved, rd.reason):
             return d, None

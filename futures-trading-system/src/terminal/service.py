@@ -478,6 +478,95 @@ class TerminalService:
             body = to_csv(rows, meta) if fmt == "csv" else to_json({"rows": rows}, meta)
             return body, f"shadow_{kind}_{(f.session_type or 'all').lower()}.{fmt}"
 
+    # ------------------------------------------------------------------ prop firm center (Sprint 9, read-only)
+    def _prop_registry(self):
+        from src.risk.prop_firms.versions import Registry
+
+        return self.opts.prop_registry or Registry()
+
+    def propfirm_status(self) -> dict[str, Any]:
+        """Current compliance state of THIS session's profile (backend values only)."""
+        from src.risk.prop_firms.authority import unified_decision
+        from src.risk.prop_firms.engine import ComplianceEngine
+        from src.risk.prop_firms.payout import payout_eligibility
+
+        def f(s):
+            if s.prop is None:
+                return {"selected": False, "note": "No prop firm profile is selected for this session: entries are "
+                        "governed by AccountGuard and RiskManager only. Select one in config/prop_firm.toml "
+                        "(exact id and version) or with --prop-profile."}
+            now = s.last_event_ts or pd.Timestamp.now(tz="UTC")
+            snap = s.prop_snapshot()
+            root = s.roots[0]
+            dec = s.prop.evaluate_entry(now, root, 1, snap, scope="status", record=False)
+            sd = s.account_session
+            eq = s.account.equity()
+            ag = s.account.guard.entry_block_reason(eq, sd) if sd is not None else "outside_session"
+            rd = s.account.risk.check_entry(when=now, session_date=sd, quantity=1) if sd is not None else None
+            ok, why = s.system_state(root, now)
+            unified = unified_decision(
+                emergency=(ok and not s.account.risk.emergency_active, why or ("emergency_stop" if s.account.risk.emergency_active else "")),
+                account_guard=ag, prop_firm=dec.to_dict(), risk_manager=(rd.approved, rd.reason) if rd else None)
+            return {"selected": True, "status": ComplianceEngine.classify(dec, s.prop.breached),
+                    "summary": s.prop.summary(snap, now), "entry_check": {**dec.to_dict(), "nominal": f"1 x {root} entry now"},
+                    "unified": unified, "payout": payout_eligibility(s.prop),
+                    "evaluated_at": now.isoformat(), "timezone": s.prop.profile.timezone}
+        out = self._locked(f)
+        return out if out is not None else {"selected": False, "note": "session not started"}
+
+    def propfirm_profiles(self) -> dict[str, Any]:
+        from src.risk.prop_firms.versions import Activations, operational_state
+
+        reg = self._prop_registry()
+        acts = self.opts.prop_activations or Activations()
+        rows = []
+        for key, p in sorted(reg.profiles.items()):
+            st = operational_state(p, acts)
+            rows.append({"key": key, "id": p.id, "version": p.version, "firm": p.firm, "product": p.product,
+                         "stage": p.stage, "account_size": p.account_size, "account_type": p.account_type,
+                         "status": st["status"], "operational": st["operational"],
+                         "not_operational_reason": st["not_operational_reason"],
+                         "unverified_rules": st["unverified_rules"], "incomplete_rules": st["incomplete_rules"],
+                         "safety_critical_unresolved": st["safety_critical_unresolved"],
+                         "retrieved": p.verification.get("retrieved"), "reviewed_by": bool(p.verification.get("reviewed_by")),
+                         "reviewed_on": p.verification.get("reviewed_on") or None, "ruleset_sha256": p.ruleset_sha256[:16]})
+        return {"profiles": rows, "invalid_files": sorted(reg.errors)}
+
+    def propfirm_profile(self, key: str) -> dict[str, Any] | None:
+        from dataclasses import asdict
+
+        from src.risk.prop_firms.versions import Activations, operational_state
+
+        reg = self._prop_registry()
+        p = reg.profiles.get(key)
+        if p is None:
+            return None
+        return {"key": key, "firm": p.firm, "product": p.product, "stage": p.stage, "account_size": p.account_size,
+                "account_type": p.account_type, "initial_balance": p.initial_balance, "timezone": p.timezone,
+                "day_start": p.day_start, "description": p.description, "verification": p.verification,
+                "status": operational_state(p, self.opts.prop_activations or Activations()),
+                "internal_limits": {**asdict(p.internal), "note": "our own margins, NOT firm rules"},
+                "rules": [asdict(r) for r in p.rules], "sources": [asdict(s) for s in p.sources],
+                "profile_sha256": p.sha256, "ruleset_sha256": p.ruleset_sha256,
+                "versions": [x.version for x in reg.versions(p.id)]}
+
+    def propfirm_compare(self, a: str, b: str) -> dict[str, Any] | None:
+        from src.risk.prop_firms.versions import diff
+
+        reg = self._prop_registry()
+        pa, pb = reg.profiles.get(a), reg.profiles.get(b)
+        if pa is None or pb is None:
+            return None
+        return diff(pa, pb)
+
+    def propfirm_history(self) -> dict[str, Any] | None:
+        from src.risk.prop_firms.reports import journal_report
+
+        b = self.built
+        if b is None:
+            return None
+        return journal_report(b.session.journal.path)
+
     def system(self) -> dict[str, Any]:
         proc = {}
         try:

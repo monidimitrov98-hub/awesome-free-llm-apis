@@ -45,7 +45,7 @@ function renderApp(st: TerminalState, prefs: Prefs = DEFAULT_PREFS) {
 }
 
 const PAGES = ["Dashboard", "Live Charts", "AI Market Analysis", "Strategy Monitor", "Positions", "Risk Center", "Trade Journal",
-  "Performance", "Shadow Analytics", "Market Data", "System Health", "Settings"];
+  "Performance", "Shadow Analytics", "Prop Firm Center", "Market Data", "System Health", "Settings"];
 
 describe("application shell", () => {
   it("shows the mode unmistakably and labels synthetic data", () => {

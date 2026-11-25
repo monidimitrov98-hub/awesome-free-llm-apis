@@ -1252,9 +1252,9 @@ python run_marketdata.py monitor                          # waits for the NinjaT
 ## Sprint 7: FTS Terminal (read-only trading terminal, desktop + browser)
 
 A local professional trading terminal built with React, TypeScript and Lightweight Charts. It runs
-on a read-only FastAPI backend that observes the running paper session. It has 12 screens:
+on a read-only FastAPI backend that observes the running paper session. It has 13 screens:
 Dashboard, Live Charts, AI Market Analysis, Strategy Monitor, Positions, Risk Center, Trade
-Journal, Performance, Shadow Analytics (Sprint 8), Market Data, System Health and Settings. **There is no order entry**, and
+Journal, Performance, Shadow Analytics (Sprint 8), Prop Firm Center (Sprint 9), Market Data, System Health and Settings. **There is no order entry**, and
 every position is paper / simulated.
 
 ```
@@ -1297,6 +1297,33 @@ python run_terminal.py --mode replay --keep-state     # keep a replay run for th
 
 The terminal has a new **Shadow Analytics** screen. See `docs/sprint8_shadow_analytics.md` for the
 architecture, metric definitions, statistical method, interpretation guide and limitations.
+
+## Sprint 9: Prop firm account protection and compliance (simulation only)
+
+This sprint adds a universal, data-driven compliance engine for prop firm profiles
+(`src/risk/prop_firms/`). It sits between AccountGuard (still the survival authority) and
+RiskManager in the entry authorization pipeline. It covers:
+
+- drawdown models (static, trailing intraday, trailing end-of-day with lock);
+- daily loss and consistency rules;
+- contract limits;
+- flat-by, session, weekend and holiday restrictions;
+- news restrictions through NewsGuard.
+
+A profile authorizes entries only when it is VERIFIED **and** activated by a human for its exact
+content. No profile is selected by default.
+
+The FundedNext Futures Flex $50K profiles (Challenge and Funded) record the firm's official rules
+with sources, from the knowledge base retrieved 2026-11-22. They are **UNVERIFIED**: the EOD
+update time, the holiday schedule and some definitions are unresolved. They therefore block every
+new entry while showing the full evaluation. The terminal has a new **Prop Firm Center** screen.
+See `docs/sprint9_prop_firm_compliance.md`.
+
+```
+python run_prop_firm.py list
+python run_prop_firm.py show fundednext_futures_flex_50k_challenge 2026-11-22.1
+python run_prop_firm.py evaluate fundednext_futures_flex_50k_challenge 2026-11-22.1 --balance 50000 --equity 49900 --root MES
+```
 
 ## Known limitations
 
