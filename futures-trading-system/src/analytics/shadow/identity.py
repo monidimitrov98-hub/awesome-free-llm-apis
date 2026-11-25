@@ -52,13 +52,20 @@ def run_identity(session) -> dict[str, Any]:
         regime.update(config_sha256=sha(rc), model_version=getattr(rc, "model_version", None),
                       classifier=getattr(rc, "classifier", None), enforcement=getattr(rc, "enforcement", None),
                       artifacts=dict(getattr(getattr(gate, "engine", None), "artifacts", {}) or {}))
-    strategy_cfg_sha = sha(session.scfg)
     meta = dict(session.session_meta or {})
+    binding = getattr(session, "binding", None)
+    if binding is not None:      # Sprint 11: a governance-approved registry version
+        strategy = {"names": strategies, "config_sha256": binding.sha256,
+                    "version": f"{binding.strategy_id}@{binding.version}", "registry": binding.identity(),
+                    "signal_timeframe": binding.signal_timeframe, "context_timeframe": None}
+    else:
+        strategy_cfg_sha = sha(session.scfg)
+        strategy = {"names": strategies, "config_sha256": strategy_cfg_sha,
+                    "version": f"{sorted(set(strategies.values()))[0] if strategies else '?'}@{strategy_cfg_sha[:12]}",
+                    "signal_timeframe": session.scfg.signal_timeframe, "context_timeframe": session.scfg.context_timeframe}
     return {
         "schema": 1,
-        "strategy": {"names": strategies, "config_sha256": strategy_cfg_sha,
-                     "version": f"{sorted(set(strategies.values()))[0] if strategies else '?'}@{strategy_cfg_sha[:12]}",
-                     "signal_timeframe": session.scfg.signal_timeframe, "context_timeframe": session.scfg.context_timeframe},
+        "strategy": strategy,
         "code": code_identity_cached(),
         "regime": regime,
         "contracts": {r: {"tick_size": session.specs[r].tick_size, "point_value": session.specs[r].point_value}

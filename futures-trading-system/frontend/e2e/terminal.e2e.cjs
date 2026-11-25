@@ -76,6 +76,26 @@ async function expectText(page, text, timeout = 60000) {
       await expectText(page, "Operational readiness");
       await page.getByText(/^(INCOMPLETE|BLOCKED)$/).first().waitFor({ timeout: 60000 });
       if (await page.getByText("OPERATIONAL (SIMULATION)", { exact: true }).count()) throw new Error("unverified profile shown as operational");
+    } else if (scenario === "research") {                               // Sprint 11 Quant Research (read-only)
+      await page.evaluate(() => { window.location.hash = "/research"; });
+      await expectText(page, "Quant Research");
+      await expectText(page, "READ-ONLY · RESEARCH SIMULATION");
+      await expectText(page, "original confirmation and stop rules are not known");
+      await expectText(page, "vwap_mean_reversion@V1-C2-SWING");
+      await expectText(page, "INSUFFICIENT EVIDENCE");                 // synthetic data never claims an edge
+      await expectText(page, "INCOMPLETE -- RESEARCH ONLY");           // unverified profile: coverage incomplete
+      await page.getByText("vwap_mean_reversion@V1-C2-SWING").first().click();
+      await expectText(page, "MANIFEST VERIFIED");
+      await expectText(page, "Prop firm compliance coverage");
+      await expectText(page, "FNF-FLEX50-MLL-EOD");
+      const v = (name) => page.getByRole("group", { name: "Research view" }).getByText(name, { exact: true }).click();
+      await v("Versions & promotion");
+      await expectText(page, "V1-C4-SWING");
+      await expectText(page, "there is no live state");
+      await v("Experiments");
+      await expectText(page, "Every attempt counts in the multiple-testing family");
+      await v("Out-of-sample ledger");
+      await expectText(page, "No out-of-sample reveal recorded");
     } else if (scenario === "mock-fail") {
       await expectText(page, "MOCK");
       await expectText(page, "MARKET FEED DEGRADED", 60000);          // degraded feed is never hidden

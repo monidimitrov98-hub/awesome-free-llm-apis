@@ -89,9 +89,11 @@ class PaperSession:
                  clock: Callable[[], pd.Timestamp] | None = None, sleeper: Callable[[float], None] | None = None,
                  news_readiness: dict[str, Any] | None = None,
                  strategy_factory: Callable[[str], Any] | None = None,
-                 session_meta: dict[str, Any] | None = None, prop_engine: Any = None) -> None:
+                 session_meta: dict[str, Any] | None = None, prop_engine: Any = None, binding: Any = None) -> None:
         """``strategy_factory`` exists for TESTS that need deterministic requests to exercise the
-        execution engine; production uses the existing VWAP Trend Pullback strategy."""
+        execution engine; production uses the existing VWAP Trend Pullback strategy, or (Sprint 11) a
+        governance-approved registry version passed as ``binding`` (src.research.paper_binding)."""
+        self.binding = binding
         self.pcfg, self.app, self.bt, self.scfg, self.regime = pcfg, app, bt, strat_cfg, regime_cfg
         # guards the whole session state: the run loop holds it while processing; read-only views
         # (e.g. the terminal API) hold it while building a consistent snapshot
@@ -130,8 +132,12 @@ class PaperSession:
         self.broker.entry_token_check = self.authorizer.check_token
         self.strategies, self.inner = {}, {}
         for r in self.roots:
-            inner = strategy_factory(r) if strategy_factory else VwapTrendPullbackStrategy(strat_cfg,
-                                                                                           self.session.timezone)
+            if strategy_factory:
+                inner = strategy_factory(r)
+            elif binding is not None:
+                inner = binding.factory(r)
+            else:
+                inner = VwapTrendPullbackStrategy(strat_cfg, self.session.timezone)
             strat = inner
             if regime_cfg is not None and regime_cfg.enabled:
                 from src.ai.market_regime.filters import RegimeGatedStrategy
@@ -174,6 +180,9 @@ class PaperSession:
     def flatten_time(self, session_date: pd.Timestamp) -> pd.Timestamp:
         if session_date not in self._flatten_cache:
             end = session_bounds([session_date], self.session).iloc[0]["end"]
+            if self.binding is not None and self.binding.session is not self.session:
+                # a strategy trading a narrower session (e.g. RTH) is flat before ITS session ends
+                end = min(end, session_bounds([session_date], self.binding.session).iloc[0]["end"])
             self._flatten_cache[session_date] = end - self.bt.execution.flatten_before_session_end
         return self._flatten_cache[session_date]
 
@@ -195,7 +204,28 @@ class PaperSession:
             return False, why
         if not math.isfinite(self.account.equity()):
             return False, "account_equity_unknown"
+        if self.binding is not None and getattr(self.binding, "recheck", None) is not None:
+            ok, why = self._governance_ok()
+            if not ok:
+                return False, "strategy_not_approved"
         return True, ""
+
+    def _governance_ok(self) -> tuple[bool, str]:
+        """Sprint 11: the promotion state of a registry version is re-read at most every 30 s (wall clock); a
+        SUSPENDED / REJECTED version, or a promotion store that fails its integrity check, blocks new entries.
+        Open positions keep their protective orders (nothing is flattened by this check)."""
+        now = time.monotonic()
+        cached = getattr(self, "_gov_cache", None)
+        if cached is None or now - cached[0] >= 30.0:
+            try:
+                res = self.binding.recheck()
+            except Exception as exc:  # noqa: BLE001 -- unreadable approval state: fail closed
+                res = (False, f"governance check failed: {type(exc).__name__}")
+            if cached is not None and cached[1][0] and not res[0]:
+                log.warning("strategy %s@%s no longer approved: %s -- new entries blocked",
+                            self.binding.strategy_id, self.binding.version, res[1])
+            self._gov_cache = cached = (now, res)
+        return cached[1]
 
     def status(self) -> dict[str, Any]:
         """Read-only status snapshot for the Sprint 7 GUI (see src/marketdata/status.py)."""
@@ -844,7 +874,7 @@ class PaperSession:
         b = self.builders[root]
         self.journal.add_bar(root, minute, tuple(float(x) for x in b._rows[-1]))
         end = minute + pd.Timedelta(minutes=1)
-        tf = pd.Timedelta(self.scfg.signal_timeframe)
+        tf = pd.Timedelta(self.binding.signal_timeframe if self.binding is not None else self.scfg.signal_timeframe)
         if (end - end.normalize()) % tf != pd.Timedelta(0):
             return
         self._signal(root, end, ev)
@@ -857,7 +887,10 @@ class PaperSession:
         self._bar_completed(root, minute, _E(f"clock-{now.isoformat()}", root, "clock", now, source="clock"))
 
     def _signal(self, root: str, boundary: pd.Timestamp, ev: MarketEvent) -> None:
-        signal, context = build_frames(self.builders[root].frame(), self.app, self.scfg, self.regime)
+        if self.binding is not None:
+            signal, context = self.binding.frames(root, self.builders[root].frame())
+        else:
+            signal, context = build_frames(self.builders[root].frame(), self.app, self.scfg, self.regime)
         avail = pd.DatetimeIndex(signal["available_at"])
         hits = (avail == boundary).nonzero()[0]
         if not len(hits):
@@ -885,7 +918,7 @@ class PaperSession:
         requests = list(strat.on_bar(ctx) or [])
         inner = self.inner[root]
         for row in getattr(inner, "diagnostics", [])[self._diag_pos[root]:]:
-            if row.get("decision") == "signal":
+            if row.get("decision") == "signal" or row.get("event") == "signal":   # trend / mean-reversion rows
                 self.signals_seen += 1
             self._journal("strategy_decision", {"root": root, **{k2: _jsonable(v) for k2, v in row.items()}}, ev.ts)
         self._diag_pos[root] = len(getattr(inner, "diagnostics", []))

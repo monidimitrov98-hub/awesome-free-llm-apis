@@ -1,5 +1,38 @@
 // Minimal responses shaped like src/terminal/views.py, for rendering tests.
 export const API: Record<string, unknown> = {
+  "/api/research/overview": {
+    read_only: true,
+    limitations: ["Research results are historical simulations; none is evidence of future profitability.",
+      "VWAP Mean Reversion V1 is a RESEARCH candidate: confirmation methods C1-C4 and the stop methods are experimental; the user's original confirmation and stop rules are not known."],
+    strategies: [{ id: "vwap_trend_pullback", title: "VWAP Trend Pullback", description: "existing", implementation: "x", research_status: "existing strategy" },
+      { id: "vwap_mean_reversion", title: "VWAP Mean Reversion (V1 research candidate)", description: "experimental", implementation: "y", research_status: "RESEARCH candidate" }],
+    versions: [{ strategy: "vwap_mean_reversion", version: "V1-C2-SWING", sha256: "2094242986eddc1588e4d0e1a292fa23", state: "REGISTERED", registered: "2026-11-25", promotion_state: "RESEARCH", integrity_ok: true, transitions: 0 },
+      { strategy: "vwap_mean_reversion", version: "V1-C9-EDITED", sha256: "abcdef0123456789abcdef", state: "MODIFIED_AFTER_REGISTRATION", registered: "2026-11-25", promotion_state: "RESEARCH", integrity_ok: false, transitions: 0 }],
+    experiments: { total: 3, failed: 1, unfinished: 0, integrity_ok: true, recent: [
+      { attempt: "aaaaaaaaaaaaaaaa", at: "2026-11-25T10:00:00Z", strategy: "vwap_mean_reversion", version: "V1-C2-SWING", instrument: "MES", purpose: "train", status: "failed", period: { start: "2024-01-02", end: "2024-06-28" }, evidence: null, registered: true, error: "ConfigError: no data" }] },
+    oos: { ledger_ok: true, reveals: [] },
+    runs: [{ attempt: "0123456789abcdef", strategy: "vwap_mean_reversion", version: "V1-C2-SWING", overrides: null, registered: true, purpose: "train", instrument: "MES:synthetic",
+      period: { start: "2025-03-10", end: "2025-03-14" }, synthetic: true, evidence: "INSUFFICIENT EVIDENCE", trades: 3, mean_daily: -26.5, mean_daily_ci95: [-45, -8], p_holm: 0.71, family_size: 5,
+      compliance: "INCOMPLETE -- RESEARCH ONLY", code_trusted: false, monte_carlo: true }],
+  },
+  "/api/research/run": {
+    integrity: { ok: true, problems: [] },
+    manifest: { attempt: "0123456789abcdef", purpose: "train", strategy: { id: "vwap_mean_reversion", version: "V1-C2-SWING", sha256: "2094242986eddc15", registered: true, overrides: null },
+      instrument: "MES:synthetic", period: { start: "2025-03-10", end: "2025-03-14" }, data: { sha256: "ab12" }, code: { commit: "95b85f8d8e2c", trusted: false, untrusted_reasons: ["working tree has uncommitted changes"] },
+      prop: { profile: "fundednext_futures_flex_50k_challenge@2026-11-25.1", sha256: "x", operational: false }, cost_sensitivity: null, oos: null, synthetic_data: true,
+      disclaimer: "Research simulation only. Not evidence of future profitability; no order can reach a broker." },
+    evaluation: { scope_text: "TRAINING PERIOD (in-sample)", evidence: "INSUFFICIENT EVIDENCE", sample: { trades: 3, trading_days_with_trades: 2, level: "INSUFFICIENT SAMPLE SIZE" },
+      net_profit: -53, ev_per_trade: -17.7, ev_per_trade_ci95_conservative: [-60, 20], mean_daily_pnl: -26.5, mean_daily_pnl_ci95_day_bootstrap: [-45, -8], win_rate: 0.333,
+      win_rate_ci95_wilson: [0.06, 0.79], average_win: 11.5, average_loss: -32.25, profit_factor: 0.18, max_drawdown_equity: 64.5,
+      ratios: { sharpe: null, sortino: null, note: "not meaningful: 2 trading day(s) (needs >= 20)" },
+      tests: { p_raw: 0.71, p_holm: 0.71, p_bh: 0.71, family_size: 5 }, power: { days_needed_80pct_at_observed_effect: null },
+      costs: { total_costs: 8.5, commission: 6, slippage: 2.5 }, limitations: ["No claim of profitability is made by this report."] },
+    compliance_coverage: { verdict: "INCOMPLETE -- RESEARCH ONLY", note: "Simulation coverage only. It does not establish compliance with the firm's real, current rules.",
+      issues: ["profile not operational: profile status UNVERIFIED"],
+      rules: [{ rule: "FNF-FLEX50-MLL", status: "APPLIED", verification: "VERIFIED", detail: "evaluated" }, { rule: "FNF-FLEX50-HOLIDAYS", status: "UNAVAILABLE", verification: "VERIFIED", detail: "no schedule" }] },
+    monte_carlo: [{ file: "monte_carlo_seed1_paths300.json", method: "day_block", paths: 300, prob_final_negative: 0.9, prob_final_negative_stress: 0.95, max_dd_p50: 60, max_dd_p95: 120, risk_of_ruin: 0.01,
+      prop_label: "RESEARCH ESTIMATE: profile not operational (UNVERIFIED or not activated); only rules individually marked VERIFIED are simulated", seed: 1 }],
+  },
   "/api/risk": {
     time: "2026-01-01T15:00:00Z",
     account_guard: { enabled: true, profile: "generic_example", drawdown_type: "trailing_eod", account_size: 10000, max_drawdown: 2000,

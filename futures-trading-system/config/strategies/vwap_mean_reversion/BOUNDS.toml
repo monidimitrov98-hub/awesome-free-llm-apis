@@ -1,0 +1,12 @@
+# Declared research bounds for parameter sweeps of vwap_mean_reversion (Sprint 11). A sweep may only use
+# values inside these bounds and only these parameters; the bounds were declared BEFORE any result was seen.
+# Every attempted configuration (including failures) is recorded in the experiment registry and counted in the
+# multiple-testing correction.
+[bounds]
+"indicators.band_k" = [1.5, 3.0]
+"indicators.rsi_oversold" = [20.0, 35.0]
+"indicators.rsi_overbought" = [65.0, 80.0]
+"confirmation.max_bars_after_setup" = [1, 6]
+"stop.atr_multiple" = [1.0, 3.0]
+"stop.swing_lookback_bars" = [3, 12]
+"target.fraction" = [0.5, 1.0]

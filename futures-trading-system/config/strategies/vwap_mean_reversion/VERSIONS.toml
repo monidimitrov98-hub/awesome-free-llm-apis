@@ -1,0 +1,31 @@
+# Registered (immutable) parameter versions. Entries are only ever appended.
+
+[versions."V1-C1-SWING"]
+sha256 = "5fad17ba68465b640a1aee40f50e2fa48585e0ec974141d95c2a4901cb4e3ffd"
+registered = "2026-11-25"
+note = "Sprint 11 initial research candidate (experimental variant)"
+
+[versions."V1-C2-SWING"]
+sha256 = "2094242986eddc1588e4d0e1a292fa236f8711f503c24feba45f755a3ac5d6b3"
+registered = "2026-11-25"
+note = "Sprint 11 initial research candidate (experimental variant)"
+
+[versions."V1-C3-SWING"]
+sha256 = "4f3bc931b07356aa7f1ac334429a04aa4e729d553be1fb09d06a620828d40a83"
+registered = "2026-11-25"
+note = "Sprint 11 initial research candidate (experimental variant)"
+
+[versions."V1-C4-SWING"]
+sha256 = "9d32d9aa727a5b4ebce45ce1d57e64df1b537c104807b0457bb5b3d9ffd692f6"
+registered = "2026-11-25"
+note = "Sprint 11 initial research candidate (experimental variant)"
+
+[versions."V1-C2-ATR"]
+sha256 = "3259da99e98b360a48dee07ce7e7b3ec0da4f0abbad2fa36c180bf811ff31766"
+registered = "2026-11-25"
+note = "Sprint 11 initial research candidate (experimental variant)"
+
+[versions."V1-C2-BAND"]
+sha256 = "760cc406ca104875dfbb82e5419fedfe93e0dc2e0d9a7e3e9cc27ca6cdb06d73"
+registered = "2026-11-25"
+note = "Sprint 11 initial research candidate (experimental variant)"

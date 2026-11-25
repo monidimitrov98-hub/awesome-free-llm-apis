@@ -1,0 +1,6 @@
+# Registered (immutable) parameter versions. Entries are only ever appended.
+
+[versions."V0"]
+sha256 = "bd16ec6de14c9ce5470bb8d144a9c8e91dc988cc21a6b410f966dc44823884cd"
+registered = "2026-11-25"
+note = "snapshot of config/strategy_vwap_pullback.toml at Sprint 11"

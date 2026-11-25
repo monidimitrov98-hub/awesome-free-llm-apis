@@ -582,6 +582,19 @@ class TerminalService:
                                                        extra={f"this terminal ({b.info.label})": b.session.journal.path})
             return lib.session_report(Filters())
 
+    # ------------------------------------------------------------------ quant research (Sprint 11, read-only)
+    def research_overview(self) -> dict[str, Any]:
+        from src.config import load_config
+        from src.research.views import overview
+
+        return overview(load_config(), root=getattr(self.opts, "research_root", None),
+                        governance_path=getattr(self.opts, "governance_path", None))
+
+    def research_run(self, attempt: str) -> dict[str, Any] | None:
+        from src.research.views import run_detail
+
+        return run_detail(attempt, root=getattr(self.opts, "research_root", None))
+
     # ------------------------------------------------------------------ prop firm center (Sprint 9, read-only)
     def _prop_registry(self):
         from src.risk.prop_firms.versions import Registry

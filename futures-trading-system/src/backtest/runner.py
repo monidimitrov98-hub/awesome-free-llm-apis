@@ -20,7 +20,6 @@ from src.backtest.manifest import build_manifest, snapshot, write_manifest
 from src.backtest.validation import Period, session_dates, slice_frame
 from src.config import AppConfig, ConfigError
 from src.pipeline import MarketData, build_market_data
-from src.strategy.vwap_pullback import VwapTrendPullbackStrategy
 from src.strategy.vwap_pullback_config import VwapPullbackConfig
 
 
@@ -39,72 +38,68 @@ class StrategyRun:
 
 
 def _frames(md: MarketData, cfg: VwapPullbackConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
-    needed = [cfg.signal_timeframe, cfg.execution_timeframe] + ([cfg.context_timeframe] if cfg.context_timeframe else [])
-    missing = [tf for tf in needed if tf not in md.frames]
-    if missing:
-        raise ConfigError(f"Timeframes {missing} are not produced by the pipeline; add them to "
-                          "config/settings.toml [resample] timeframes")
-    context = {cfg.context_timeframe: md.frames[cfg.context_timeframe]} if cfg.context_timeframe else {}
-    return md.frames[cfg.signal_timeframe], md.frames[cfg.execution_timeframe], context
+    """Kept for compatibility: the trend-pullback frames (see src.research.registry)."""
+    from src.research.registry import _tp_prepare
+
+    p = _tp_prepare(md, None, cfg, None)
+    return p.signal, p.execution, p.context
 
 
 def _regime_frames(md: MarketData, app: AppConfig, cfg: VwapPullbackConfig, regime) -> tuple[pd.DataFrame, dict]:
-    """Signal frame and context frames with causal regime features (computed on the whole
-    file before any period slicing; features are causal, earlier data is warm-up only)."""
-    from src.ai.market_regime.features import add_regime_features, add_shock_features
+    """Kept for compatibility (paper runtime, tests): trend-pullback signal frame and context frames with causal
+    regime features, computed on the whole file before any period slicing."""
+    from src.research.registry import _regime_frames as generic
 
-    if regime.signal_timeframe != cfg.signal_timeframe:
-        raise ConfigError(f"regime signal_timeframe {regime.signal_timeframe} != strategy {cfg.signal_timeframe}")
-    if regime.context_timeframe and regime.context_timeframe != cfg.context_timeframe:
-        raise ConfigError(f"regime context_timeframe {regime.context_timeframe} != strategy {cfg.context_timeframe}")
-    kw = dict(ema_fast=cfg.ema_fast_col, ema_slow=cfg.ema_slow_col, atr_col=cfg.atr_col, rsi_col=cfg.rsi_col)
-    signal = add_regime_features(md.frames[cfg.signal_timeframe], regime.features, app.session, **kw)
-    context = {}
-    if cfg.context_timeframe:
-        context[cfg.context_timeframe] = add_regime_features(md.frames[cfg.context_timeframe], regime.features,
-                                                             app.session, **kw)
-    if regime.fast_timeframe:
-        if regime.fast_timeframe not in md.frames:
-            raise ConfigError(f"regime fast_timeframe {regime.fast_timeframe} is not produced by the pipeline")
-        context[regime.fast_timeframe] = add_shock_features(md.frames[regime.fast_timeframe], regime.features,
-                                                            atr_col=cfg.atr_col)
-    return signal, context
+    cols = dict(ema_fast=cfg.ema_fast_col, ema_slow=cfg.ema_slow_col, atr_col=cfg.atr_col, rsi_col=cfg.rsi_col)
+    return generic(md, app, cfg.signal_timeframe, cfg.context_timeframe, cols, regime)
 
 
 def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,
                  label: str = "", period: Period | None = None, regime=None, explainer=None,
-                 news=None) -> StrategyRun:
+                 news=None, prop_engine=None) -> StrategyRun:
     """Backtest the VWAP Trend Pullback strategy on already-built market data.
 
     With ``period`` only sessions inside it are traded (indicators were computed on the
     whole file and are causal, so earlier data is warm-up only). Each period starts from
     the configured initial capital with a fresh risk manager and account guard.
+    Delegates to the strategy-agnostic :func:`run_spec` (behaviour unchanged; golden-tested).
     """
+    from src.research.registry import get_spec
+
+    return run_spec(md, app, bt, get_spec("vwap_trend_pullback"), cfg, label=label or f"r_{cfg.target.r_multiple:g}",
+                    period=period, regime=regime, explainer=explainer, news=news, prop_engine=prop_engine)
+
+
+def run_spec(md: MarketData, app: AppConfig, bt: BacktestConfig, spec, params, *, label: str,
+             period: Period | None = None, regime=None, explainer=None, news=None, prop_engine=None) -> StrategyRun:
+    """Backtest ANY registered strategy on the same event-driven engine, with the same costs, slippage,
+    NewsGuard, RiskManager, AccountGuard and (optionally) prop firm compliance engine."""
+    from src.research.registry import with_enforcement
+
     if md.contract.spec is None:
         raise ConfigError(f"No contract specification for {md.contract.root}")
-    signal, execution, context = _frames(md, cfg)
-    use_regime = regime is not None and regime.enabled
-    if use_regime:
-        signal, regime_context = _regime_frames(md, app, cfg, regime)
-        context = {**context, **regime_context}
+    prep = spec.prepare(md, app, params, regime)
+    signal, execution, context = prep.signal, prep.execution, prep.context
     if period is not None:
         signal, execution = slice_frame(signal, period), slice_frame(execution, period)
         context = {k: slice_frame(v, period) for k, v in context.items()}
         if signal.empty or execution.empty:
             raise ConfigError(f"No data inside period {period.to_dict()}")
-    strategy = VwapTrendPullbackStrategy(cfg, app.session.timezone)
+    strategy = spec.build(params, app, prep.session)
     gate = None
-    if use_regime:
+    regime_eff = with_enforcement(regime, prep.regime_enforcement)
+    if prep.regime_enforcement is not None:
         from src.ai.market_regime.filters import RegimeGatedStrategy
         from src.ai.market_regime.regime import RegimeEngine
 
-        gate = RegimeGatedStrategy(strategy, RegimeEngine(regime, md.contract.root), regime, explainer)
-    engine = BacktestEngine(bt, md.contract.spec, app.session)
+        gate = RegimeGatedStrategy(strategy, RegimeEngine(regime_eff, md.contract.root), regime_eff, explainer)
+    engine = BacktestEngine(bt, md.contract.spec, prep.session)
     news_guard = news.guard(md.contract.root) if news is not None else None
     if news_guard is not None and news_guard.store.is_synthetic and not md.is_synthetic:
         raise ConfigError("a SYNTHETIC news calendar cannot be used with real market data: its events are invented "
                           "and would be mistaken for real event protection")
-    result = engine.run(gate or strategy, signal, execution, context_bars=context, news_guard=news_guard)
+    result = engine.run(gate or strategy, signal, execution, context_bars=context, news_guard=news_guard,
+                        prop_engine=prop_engine)
     news_out = None
     if news_guard is not None:
         from src.risk.news.backtest import news_report
@@ -120,9 +115,9 @@ def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPu
         regime_out = {"decisions": decisions, "snapshots": gate.snapshots_frame(), "trades": trades,
                       "performance": regime_performance(trades, decisions),
                       "dashboard": gate.dashboard.current, "artifacts": dict(gate.engine.artifacts),
-                      "config": regime.to_dict(), "errors": gate.errors}
-    return StrategyRun(label or f"r_{cfg.target.r_multiple:g}", cfg, result, strategy.diagnostics_frame(),
-                       strategy.signals_frame(), period, regime_out, news_out)
+                      "config": regime_eff.to_dict(), "errors": gate.errors}
+    return StrategyRun(label, params, result, strategy.diagnostics_frame(), strategy.signals_frame(), period,
+                       regime_out, news_out)
 
 
 def run_from_csv(csv_path: str | Path, app: AppConfig, bt: BacktestConfig, cfg: VwapPullbackConfig,

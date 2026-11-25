@@ -47,6 +47,9 @@ def parse_args(argv=None):
     p.add_argument("--settings", type=Path, default=DEFAULT_CONFIG_PATH)
     p.add_argument("--backtest-config", type=Path, default=DEFAULT_BACKTEST_CONFIG_PATH)
     p.add_argument("--strategy-config", type=Path, default=DEFAULT_STRATEGY_CONFIG_PATH)
+    p.add_argument("--strategy", default=None, metavar="ID@VERSION",
+                   help="a registered research version (run_research.py); needs human promotion: SHADOW_APPROVED "
+                        "for replay / shadow, PAPER_APPROVED for --mode paper")
     p.add_argument("--regime-config", type=Path, default=DEFAULT_REGIME_CONFIG_PATH)
     p.add_argument("--news-config", type=Path, default=DEFAULT_NEWS_CONFIG_PATH)
     p.add_argument("--mode", choices=MODES, default=None)
@@ -150,6 +153,16 @@ def main(argv=None) -> int:
             feed = BarReplayFeed(live)
         if a.realtime_speed and a.feed != "bridge":
             feed = SimulatedRealtimeFeed(feed, lambda: pd.Timestamp.now(tz="UTC"), speed=a.realtime_speed)
+        binding = None
+        if a.strategy:
+            from src.research.paper_binding import binding_for
+
+            sid, _, ver = a.strategy.partition("@")
+            if not ver:
+                raise ConfigError("--strategy needs ID@VERSION (an exact registered version)")
+            use = "paper" if pcfg.mode == "paper" and a.feed != "bridge" else "shadow"
+            binding = binding_for(sid, ver, app, rc, use=use)
+            rc = binding.regime
         guards, readiness = news_guards(pcfg.mode, pcfg.instruments, ncfg, a.news_calendar)
         from src.risk.prop_firms.runtime import build_engine
 
@@ -177,7 +190,7 @@ def main(argv=None) -> int:
                     "provider": feed.name}
         session = PaperSession(pcfg, app, bt, sc, rc, guards, feed, journal, warmup=warm,
                                clock=(lambda: pd.Timestamp.now(tz="UTC")), news_readiness=readiness, session_meta=meta,
-                               prop_engine=prop)
+                               prop_engine=prop, binding=binding)
     except RecoveryError as exc:
         print(f"Error: paper state cannot be recovered: {exc}. Nothing was traded; fix or archive the state.",
               file=sys.stderr)

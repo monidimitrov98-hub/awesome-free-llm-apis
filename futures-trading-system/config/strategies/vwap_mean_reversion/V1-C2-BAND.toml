@@ -1,0 +1,59 @@
+# VWAP Mean Reversion -- V1-C2-BAND -- V1 RESEARCH CANDIDATE (immutable once registered in VERSIONS.toml).
+# The RSI 14 / 30 / 70 values, the band multiplier and every other number below are EXPLICIT RESEARCH DEFAULTS,
+# not the user's confirmed historical settings. Confirmation C2 and stop "band" are EXPERIMENTAL variants:
+# the user's original confirmation and stop rules are not known and are not claimed here.
+
+[version]
+strategy = "vwap_mean_reversion"
+version = "V1-C2-BAND"
+label = "V1 close back inside the band, band stop"
+created = "2026-11-25"
+notes = "Experimental variant C2/band; research only. Not approved for shadow, paper or live trading."
+
+[scope]
+instruments = ["MES", "MNQ"]
+session = "rth"                  # explicit: Regular Trading Hours 09:30-16:00 New York (config/settings.toml)
+signal_timeframe = "5min"
+execution_timeframe = "1min"
+enable_long = true
+enable_short = true
+
+[indicators]
+vwap_price = "typical"           # (H + L + C) / 3, like the existing session VWAP
+band_k = 2.0                     # setup: close beyond VWAP -/+ 2.0 sigma (volume-weighted)
+rsi_period = 14
+rsi_oversold = 30.0
+rsi_overbought = 70.0
+atr_period = 14
+indicator_scope = "session_bars" # RSI / ATR on RTH bars only (no ETH bars mixed in)
+min_sigma_ticks = 2.0
+min_session_bars = 6             # first 30 minutes: no setup (sigma not yet meaningful)
+
+[confirmation]
+method = "C2"
+max_bars_after_setup = 3
+
+[stop]
+method = "band"
+swing_lookback_bars = 5
+atr_multiple = 1.5
+band_k = 3.0
+buffer_ticks = 2
+max_risk_points = 0.0
+
+[target]
+method = "vwap"
+fraction = 1.0
+min_reward_risk = 0.0
+
+[execution]
+order_type = "market"
+quantity = 0                     # engine sizing (config/backtest.toml [sizing])
+entry_cutoff_minutes = 30.0
+max_entries_per_session = 3
+cooldown_bars_after_exit = 2
+max_holding_bars = 0
+allow_pyramiding = false
+
+[regime]
+mode = "observe"                 # regime labels for evaluation only; never blocks V1

@@ -84,6 +84,17 @@ both stops on the same side, so whichever is closer to the market triggers first
 without ambiguity. With ``"block_entries"`` the position is kept but no new entry
 is allowed that day. Exits are never blocked.
 
+Prop firm compliance (Sprint 11)
+--------------------------------
+An optional :class:`~src.risk.prop_firms.engine.ComplianceEngine` (``run(prop_engine=...)``) -- the SAME
+engine the paper runtime uses -- is asked for every NEW entry at the signal (after the AccountGuard) and at the
+fill (after the AccountGuard, with the actual trade risk). Every veto is independent, so the order only decides
+which reason is recorded first; no layer can override another's block. ``observe`` runs at each execution bar's
+open (end-of-day trailing, flat-by time) and at the bar's most adverse price (loss-limit breach); a protective
+level (official floor + uncertainty + flatten reserve) competes with the bracket stop like the AccountGuard
+level, and flatten requests close the position at the next bar's open. An unverified or not human-activated
+profile blocks every entry (fail closed). Exits are never gated.
+
 Higher-timeframe context
 ------------------------
 Optional ``context_bars`` (e.g. 15m) are never events themselves. At every signal
@@ -142,6 +153,7 @@ class BacktestResult:
     adjustments: pd.DataFrame = field(default_factory=pd.DataFrame)
     entry_checks: pd.DataFrame = field(default_factory=pd.DataFrame)
     account: dict[str, Any] = field(default_factory=dict)
+    compliance: dict[str, Any] | None = None   # prop firm decisions, records and coverage (None = no profile)
 
 
 def _validate_bars(df: pd.DataFrame, name: str) -> None:
@@ -215,6 +227,7 @@ class BacktestEngine:
         risk_manager: RiskManager | None = None,
         context_bars: Mapping[str, pd.DataFrame] | None = None,
         news_guard: Any = None,
+        prop_engine: Any = None,
     ) -> BacktestResult:
         """Run the backtest. Inputs are not modified.
 
@@ -226,7 +239,8 @@ class BacktestEngine:
                 and at the fill, before the risk manager and the AccountGuard. Never asked
                 for exits or protective actions.
         """
-        sim = _Simulation(self, strategy, signal_bars, execution_bars, risk_manager, context_bars, news_guard)
+        sim = _Simulation(self, strategy, signal_bars, execution_bars, risk_manager, context_bars, news_guard,
+                          prop_engine)
         return sim.run()
 
 
@@ -242,6 +256,7 @@ class _Simulation:
         risk_manager: RiskManager | None,
         context_bars: Mapping[str, pd.DataFrame] | None = None,
         news_guard: Any = None,
+        prop_engine: Any = None,
     ) -> None:
         self.cfg = engine.config
         self.spec = engine.contract
@@ -296,6 +311,10 @@ class _Simulation:
         self._last_equity = self.cfg.initial_capital
         self._now: pd.Timestamp | None = None  # time of the event being processed
         self.news = news_guard
+        self.prop = prop_engine                 # Sprint 11: prop firm compliance engine (None = no profile)
+        self.prop_decisions: list[dict[str, Any]] = []
+        self.prop_records: list[dict[str, Any]] = []
+        self._prop_flatten: str | None = None
 
     # ------------------------------------------------------------------ helpers
     def _session_end(self, session_date: pd.Timestamp) -> pd.Timestamp:
@@ -340,6 +359,36 @@ class _Simulation:
 
     def _equity_at(self, price: float) -> float:
         return self.cfg.initial_capital + self.realized_net + self.position.unrealized_pnl(price)
+
+    def _prop_snap(self, equity: float | None = None, exclude: Order | None = None):
+        """Backend account values for the compliance engine (same semantics as the paper runtime)."""
+        from src.risk.prop_firms.engine import AccountSnapshot
+
+        pending = sum(o.quantity for o in self._pending((OrderRole.ENTRY,)) if o is not exclude)
+        eq = self._last_equity if equity is None else equity
+        return AccountSnapshot(balance=self.cfg.initial_capital + self.realized_net, equity=eq,
+                               positions={self.spec.root: self.position.quantity},
+                               pending_entries={self.spec.root: pending}, data_fresh=True,
+                               initial_balance=self.cfg.initial_capital, known_equity=eq)
+
+    def _prop_observe(self, t: pd.Timestamp, equity: float) -> None:
+        for act in self.prop.observe(t, self._prop_snap(equity)):
+            if act["action"] == "journal":
+                self.prop_records.append({"time": t, "kind": act["kind"], **act["payload"]})
+            elif act["action"] == "flatten" and self.open_trade is not None and self._prop_flatten is None:
+                self._prop_flatten = act["reason"]
+
+    def _prop_check(self, now: pd.Timestamp, quantity: int, risk: float | None, scope: str,
+                    exclude: Order | None = None):
+        news = ({"available": True, "allowed": True, "reason": "NewsGuard passed"} if self.news is not None
+                else {"available": False})
+        d = self.prop.evaluate_entry(now, self.spec.root, quantity, self._prop_snap(exclude=exclude), trade_risk=risk,
+                                     news=news, scope=scope)
+        self.prop_decisions.append({"time": now, "scope": scope, "quantity": quantity, "allowed": d.allowed,
+                                    "reason": d.reason, "reasons": ";".join(d.reasons),
+                                    "official_buffer": d.official_buffer, "estimated_buffer": d.estimated_buffer,
+                                    "allowed_quantity": d.allowed_quantity, "state": d.account_state_sha256[:16]})
+        return d
 
     def _snapshot(self) -> PositionSnapshot:
         if self.position.is_flat:
@@ -485,14 +534,30 @@ class _Simulation:
         blocked = self.guard.entry_block_reason(self._last_equity, session_date)
         if blocked:
             return reject(blocked, f"equity {self._last_equity:.2f}, floor {self.guard.floor:.2f}")
+        quantity = size.quantity
+        if self.prop is not None:
+            from src.backtest.sizing import entry_slippage_ticks
+
+            risk = None
+            if stop is not None:
+                per = risk_per_contract(self.spec, entry_price=ref, stop_loss=stop, cost=self.cost,
+                                        slippage=self.cfg.slippage, include_costs=True,
+                                        entry_slippage_ticks=entry_slippage_ticks(req.order_type, self.cfg.slippage))
+                risk = per * quantity if math.isfinite(per) else None
+            pd_ = self._prop_check(now, quantity, risk, "pre_trade")
+            if not pd_.allowed:
+                self._reject(now, "prop_firm", pd_.reason, ";".join(pd_.reasons), client_id=req.client_id)
+                return None
+            if pd_.allowed_quantity is not None and pd_.allowed_quantity < quantity:
+                quantity = pd_.allowed_quantity  # explicit profile policy: reduce only, never increase
         expire = now + self.cfg.execution.max_fill_delay if req.order_type is OrderType.MARKET else None
         order = self._new_order(role=OrderRole.ENTRY, order_type=req.order_type, is_buy=is_buy,
-                                quantity=size.quantity, price=price, created_at=now, active_from=now,
+                                quantity=quantity, price=price, created_at=now, active_from=now,
                                 signal_time=bar_time, session_date=session_date, expire_at=expire,
                                 tag=req.tag, stop_loss=stop, take_profit=target,
                                 risk_budget=(self.cfg.sizing.risk_per_trade
                                              if self.cfg.sizing.method == "risk" and req.quantity is None else None),
-                                requested_quantity=size.quantity, client_id=req.client_id, reference_price=ref,
+                                requested_quantity=quantity, client_id=req.client_id, reference_price=ref,
                                 max_stop_distance=req.max_stop_distance, min_stop_distance=req.min_stop_distance,
                                 min_reward_risk=req.min_reward_risk)
         self._emit(req.client_id, order.id, "accepted", now, "signal")
@@ -524,6 +589,8 @@ class _Simulation:
                 self.guard.on_session_end(self._last_equity, session_date)
             self._guard_session = session_date
         guard_locked = self.guard.enabled and (self.guard.breached or self.guard.is_locked(session_date))
+        if self.prop is not None:  # end-of-day trailing and flat-by time, at this bar's open
+            self._prop_observe(t, self._equity_at(bar.open))
 
         # 1. Session / emergency housekeeping (uses only configuration and this bar's open).
         if self.open_trade is not None:
@@ -532,6 +599,8 @@ class _Simulation:
                 reason = "emergency_stop"
             elif guard_locked:
                 reason = "account_protection"
+            elif self._prop_flatten is not None:
+                reason = self._prop_flatten
             elif session_date is None:
                 reason = "outside_session"
             elif session_date != self.open_trade.session_date:
@@ -550,6 +619,7 @@ class _Simulation:
                         reason = "news_event_flatten"
             if reason:
                 self._force_exit(t, bar, complete, reason)
+        self._prop_flatten = None
         for o in self._pending((OrderRole.ENTRY,)):
             if self.risk.emergency_active:
                 self._cancel(o, "emergency_stop")
@@ -607,6 +677,13 @@ class _Simulation:
                     self._reject_entry(check, blocked, f"account risk {account_risk}, buffer "
                                        f"{self.guard.remaining_buffer(self._last_equity):.2f}", o, t)
                     continue
+                if self.prop is not None:
+                    risk = check["actual_risk_dollars"]
+                    pd_ = self._prop_check(t, o.quantity, risk if isinstance(risk, float) and math.isfinite(risk)
+                                           else None, "fill", exclude=o)
+                    if not pd_.allowed:
+                        self._reject_entry(check, pd_.reason, ";".join(pd_.reasons), o, t)
+                        continue
                 self._log_check(check, o, "accepted", "")
                 self._open(o, sim, t, complete, session_date, check)
                 break
@@ -643,6 +720,11 @@ class _Simulation:
             if state:
                 self.warnings.append(f"{t}: account protection '{state}' (floor {self.guard.floor:.2f}); "
                                      "entries locked" + ("; position closed at next bar" if self.open_trade else ""))
+
+        # 3d. Prop firm loss limit at this bar's most adverse equity (breach detection; flatten next bar).
+        if self.prop is not None:
+            worst = (bar.low if self.position.quantity > 0 else bar.high) if self.open_trade is not None else bar.close
+            self._prop_observe(pd.Timestamp(ex["available_at"][j]), self._equity_at(worst))
 
         # 4. Mark to market at this bar's close, recorded when the close is known.
         self._last_mark = bar.close
@@ -830,6 +912,9 @@ class _Simulation:
         account_level = self._account_flatten_price()
         if account_level is not None:
             levels.append((account_level, "account_protection"))
+        prop_level = self._prop_flatten_price()
+        if prop_level is not None:
+            levels.append((prop_level, "prop_firm_max_loss_protection"))
         # A floor raised by THIS bar's favourable extreme cannot be acted on at the open
         # (the open came before that extreme): at-open fills are only legal against the
         # level implied by the floor in force before the bar.
@@ -884,6 +969,24 @@ class _Simulation:
         if not self.guard.enabled or self.position.is_flat:
             return None
         target = (self.guard.floor if floor is None else floor) + self.cfg.account_rules.flatten_buffer
+        q = self.position.quantity
+        exit_costs = abs(q) * (self.cost.commission_per_contract_per_side
+                               + self.cfg.slippage.stop_ticks * self.spec.tick_value)
+        raw = self.position.avg_price + (target + exit_costs - self.cfg.initial_capital - self.realized_net) / (
+            q * self.spec.point_value)
+        return round_to_tick(raw, self.spec.tick_size, "up" if q > 0 else "down")
+
+    def _prop_flatten_price(self) -> float | None:
+        """Stop-trigger price at which, after the estimated exit costs, the prop engine's ESTIMATED buffer equals
+        its flatten reserve (official floor + uncertainty reserve + flatten reserve). None without a floor."""
+        if self.prop is None or self.position.is_flat:
+            return None
+        floor = self.prop.official_floor()
+        ml = self.prop.profile.rule("max_loss")
+        if floor is None or ml is None or not ml.params.get("includes_unrealized", True):
+            return None
+        it = self.prop.profile.internal
+        target = floor + it.uncertainty_reserve + it.flatten_reserve
         q = self.position.quantity
         exit_costs = abs(q) * (self.cost.commission_per_contract_per_side
                                + self.cfg.slippage.stop_ticks * self.spec.tick_value)
@@ -1012,5 +1115,15 @@ class _Simulation:
         metrics, daily = compute_metrics(trades, equity, self.cfg.initial_capital)
         account = self.guard.summary()
         metrics["account_protection"] = {k: v for k, v in account.items() if k != "events"}
+        compliance = None
+        if self.prop is not None:
+            from src.risk.prop_firms.coverage import coverage_report
+
+            compliance = {"profile": self.prop.profile.key, "profile_sha256": self.prop.profile.sha256,
+                          "ruleset_sha256": self.prop.profile.ruleset_sha256, "operational": dict(self.prop.operational),
+                          "decisions": pd.DataFrame(self.prop_decisions), "records": list(self.prop_records),
+                          "state": self.prop.summary(self._prop_snap()),
+                          "coverage": coverage_report(self.prop, environment="backtest",
+                                                      news_guard=self.news is not None)}
         return BacktestResult(trades, orders, fills, equity, rejections, daily, metrics, self.warnings, adjustments,
-                              pd.DataFrame(self.entry_checks, columns=ENTRY_CHECK_COLUMNS), account)
+                              pd.DataFrame(self.entry_checks, columns=ENTRY_CHECK_COLUMNS), account, compliance)

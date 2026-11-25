@@ -14,6 +14,7 @@ import { Journal } from "./pages/Journal";
 import { Performance } from "./pages/Performance";
 import { ShadowAnalytics } from "./pages/ShadowAnalytics";
 import { PropFirmCenter } from "./pages/PropFirm";
+import { Research } from "./pages/Research";
 import { MarketData } from "./pages/MarketData";
 import { SystemHealth } from "./pages/System";
 import { Settings } from "./pages/Settings";
@@ -29,6 +30,7 @@ export const PAGES: { id: string; label: string; ico: string; render(): ReactNod
   { id: "performance", label: "Performance", ico: "PF", render: () => <Performance /> },
   { id: "shadow", label: "Shadow Analytics", ico: "SA", render: () => <ShadowAnalytics /> },
   { id: "propfirm", label: "Prop Firm Center", ico: "PC", render: () => <PropFirmCenter /> },
+  { id: "research", label: "Quant Research", ico: "QR", render: () => <Research /> },
   { id: "market", label: "Market Data", ico: "MD", render: () => <MarketData /> },
   { id: "system", label: "System Health", ico: "SH", render: () => <SystemHealth /> },
   { id: "settings", label: "Settings", ico: "ST", render: () => <Settings /> },

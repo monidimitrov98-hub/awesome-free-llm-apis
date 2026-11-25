@@ -56,6 +56,8 @@ class ModeOptions:
     prop_initial_balance_from_profile: bool = False   # explicit: size the simulated account like the profile
     prop_registry: Any = None                          # tests only (alternative profile directory)
     prop_activations: Any = None                       # tests only (alternative activation store)
+    research_root: Any = None                          # tests only (alternative research output folder)
+    governance_path: Any = None                        # tests only (alternative promotion store)
 
 
 @dataclass

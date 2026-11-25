@@ -63,6 +63,11 @@ def paper_report(session) -> dict[str, Any]:
                    "fill_rate": (len(filled) / len(entries)) if entries else None,
                    "by_state": dict(Counter(o.state.value for o in session.broker.orders.values()))},
         "account": {k: v for k, v in session.account.summary().items()},
+        # Sprint 11: which session type and which registry version produced this report (promotion evidence)
+        "session": {"session_type": (getattr(session, "session_meta", None) or {}).get("session_type"),
+                    "strategy": (session.binding.identity() if getattr(session, "binding", None) is not None
+                                 else {"id": "vwap_trend_pullback", "version": None, "sha256": None,
+                                       "note": "default configuration path (config/strategy_vwap_pullback.toml)"})},
     }
     execs = [e["payload"] for e in session.journal.entries("execution")]
     synth = sum(1 for e in execs if e.get("synthetic_data"))

@@ -1,0 +1,108 @@
+# VWAP Trend Pullback - strategy configuration (Sprint 3).
+#
+# EVERY VALUE BELOW IS AN UNVALIDATED RESEARCH HYPOTHESIS: a reasonable starting
+# point for testing, NOT an optimized or proven setting. Nothing here is evidence
+# of an edge. Change values deliberately, one at a time, and judge them out of sample.
+#
+# Distances are expressed in multiples of ATR (instrument-independent, so the same
+# file works for MES and MNQ) unless the name says ticks.
+#
+# Every filter is independently switchable: booleans turn checks on/off and a value of
+# 0 disables a numeric threshold (noted per line). Data integrity is NOT a filter: bars
+# used for structure, pivots, stops and the pullback window must always be complete and
+# contiguous in time.
+
+[strategy]
+name = "vwap_trend_pullback"
+signal_timeframe = "5min"      # bars the strategy decides on
+context_timeframe = "15min"    # higher-timeframe trend filter; "" disables it
+execution_timeframe = "1min"   # bars the engine fills orders on
+enable_long = true
+enable_short = true
+
+# Indicator periods. They select the columns produced by the Sprint 1 pipeline
+# (e.g. ema_9, rsi_14) and must match config/settings.toml [indicators].
+[indicators]
+ema_fast = 9
+ema_slow = 21
+rsi_period = 14
+atr_period = 14
+
+# A. Trend on the signal timeframe.
+[trend]
+require_price_vs_vwap = true     # long: close > VWAP; short: close < VWAP
+require_ema_alignment = true     # long: EMA fast > EMA slow; short: below (direction only)
+require_structure = true         # long: HH + HL; short: LH + LL (confirmed pivots only)
+min_trend_strength_atr = 0.10    # |EMA fast - EMA slow| / ATR, direction-free; 0 disables
+
+# Higher-timeframe context: the last COMPLETED context candle (see README).
+[context]
+require_price_vs_vwap = true
+require_ema_alignment = true
+
+# Swing pivots for market structure and swing stops.
+[structure]
+swing_left_bars = 2              # bars before the pivot that must be lower (higher for lows)
+swing_right_bars = 2             # confirmation bars; the pivot is usable only after they close
+lookback_bars = 60               # signal bars searched for pivots (60 x 5m = 5 hours)
+
+# B. Pullback toward EMA fast / EMA slow / VWAP.
+[pullback]
+levels = ["ema_fast", "ema_slow", "vwap"]
+lookback_bars = 3                # the touch must happen on the current or the 2 previous bars
+zone_atr = 0.25                  # long: a bar low within 0.25 ATR above a level counts as a touch
+max_penetration_atr = 0.50       # ... or up to 0.5 ATR below it; deeper is "too deep" for that level
+require_structure_intact = true  # the pullback must not reach the last confirmed swing low (long) / high (short)
+
+# Avoid chasing extended moves (measured at the confirmation close).
+[extension]
+max_vwap_distance_atr = 1.5      # 0 disables
+max_ema_distance_atr = 1.0       # 0 disables
+
+# C. Confirmation candle (the current, completed signal bar).
+[confirmation]
+require_directional_close = true         # long: close > open; short: close < open
+require_close_beyond_prev_extreme = false # long: close > previous high; short: close < previous low
+require_close_beyond_ema_fast = true     # long: close back above EMA fast; short: below
+
+# D. RSI as momentum recovery in the trend direction (not 70/30 reversal signals).
+[rsi]
+enabled = true
+long_pullback_max = 50.0   # during the pullback window RSI dipped to <= 50 ...
+long_recovery_min = 50.0   # ... and the confirmation close has RSI >= 50 again
+long_entry_max = 75.0      # but not already stretched
+short_pullback_min = 50.0
+short_recovery_max = 50.0
+short_entry_min = 25.0
+require_turn = true        # long: RSI rising on the confirmation bar; short: falling
+
+# E. Relative volume (existing Sprint 1 RVOL column). NaN (not enough history) never passes.
+[rvol]
+enabled = true
+min_rvol = 1.0
+
+# F. Stop-loss. Reference price = confirmation close (the engine re-checks the bracket
+# and the risk budget at the actual fill price).
+[stop]
+method = "swing"           # "swing": beyond the last confirmed swing low/high; "atr": close -/+ multiplier x ATR
+buffer_ticks = 2           # swing method: extra ticks beyond the pivot
+atr_multiplier = 1.5       # atr method
+min_distance_atr = 0.5     # reject stops tighter than 0.5 ATR (noise)
+max_distance_atr = 3.0     # reject stops wider than 3 ATR (also re-checked at the ACTUAL fill); 0 disables
+min_distance_ticks = 4
+max_distance_ticks = 0     # 0 disables the absolute tick cap
+
+# G. Take-profit as a multiple of the initial stop distance (R).
+[target]
+r_multiple = 2.0           # run several values with run_backtest.py --r-multiples; none is "selected"
+# The engine recomputes reward/risk from the ACTUAL fill price and rejects the entry when it
+# is below this fraction of the planned R (0.9 x 2.0 = 1.8R). Stop and target are never moved.
+# 0 disables (not recommended).
+min_actual_r_fraction = 0.9
+
+# H. Additional filters.
+[filters]
+session_windows = ["09:45-15:30"]  # New York time of the decision; [] disables (engine risk windows still apply)
+max_entries_per_session = 3        # filled entries per trade date; 0 disables
+cooldown_minutes = 15              # after an exit fill; 0 disables
+one_entry_per_pullback = true      # a new entry needs a new swing high (long) / swing low (short)

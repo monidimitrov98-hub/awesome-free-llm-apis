@@ -337,6 +337,15 @@ def create_app(service: TerminalService, *, token: str, port: int, dev: bool = F
         return Response(body, media_type="text/csv" if fmt == "csv" else "application/json",
                         headers={"Content-Disposition": f'attachment; filename="prop_firm_{kind}.{fmt}"'})
 
+    # ------------------------------------------------------------------ Quant Research (Sprint 11, read-only)
+    @app.get("/api/research/overview", dependencies=A + [Depends(heavy_limit)])
+    def research_overview() -> Any:
+        return prop_call(service.research_overview)
+
+    @app.get("/api/research/run", dependencies=A + [Depends(heavy_limit)])
+    def research_run(attempt: str = Query(..., pattern=r"^[0-9a-f]{16}$")) -> Any:
+        return prop_call(lambda: service.research_run(attempt))
+
     @app.get("/api/performance", dependencies=A)
     def performance(source: Literal["session", "backtest"] = "session") -> Any:
         return found(service.performance(source))

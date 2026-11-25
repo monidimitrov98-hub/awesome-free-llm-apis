@@ -70,6 +70,8 @@ def main() -> None:
     elif scenario == "shadow-analytics":  # a fast replay run with simulated trades, analysed in Shadow Analytics
         opts = ModeOptions(mode="replay", speed=speed, replay_start="2025-03-12",
                            strategy_factory=lambda root: EveryNthBarTestStrategy(), tests_disable_regime_gate=True)
+    elif scenario == "research":  # Sprint 11: one research run (temporary ledger / registry / promotion store)
+        opts = ModeOptions(mode="mock", mock_rate_hz=10, **_research_fixture())
     else:
         opts = ModeOptions(mode="mock", mock_rate_hz=10)
     svc = TerminalService(opts)
@@ -93,6 +95,31 @@ def main() -> None:
         threading.Thread(target=kill, daemon=True).start()
     app = create_app(svc, token=token, port=port)
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning", access_log=False)
+
+
+def _research_fixture() -> dict:
+    """A research run of V1-C2-SWING on the synthetic MES sample with the UNVERIFIED FundedNext profile (every
+    entry blocked, coverage INCOMPLETE). Everything lives in a temporary folder; the project is never touched."""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    from src.backtest.config import DEFAULT_BACKTEST_CONFIG_PATH, load_backtest_config
+    from src.backtest.validation import ValidationLedger
+    from src.config import DEFAULT_CONFIG_PATH, load_config
+    from src.research.experiments import ExperimentRegistry
+    from src.research.runs import ResearchEnv, run_research
+
+    d = Path(tempfile.mkdtemp(prefix="fts-e2e-research-"))
+    os.environ["FTS_LEDGER_PATH"] = str(d / "ledger.jsonl")
+    os.environ["FTS_EXPERIMENTS_PATH"] = str(d / "experiments.jsonl")
+    ValidationLedger(d / "ledger.jsonl").initialise("e2e")
+    env = ResearchEnv(load_config(), load_backtest_config(), d / "out", DEFAULT_CONFIG_PATH, DEFAULT_BACKTEST_CONFIG_PATH,
+                      registry=ExperimentRegistry())
+    root = Path(__file__).resolve().parents[2]
+    run_research(env, "vwap_mean_reversion", "V1-C2-SWING", root / "data/samples/SYNTHETIC_MES_1m.csv",
+                 prop_profile="fundednext_futures_flex_50k_challenge@2026-11-25.1")
+    return {"research_root": d / "out", "governance_path": d / "promotions.jsonl"}
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@ futures-trading-system/
 ├── config/strategy_vwap_pullback.toml  # strategy parameters (unvalidated research hypotheses)
 ├── config/account_profiles/    # generic account-protection (drawdown) rule profiles
 ├── run_backtest.py             # run the strategy on a CSV and write all result files
+├── run_research.py             # Sprint 11 research engine CLI (research, OOS reveal, Monte Carlo, promotion)
+├── config/strategies/          # immutable, registered strategy parameter versions (Sprint 11)
 ├── data/samples/               # SYNTHETIC sample CSVs (clearly marked) + README
 ├── run_pipeline.py             # command-line entry point
 ├── scripts/generate_synthetic_data.py
@@ -1346,6 +1348,49 @@ See `docs/sprint10_compliance_validation.md` and `docs/sprint10_quant_integratio
 python run_shadow_analytics.py session-report --session-type SHADOW --out output/analytics
 python run_shadow_analytics.py trace --run-id <16 hex> --seq <journal seq>
 python run_prop_firm.py diff fundednext_futures_flex_50k_challenge 2026-11-22.1 2026-11-25.1
+```
+
+## Sprint 11: Quant research engine and VWAP Mean Reversion research candidate
+
+- **Strategy registry:** stable strategy ids, and immutable parameter versions identified by
+  SHA-256 (`config/strategies/<id>/<version>.toml` + `VERSIONS.toml`). Every strategy runs on the
+  same BacktestEngine. A golden regression test proves that VWAP Trend Pullback's results are
+  byte-identical to Sprint 10.
+- **VWAP bands:** session VWAP with volume-weighted sigma bands and a z-score. They are causal,
+  the session is explicit (RTH and ETH are never mixed), and they are tested numerically.
+- **`vwap_mean_reversion` V1 RESEARCH candidate:**
+  - RSI 14 with 30/70 (research defaults)
+  - confirmation methods C1-C4 and swing / ATR / band stops, all EXPERIMENTAL (the user's original
+    rules are not known)
+  - target: reversion to VWAP
+- **Prop compliance in backtests:** the same ComplianceEngine as paper, with parity tests. Every
+  run reports its rule coverage, and the UNVERIFIED FundedNext profiles still block every entry.
+- **Research discipline:**
+  - every attempt is recorded, failures included, and counted in the Holm / BH correction
+  - sweeps stay inside declared bounds
+  - walk-forward with a purge gap, and purged k-fold with an embargo
+  - cost sensitivity by full re-runs
+  - a one-time, ledger-recorded OOS reveal
+  - Monte Carlo (trade / day-block / moving-block / shuffle) with fixed seeds
+- **Human promotion gates:** RESEARCH -> BACKTESTED -> OOS_VALIDATED -> SHADOW_APPROVED ->
+  PAPER_APPROVED (plus REJECTED / SUSPENDED). There is no live state and no automatic promotion.
+  The read-only **Quant Research** terminal page shows all of it.
+
+See `docs/sprint11_quant_research.md`.
+
+```
+python run_backtest.py --init-ledger                       (once; research never runs without the ledger)
+python run_research.py versions --strategy vwap_mean_reversion
+python run_research.py run --strategy vwap_mean_reversion --version V1-C2-SWING --csv data/MES.csv \
+    --purpose train --start 2024-01-02 --end 2024-06-28 --cost-sensitivity
+python run_research.py sweep ... --grid indicators.band_k=1.5,2,2.5
+python run_research.py walk-forward ... --train 60 --test 20 --purge 1
+python run_research.py reveal-oos --strategy vwap_mean_reversion --version V1-C2-SWING --csv data/MES.csv \
+    --start 2025-01-02 --end 2025-06-30
+python run_research.py monte-carlo --run output/research/<...>/<run folder> --paths 5000 --ruin-loss 2000
+python run_research.py promote --strategy ... --version ... --to BACKTESTED --approved-by "Your Name" \
+    --confirm <sha16> --statement "..." --run <run folder>
+python run_paper.py --mode replay --bars MES=... --strategy vwap_mean_reversion@V1-C2-SWING   (needs SHADOW_APPROVED)
 ```
 
 ## Known limitations
