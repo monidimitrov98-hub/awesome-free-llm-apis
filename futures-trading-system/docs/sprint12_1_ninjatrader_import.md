@@ -150,6 +150,8 @@ The datasets live in `data/datasets/` (git-ignored, local only).
 * Tests: `tests/test_sprint12_1_ninjatrader_import.py`, 24 tests.
   - 20 are unit tests on fixtures.
   - 4 are real-data integration tests. They check the exact SHA-256 first and SKIP when the inbox is absent.
+    Since Sprint 13 P0 they find the validated bytes by content: the inbox, then the dataset store's raw
+    copies. See `docs/sprint13_p0_rollover_conflicts.md` §6.
 
 The existing Sprint 12 checks, status gates and thresholds are unchanged.
 

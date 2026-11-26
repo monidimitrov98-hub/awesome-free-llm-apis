@@ -4,15 +4,24 @@ Two kinds of test, kept apart on purpose:
 
 * UNIT tests use small controlled fixtures (SYNTHETIC or hand-written lines). They exercise the code and say
   nothing about markets.
-* REAL-DATA integration tests (``test_real_*``) read the actual NinjaTrader exports from the git-ignored
-  inbox (``FTS_NT_INBOX`` or ``<repo>/../market-data-inbox``). They check the SHA-256 of each file first and
-  are SKIPPED when the files are absent (e.g. in a cloud checkout), never silently replaced by fixtures.
+* REAL-DATA integration tests (``test_real_*``) run on the actual 6-day NinjaTrader exports validated in
+  Sprint 12.1, identified by CONTENT (SHA-256 and size), never by path alone. The inbox is mutable (newer
+  exports reuse the same file names), so the bytes are looked up, in order, in:
+
+  1. ``FTS_NT_INBOX`` when set: an explicit request, so a file there with other content FAILS the test;
+  2. the default inbox ``<repo>/../market-data-inbox``;
+  3. the immutable raw byte copies kept by the local dataset store (``data/datasets/*/v*/raw/<sha16>_*``).
+
+  The first candidate whose SHA-256 and size match is copied under its original file name (the adapter reads
+  the contract from it) and checked again before use. When no candidate matches (e.g. a cloud checkout) the
+  tests are SKIPPED with the reason, never silently run on other bytes or replaced by fixtures.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -30,7 +39,9 @@ from tests.histdata_fixtures import CAL, bars, write_nt
 ROOT = Path(__file__).resolve().parents[1]
 APP = load_config()
 PROVENANCE = ROOT / "config" / "datasets" / "ninjatrader_2026-11.provenance.json"
-INBOX = Path(os.environ.get("FTS_NT_INBOX") or ROOT.parent / "market-data-inbox")
+EXPLICIT_INBOX = Path(os.environ["FTS_NT_INBOX"]) if os.environ.get("FTS_NT_INBOX") else None
+DEFAULT_INBOX = ROOT.parent / "market-data-inbox"
+STORE_ROOT = Path(os.environ.get("FTS_DATASETS_ROOT") or ROOT / "data" / "datasets")
 REAL = {
     "MES": ("MES 12-26.Last.txt", "2a9db3ca7b7bb443147d09e03fccfd7017263a34cbcb5459c0d7d47a4c121897", 408741),
     "MNQ": ("MNQ 12-26.Last.txt", "d744b0fdd0f5a47ad126592aa79198badbd4cfeffe7ccd2e885645bffd97b5e2", 444216),
@@ -316,20 +327,72 @@ def test_cli_ingest_with_provenance(tmp_path, capsys):
 
 
 # ============================================================================ REAL DATA (integration)
-def _real(root):
-    name, sha, size = REAL[root]
-    p = INBOX / name
-    if not p.is_file():
-        pytest.skip(f"real NinjaTrader export not present: {p}")
+def find_original_export(name: str, sha: str, size: int, *, explicit: Path | None,
+                         candidates: list[Path]) -> tuple[Path | None, list[str]]:
+    """Content-addressed lookup of one validated export. Returns (matching file or None, what was checked).
+    An explicit directory is strict: its file must match, or the lookup fails (AssertionError)."""
     from src.backtest.manifest import file_sha256
 
-    assert p.stat().st_size == size and file_sha256(p) == sha, f"{name} changed since Sprint 12.1 was validated"
-    return p
+    if explicit is not None:
+        p = explicit / name
+        if not p.is_file():
+            return None, [f"{p}: absent (FTS_NT_INBOX)"]
+        assert p.stat().st_size == size and file_sha256(p) == sha, \
+            f"{p} (FTS_NT_INBOX) is not the export validated in Sprint 12.1 (SHA-256 / size differ)"
+        return p, [f"{p}: matches"]
+    seen = []
+    for p in candidates:
+        if not p.is_file():
+            seen.append(f"{p}: absent")
+        elif p.stat().st_size == size and file_sha256(p) == sha:
+            return p, seen + [f"{p}: matches"]
+        else:
+            seen.append(f"{p}: present, different content ({p.stat().st_size} bytes)")
+    return None, seen
+
+
+def _real(root, tmp_path):
+    """(original file, verified working copy named as exported) of the validated 6-day export of ``root``."""
+    from src.backtest.manifest import file_sha256
+
+    name, sha, size = REAL[root]
+    cands = [DEFAULT_INBOX / name] + sorted(STORE_ROOT.glob(f"*/v*/raw/{sha[:16]}_*"))
+    src, seen = find_original_export(name, sha, size, explicit=EXPLICIT_INBOX, candidates=cands)
+    if src is None:
+        pytest.skip(f"validated export {name} ({sha[:16]}) not available: " + "; ".join(seen))
+    work = tmp_path / "export"
+    work.mkdir()
+    p = work / name
+    shutil.copyfile(src, p)
+    assert p.stat().st_size == size and file_sha256(p) == sha, f"copy of {src} does not match"
+    return src, p
+
+
+def test_original_export_lookup_is_content_addressed(tmp_path):
+    good, other = b"20261123 143100;1;1;1;1;1\r\n", b"20261123 143100;2;2;2;2;2\r\n"
+    from src.backtest.manifest import file_sha256
+
+    (tmp_path / "inbox").mkdir()
+    (tmp_path / "store").mkdir()
+    (tmp_path / "inbox" / "X 12-26.Last.txt").write_bytes(other)           # same name, newer export
+    (tmp_path / "store" / "copy.txt").write_bytes(good)
+    (tmp_path / "ref.txt").write_bytes(good)
+    sha, size = file_sha256(tmp_path / "ref.txt"), len(good)
+    cands = [tmp_path / "inbox" / "X 12-26.Last.txt", tmp_path / "store" / "copy.txt"]
+    found, seen = find_original_export("X 12-26.Last.txt", sha, size, explicit=None, candidates=cands)
+    assert found == tmp_path / "store" / "copy.txt" and "different content" in seen[0]
+    found, seen = find_original_export("X 12-26.Last.txt", sha, size, explicit=None, candidates=cands[:1])
+    assert found is None                                                      # never another file's bytes
+    with pytest.raises(AssertionError, match="not the export validated"):
+        find_original_export("X 12-26.Last.txt", sha, size, explicit=tmp_path / "inbox", candidates=cands)
+    assert find_original_export("Y.txt", sha, size, explicit=tmp_path / "inbox", candidates=cands)[0] is None
 
 
 @pytest.mark.parametrize("root", ["MES", "MNQ"])
 def test_real_export_imports_and_validates(tmp_path, root):
-    p = _real(root)
+    from src.backtest.manifest import file_sha256
+
+    original, p = _real(root, tmp_path)
     before = p.read_bytes()
     st = DatasetStore(tmp_path / "real")
     prov = json.loads(PROVENANCE.read_text(encoding="utf-8"))
@@ -355,11 +418,12 @@ def test_real_export_imports_and_validates(tmp_path, root):
     again = st.ingest(f"ninjatrader.{root.lower()}.1m", UTC_NT, [p], specs=APP.contracts, calendar=CAL, provenance=prov)
     assert again["created"] is False and again["ref"] == r["ref"]
     assert p.read_bytes() == before
+    assert file_sha256(original) == REAL[root][1]                           # the original is never touched
 
 
 @pytest.mark.parametrize("root", ["MES", "MNQ"])
 def test_real_export_read_as_europe_sofia_is_rejected(tmp_path, root):
-    p = _real(root)
+    _, p = _real(root, tmp_path)
     st = DatasetStore(tmp_path / "real")
     r = st.ingest("probe.sofia", make_adapter("ninjatrader_export", timezone="Europe/Sofia"), [p],
                   specs=APP.contracts, calendar=CAL)

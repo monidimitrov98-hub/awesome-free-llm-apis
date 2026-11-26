@@ -21,6 +21,9 @@ Rules:
   substituted manifest) refuses the dataset.
 * Status changes (cross-source validation, a human downgrade) are NEW registry records with evidence; the
   data never changes.
+* Data conflicts between datasets (Sprint 13 P0) live in a separate chained register (``conflicts.jsonl``, see
+  :mod:`src.histdata.conflicts`). Every load attaches the dataset's conflict state; a superseded dataset or one
+  with an unresolved conflict is refused for research, plans and continuous series (:meth:`Dataset.usage_refusal`).
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from src.backtest.manifest import file_sha256, text_sha256
 from src.config import PROJECT_ROOT, ConfigError
 from src.histdata import schema
 from src.histdata.calendar import Calendar
+from src.histdata.conflicts import ConflictRegister, compare_datasets, usage_refusal
 from src.histdata.providers import ProviderAdapter
 from src.histdata.quality import Report, normalize, validate
 from src.research.chain import ChainError, ChainStore
@@ -76,10 +80,16 @@ class Dataset:
     manifest: dict[str, Any]
     status: str
     status_history: list[dict[str, Any]]
+    conflict_state: dict[str, Any] | None = None
 
     @property
     def ref(self) -> str:
         return f"{self.id}@{self.version}"
+
+    def usage_refusal(self) -> str | None:
+        """Why this dataset must not be used for research / plans / continuous series (None when usable)."""
+        why = usage_refusal(self.conflict_state)
+        return f"{self.ref} is refused: {why}" if why else None
 
     def bars(self) -> pd.DataFrame:
         return schema.read_bars(self.path / "bars.csv.gz")
@@ -100,6 +110,7 @@ class DatasetStore:
         raw = root or os.environ.get(DATASETS_ENV)
         self.root = Path(raw).resolve() if raw else DEFAULT_ROOT
         self.registry = ChainStore(self.root / "registry.jsonl", kinds=("reserved", "status"))
+        self.conflicts = ConflictRegister(self.root)
 
     # ------------------------------------------------------------------ registry
     def records(self) -> list[dict[str, Any]]:
@@ -143,7 +154,11 @@ class DatasetStore:
             if r["kind"] == "status":
                 status = r["status"]
                 hist.append({"at": r["at"], "status": r["status"], "by": r.get("by"), "evidence": r.get("evidence")})
-        return Dataset(did, ver, path, m, status, hist)
+        try:
+            conflict_state = self.conflicts.state(f"{did}@{ver}")
+        except ConfigError as exc:                    # broken register or evidence: fail closed
+            raise DatasetError(f"{did}@{ver}: conflict register integrity failure: {exc}") from exc
+        return Dataset(did, ver, path, m, status, hist, conflict_state)
 
     def _verify(self, path: Path, expected_sha: str, did: str, ver: str) -> dict[str, Any]:
         try:
@@ -390,6 +405,12 @@ class DatasetStore:
         for d in loaded:
             if d.manifest["kind"] != "per_contract" or d.manifest["adjustment"] != "none":
                 raise DatasetError(f"{d.ref} is not an unadjusted per-contract dataset")
+            if RANK[d.status] < RANK["VALIDATED"]:
+                raise DatasetError(f"{d.ref} is {d.status}: a continuous series needs VALIDATED sources (fix or "
+                                   "remediate the source first; nothing is dropped or repaired here)")
+            why = d.usage_refusal()
+            if why:
+                raise DatasetError(why)
         res = {d.manifest["resolution"] for d in loaded}
         if len(res) != 1:
             raise DatasetError(f"sources have different resolutions {sorted(res)}")
@@ -403,8 +424,9 @@ class DatasetStore:
                 raise DatasetError("source datasets disagree on the same contract and minute: resolve with a "
                                    "cross-source comparison first")
             bars = bars.drop_duplicates(key, keep="first")
+        accounting: dict[str, Any] = {}
         cont, rolls = build_continuous(bars, calendar, rule=rule, days_before_expiry=days_before_expiry,
-                                       confirm_days=confirm_days, adjustment=adjustment)
+                                       confirm_days=confirm_days, adjustment=adjustment, report=accounting)
         st = self._stage()
         try:
             rolls.to_csv(st / "rolls.csv", index=False)
@@ -424,7 +446,8 @@ class DatasetStore:
                                kind="continuous", adjustment=adjustment,
                                lineage={"sources": [{"ref": d.ref, "manifest_sha256": d.manifest["manifest_sha256"],
                                                      "status": d.status} for d in loaded],
-                                        "roll_rule": source.identity()["params"], "rolls": len(rolls)},
+                                        "roll_rule": source.identity()["params"], "rolls": len(rolls),
+                                        "roll_accounting": accounting},
                                extra_files={"rolls.csv": file_sha256(st / "rolls.csv")})
         except BaseException:
             shutil.rmtree(st, ignore_errors=True)
@@ -441,6 +464,25 @@ class DatasetStore:
             raise DatasetError(f"{ref} is {ds.status}: only a VALIDATED dataset can be cross-source validated")
         return self.registry.append({"kind": "status", "dataset_id": ds.id, "version": ds.version, "status": status,
                                      "by": by, "evidence": evidence})
+
+    # ------------------------------------------------------------------ data conflicts (Sprint 13 P0)
+    def compare(self, ref_a: str, ref_b: str) -> dict[str, Any]:
+        """Read-only conflict report between two per-contract datasets (nothing is recorded)."""
+        return compare_datasets(self.load(ref_a), self.load(ref_b))
+
+    def record_conflict(self, report: dict[str, Any], *, by: str, note: str = "") -> dict[str, Any]:
+        """Record a conflict report. Both datasets must still match the manifests the report was made from."""
+        for side in ("a", "b"):
+            ds = self.load(report[side]["ref"])
+            if ds.manifest["manifest_sha256"] != report[side]["manifest_sha256"]:
+                raise DatasetError(f"{ds.ref}: the report was made from another manifest; compare again")
+        return self.conflicts.record(report, by=by, note=note)
+
+    def supersede(self, old_ref: str, new_ref: str, *, by: str, reason: str) -> dict[str, Any]:
+        """HUMAN decision recorded with evidence: ``old_ref`` is superseded by ``new_ref`` (nothing is deleted)."""
+        self.load(old_ref)
+        self.load(new_ref)
+        return self.conflicts.supersede(old_ref, new_ref, by=by, reason=reason)
 
     # ------------------------------------------------------------------ recovery
     def recover(self) -> dict[str, Any]:

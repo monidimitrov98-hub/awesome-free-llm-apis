@@ -121,6 +121,9 @@ def parse_plan(path: Path, app, store) -> dict[str, Any]:
             raise ConfigError(f"{ds.ref}: manifest hash differs from the plan (dataset substituted)")
         if RANK[ds.status] < RANK["VALIDATED"]:
             raise ConfigError(f"{ds.ref} is {ds.status}: a plan needs VALIDATED datasets")
+        why = ds.usage_refusal()                       # superseded, or an unresolved data conflict
+        if why:
+            raise ConfigError(why)
         if ds.manifest["adjustment"] != "none":
             raise ConfigError(f"{ds.ref} is adjusted: refused")
         if d.get("instrument") not in ds.manifest["roots"]:

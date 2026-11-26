@@ -15,6 +15,9 @@ Provider files are obtained with the provider's own tools, then ingested here in
     python run_data.py continuous --dataset-id databento.mes.1m.cont --source databento.mes.1m@v1 --rule volume
     python run_data.py cross-validate databento.mes.1m@v1 other.mes.1m@v1 [--start 2025-01-02 --end 2025-03-31]
     python run_data.py readiness databento.mes.1m.cont@v1
+    python run_data.py conflicts nt.mes.1m@v1 nt.mes.z26.1m@v1         (read-only minute-by-minute comparison)
+    python run_data.py conflicts A@v1 B@v1 --record --by NAME [--note TEXT]   (HUMAN: record a data conflict)
+    python run_data.py supersede A@v1 --with B@v1 --by NAME --reason TEXT    (HUMAN: resolve it; nothing deleted)
     python run_data.py recover
 
 Exit codes: 0 ok, 1 refused / error, 3 cross-validation FAIL.
@@ -75,6 +78,19 @@ def parse_args(argv=None):
     x.add_argument("b")
     x.add_argument("--start", default=None)
     x.add_argument("--end", default=None)
+    k = sub.add_parser("conflicts", help="compare two per-contract datasets minute by minute (read-only unless "
+                                         "--record)")
+    k.add_argument("a")
+    k.add_argument("b")
+    k.add_argument("--record", action="store_true", help="HUMAN: record the differences as a data conflict")
+    k.add_argument("--by", default="")
+    k.add_argument("--note", default="")
+    k.add_argument("--show", type=int, default=20, help="conflicting minutes to print (all are in the report)")
+    s = sub.add_parser("supersede", help="HUMAN: declare OLD superseded by NEW (needs a recorded conflict)")
+    s.add_argument("old")
+    s.add_argument("--with", dest="new", required=True)
+    s.add_argument("--by", required=True)
+    s.add_argument("--reason", required=True)
     d = sub.add_parser("downgrade", help="HUMAN: mark a dataset VALIDATION_FAILED after a discovered problem")
     d.add_argument("ref")
     d.add_argument("--by", required=True)
@@ -115,13 +131,18 @@ def main(argv=None) -> int:
                 print("VALIDATION FAILED: see `run_data.py show` (the dataset is kept, unusable for research)")
             return 0
         if a.cmd == "list":
+            from src.histdata.conflicts import usage_refusal
+
             for v in store.versions():
+                ref = f"{v['dataset_id']}@{v['version']}"
+                v["data_conflict"] = usage_refusal(store.conflicts.state(ref))
                 print(json.dumps(v, default=str))
             return 0
         if a.cmd == "show":
             ds = store.load(a.ref)
             v = ds.validation()
             print(json.dumps({"identity": ds.identity(), "status_history": ds.status_history,
+                              "conflict_state": ds.conflict_state,
                               "manifest": {k: ds.manifest[k] for k in ("provider", "source_files", "contracts",
                                                                      "first_bar_utc", "last_bar_utc", "calendar",
                                                                      "lineage", "description")},
@@ -146,6 +167,9 @@ def main(argv=None) -> int:
             from src.histdata.crossval import compare
 
             ra, rb = store.load(a.a), store.load(a.b)
+            for x in (ra, rb):
+                if x.usage_refusal():
+                    raise ConfigError(x.usage_refusal())
             rep = compare(ra, rb, cal, app.contracts, start=a.start, end=a.end)
             out = store.root / "_reports"
             out.mkdir(parents=True, exist_ok=True)
@@ -162,6 +186,26 @@ def main(argv=None) -> int:
                 store.set_status(x.ref, "CROSS_SOURCE_VALIDATED", by="cross-validate",
                                  evidence={**ev, "against": y.ref})
             print(f"{ra.ref} and {rb.ref}: CROSS_SOURCE_VALIDATED")
+            return 0
+        if a.cmd == "conflicts":
+            rep = store.compare(a.a, a.b)
+            summary = {"a": rep["a"]["ref"], "b": rep["b"]["ref"], "report_sha256": rep["report_sha256"],
+                       "totals": rep["totals"], "contracts": rep["contracts"],
+                       "conflicts": rep["conflicts"][:max(a.show, 0)]}
+            print(json.dumps(summary, indent=2, default=str))
+            if a.record:
+                rec = store.record_conflict(rep, by=a.by, note=a.note)
+                print(f"conflict {rec['conflict_id']} recorded: {rec['a']} and {rec['b']} are refused for research "
+                      "until one supersedes the other (`run_data.py supersede`)")
+            else:
+                from src.histdata.conflicts import has_conflict
+
+                print("read-only comparison: nothing recorded" + (" (use --record --by NAME to record the "
+                                                                  "conflict)" if has_conflict(rep) else ""))
+            return 0
+        if a.cmd == "supersede":
+            rec = store.supersede(a.old, a.new, by=a.by, reason=a.reason)
+            print(f"{rec['dataset']} superseded by {rec['superseded_by']} (conflict(s) {', '.join(rec['conflict_ids'])})")
             return 0
         if a.cmd == "downgrade":
             store.set_status(a.ref, "VALIDATION_FAILED", by=a.by, evidence={"reason": a.reason[:500]})

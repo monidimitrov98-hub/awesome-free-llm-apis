@@ -1441,6 +1441,23 @@ python run_research.py run --strategy vwap_mean_reversion --version V1-C2-SWING 
 
 See `docs/sprint12_1_ninjatrader_import.md`.
 
+## Sprint 13 P0: Rollover safeguards and data-conflict register
+
+- **Continuous series refuse instead of guessing:**
+  - contracts must be consecutive listed contracts (a missing quarterly contract is named);
+  - every source must be VALIDATED and free of data conflicts;
+  - bars outside the exchange schedule are refused, never dropped;
+  - a trade date whose selected contract has no bars is refused, never lost;
+  - each trade date maps to exactly one contract.
+- **Roll dates** count VERIFIED full-day closures, and every input bar is accounted for in the manifest
+  (`lineage.roll_accounting`).
+- **Data conflicts:** `run_data.py conflicts A B` compares two datasets of the same contract minute by minute,
+  read-only. A conflict recorded by a person (`--record --by NAME`) refuses both datasets for research, plans,
+  continuous series and cross-validation until a person declares one superseded by the other
+  (`run_data.py supersede`). Nothing is merged, deleted or downgraded.
+
+See `docs/sprint13_p0_rollover_conflicts.md`.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.

@@ -47,6 +47,9 @@ def assess(ds: Dataset) -> dict[str, Any]:
         base_block.append("SYNTHETIC data: never evidence of market behaviour")
     if RANK[ds.status] < RANK["INGESTED"]:
         base_block.append(f"status {ds.status}")
+    conflict_refusal = ds.usage_refusal()
+    if conflict_refusal:
+        base_block.append(conflict_refusal)
     uses: dict[str, dict[str, Any]] = {}
 
     def put(use: str, blocks: list[str], limits: list[str]) -> None:
@@ -79,6 +82,7 @@ def assess(ds: Dataset) -> dict[str, Any]:
     return {
         "dimensions": dims,
         "dataset": ds.identity(), "status": ds.status, "status_history": ds.status_history,
+        "conflict_state": ds.conflict_state,
         "instruments": m["roots"], "contracts": m["contracts"], "resolution": m["resolution"],
         "first_bar_utc": m["first_bar_utc"], "last_bar_utc": m["last_bar_utc"],
         "trade_dates": tdates, "active_trade_dates": active, "session_coverage": cov,
@@ -166,7 +170,7 @@ def dimensions(ds: Dataset, v: dict[str, Any], uses: dict[str, dict[str, Any]]) 
     fails = [k for k, d in out.items() if d["status"] == "FAIL"]
     ready = [u for u, x in uses.items() if x["verdict"] != "NOT_READY"]
     not_ready = {u: x["blocking"] for u, x in uses.items() if x["verdict"] == "NOT_READY"}
-    if fails or m.get("synthetic"):
+    if fails or m.get("synthetic") or ds.usage_refusal():
         verdict = "BLOCKED"
     elif uses["walk_forward"]["verdict"] == "NOT_READY":
         verdict = "NOT_READY_FOR_STRATEGY_RESEARCH"
@@ -176,6 +180,7 @@ def dimensions(ds: Dataset, v: dict[str, Any], uses: dict[str, dict[str, Any]]) 
         verdict = "READY"
     out["overall_research_readiness"] = {
         "status": verdict, "blocking_dimensions": fails, "supported_uses": ready, "unsupported_uses": not_ready,
+        "data_conflict": ds.usage_refusal(),
         "note": "describes the data only; a structurally valid dataset is not automatically suitable for research"}
     return out
 

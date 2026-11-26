@@ -100,6 +100,9 @@ class ResearchEnv:
         if RANK[ds.status] < RANK["VALIDATED"]:
             raise ResearchError(f"dataset {ds.ref} is {ds.status}: research needs a VALIDATED dataset "
                                 "(see `run_data.py show`)")
+        why = ds.usage_refusal()                   # superseded, or an unresolved data conflict
+        if why:
+            raise ResearchError(why)
         return ds, contract or None
 
     def config_hashes(self) -> dict[str, str]:
