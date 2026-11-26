@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 
 SCHEMA_VERSION = "bars/1"
-NORMALIZATION_VERSION = "2026-11-25.1"
+NORMALIZATION_VERSION = "2026-11-25.2"     # .2: strict NinjaTrader line parser, quarantine file, clock check
 COLUMNS = ["ts_utc", "root", "contract", "open", "high", "low", "close", "volume", "source_ts", "source_file"]
 PRICE = ["open", "high", "low", "close"]
 

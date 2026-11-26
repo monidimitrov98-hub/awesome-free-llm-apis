@@ -187,6 +187,11 @@ def validate(bars: pd.DataFrame, specs: dict[str, ContractSpec], calendar: Calen
         sel = gaps[gaps["classification"] == cls]
         report.add(sev, cls, f"gaps classified {cls}", len(sel),
                    [f"{r.contract} {r.after} -> {r.before}" for r in sel.head().itertuples()])
+    clock = clock_alignment(bars, calendar)
+    if clock["suspected_shift_hours"] is not None:
+        report.add("warning", "CLOCK_MISALIGNMENT_SUSPECTED",
+                   f"bars fit the exchange schedule better shifted by {clock['suspected_shift_hours']:+g} h "
+                   "(declared source timezone or bar labelling is probably wrong); nothing was shifted")
     if synthetic:
         report.add("warning", "SYNTHETIC_DATA", "source marked SYNTHETIC: not market prices; never evidence")
     rth_missing = sum(v["active_rth_minutes_missing"] for v in coverage.values())
@@ -202,7 +207,32 @@ def validate(bars: pd.DataFrame, specs: dict[str, ContractSpec], calendar: Calen
         status = "VALIDATED"
     else:
         status = "INGESTED"
-    return {"findings": report.findings, "gaps": gaps, "coverage": coverage, "gate": gate, "status": status}
+    return {"findings": report.findings, "gaps": gaps, "coverage": coverage, "gate": gate, "status": status,
+            "clock_alignment": clock}
+
+
+CLOCK_SHIFTS_MINUTES = tuple(range(-14 * 60, 14 * 60 + 1, 30))
+
+
+def clock_alignment(bars: pd.DataFrame, calendar: Calendar) -> dict[str, Any]:
+    """Diagnostic only (never changes data): how many bars fall into scheduled closures if every timestamp
+    were shifted by whole / half hours between -14 h and +14 h. With a correct source timezone and bar
+    labelling, the declared clock (shift 0) has no bar in a closure. ``zero_closed_shifts_hours`` lists every shift
+    with no closed bar: a single entry ``[0]`` means the exchange schedule pins the clock uniquely; several
+    entries mean the sample is too short to tell them apart. Shifts are DST-safe because the calendar
+    converts every shifted UTC instant through the tz database."""
+    if bars.empty:
+        return {"declared_closed_bars": 0, "zero_closed_shifts_hours": [], "suspected_shift_hours": None,
+                "unique": False, "shifts_tested_hours": [-14, 14, 0.5]}
+    ts = pd.DatetimeIndex(bars["ts_utc"])
+    closed = {m: int((~calendar.is_open(ts + pd.Timedelta(minutes=m)).to_numpy()).sum())
+              for m in CLOCK_SHIFTS_MINUTES}
+    zero = [m for m, n in closed.items() if n == 0]
+    best = min(closed, key=lambda m: (closed[m], abs(m)))
+    suspected = best / 60 if closed[0] > 0 and closed[best] < closed[0] else None
+    return {"declared_closed_bars": closed[0], "zero_closed_shifts_hours": [m / 60 for m in zero],
+            "suspected_shift_hours": suspected, "best_shift_closed_bars": closed[best],
+            "unique": zero == [0], "shifts_tested_hours": [-14, 14, 0.5]}
 
 
 def _expiry(contract: str, calendar: Calendar) -> pd.Timestamp:
@@ -278,4 +308,4 @@ def _gaps_and_coverage(contract: str, g: pd.DataFrame, calendar: Calendar, step:
     }
 
 
-__all__ = ["Report", "normalize", "validate", "GATES"]
+__all__ = ["Report", "normalize", "validate", "clock_alignment", "GATES"]

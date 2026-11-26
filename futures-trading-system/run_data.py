@@ -6,7 +6,7 @@ Provider files are obtained with the provider's own tools, then ingested here in
     python run_data.py adapters
     python run_data.py ingest --dataset-id databento.mes.1m --adapter databento_ohlcv_csv --file a.csv [--file b.csv]
     python run_data.py ingest --dataset-id nt.mes.1m --adapter ninjatrader_export --param timezone=America/Chicago \\
-        --file "MES 03-25.Last.txt"
+        --file "MES 03-25.Last.txt" [--provenance source_facts.json]
     python run_data.py ingest --dataset-id databento.mes.1m --adapter databento_ohlcv_csv --file new.csv \\
         --base databento.mes.1m@v1                 (incremental update -> new version; history never changes)
     python run_data.py list
@@ -56,6 +56,8 @@ def parse_args(argv=None):
     i.add_argument("--description", default="")
     i.add_argument("--base", default=None, help="extend this version (incremental update)")
     i.add_argument("--allow-corrections", action="store_true")
+    i.add_argument("--provenance", type=Path, default=None,
+                   help="JSON file of recorded source facts (e.g. timezone evidence); stored in the manifest")
     sub.add_parser("list")
     for name in ("show", "verify", "readiness"):
         s = sub.add_parser(name)
@@ -99,9 +101,15 @@ def main(argv=None) -> int:
             params = _kv(a.param)
             if "columns" in params:
                 params["columns"] = json.loads(params["columns"])
+            prov = None
+            if a.provenance is not None:
+                try:
+                    prov = json.loads(a.provenance.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ConfigError(f"{a.provenance}: invalid JSON: {exc}") from exc
             r = store.ingest(a.dataset_id, make_adapter(a.adapter, **params), a.file, specs=app.contracts,
                              calendar=cal, resolution=a.resolution, description=a.description, base=a.base,
-                             allow_corrections=a.allow_corrections)
+                             allow_corrections=a.allow_corrections, provenance=prov)
             print(json.dumps(r, indent=2, default=str))
             if r.get("created") and r["status"] == "VALIDATION_FAILED":
                 print("VALIDATION FAILED: see `run_data.py show` (the dataset is kept, unusable for research)")

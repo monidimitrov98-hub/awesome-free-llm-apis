@@ -75,7 +75,9 @@ def assess(ds: Dataset) -> dict[str, Any]:
         oos_lim.append("not cross-source validated: a single provider's errors would go unnoticed")
     put("oos_validation", oos, oos_lim)
     put("monte_carlo", list(bt), bt_lim)
+    dims = dimensions(ds, v, uses)
     return {
+        "dimensions": dims,
         "dataset": ds.identity(), "status": ds.status, "status_history": ds.status_history,
         "instruments": m["roots"], "contracts": m["contracts"], "resolution": m["resolution"],
         "first_bar_utc": m["first_bar_utc"], "last_bar_utc": m["last_bar_utc"],
@@ -88,4 +90,94 @@ def assess(ds: Dataset) -> dict[str, Any]:
     }
 
 
-__all__ = ["assess", "MIN_WF_TRADE_DATES", "MIN_OOS_TRADE_DATES"]
+_DIM_CODES = {
+    "structural_validity": ("BAD_SOURCE_ROWS", "MISSING_VALUES", "OFF_GRID_TIMESTAMP", "UNKNOWN_OR_CONTINUOUS_SYMBOL",
+                            "CONFLICTING_DUPLICATES", "EXACT_DUPLICATES", "OUT_OF_ORDER", "EMPTY", "SOURCE_FILE_CHANGED"),
+    "ohlcv_validity": ("NON_POSITIVE_PRICE", "NEGATIVE_VOLUME", "OHLC_INCONSISTENT", "OFF_TICK_PRICE", "ZERO_VOLUME",
+                       "ABNORMAL_VOLUME", "PRICE_JUMP", "CORRECTIONS"),
+    "timestamp_timezone": ("BAR_WHILE_MARKET_CLOSED", "BAR_AFTER_EXPIRY", "CLOCK_MISALIGNMENT_SUSPECTED"),
+    "session_calendar": ("SCHEDULED_BREAK", "EXPECTED_CLOSURE_WEEKEND", "EXPECTED_HOLIDAY",
+                         "HOLIDAY_CANDIDATE_UNVERIFIED"),
+    "completeness": ("MISSING_DATA_RTH", "MISSING_DATA_ETH", "NO_TRADE_INTERVAL"),
+}
+
+
+def dimensions(ds: Dataset, v: dict[str, Any], uses: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Eight SEPARATE verdicts (PASS / PASS_WITH_LIMITATIONS / FAIL / NOT_PERFORMED), so that no single green
+    light hides a limitation. ``overall_research_readiness`` is BLOCKED by any FAIL; otherwise it says which
+    research uses the data supports and which it does not."""
+    m = ds.manifest
+    findings = v.get("findings", [])
+    prov = m.get("provenance") or {}
+    out: dict[str, Any] = {}
+
+    def dim(name: str, extra_limits: list[str] | None = None, extra_details: list[str] | None = None) -> None:
+        fs = [f for f in findings if f["code"] in _DIM_CODES[name]]
+        errs = [f"{f['code']}: {f['count']}" for f in fs if f["severity"] == "error"]
+        warns = [f"{f['code']}: {f['count']}" for f in fs if f["severity"] == "warning"] + (extra_limits or [])
+        info = [f"{f['code']}: {f['count']}" for f in fs if f["severity"] == "info"] + (extra_details or [])
+        out[name] = {"status": "FAIL" if errs else ("PASS_WITH_LIMITATIONS" if warns else "PASS"),
+                     "errors": errs, "limitations": warns, "details": info}
+
+    out["file_integrity"] = {
+        "status": "PASS", "errors": [], "limitations": [],
+        "details": ["registry record, manifest self-hash and every stored file hash verified on load"]
+        + [f"{s['name']}: sha256 {s['sha256']}, {s['bytes']} bytes, {s['rows']} rows accepted, {s['rejected']} rejected"
+           for s in m.get("source_files", [])]}
+    dim("structural_validity",
+        extra_details=[f"{s['name']}: {s.get('parse_stats')}" for s in m.get("source_files", []) if s.get("parse_stats")])
+    dim("ohlcv_validity")
+    tz_limits, tz_details = [], []
+    tzp = prov.get("timezone") if isinstance(prov, dict) else None
+    srcs = sorted({s.get("source_timezone") for s in m.get("source_files", [])} - {None})
+    if srcs:
+        tz_details.append(f"declared source timezone(s): {srcs}; {m.get('timestamps')}")
+    if m.get("kind") == "per_contract" and m.get("source_files"):
+        if not tzp:
+            tz_limits.append("no timezone provenance recorded")
+        elif tzp.get("basis") != "explicit_export_setting":
+            tz_limits.append(f"source timezone established by {tzp.get('basis')}, not by an explicit, verified "
+                             "export setting")
+    clock = v.get("clock_alignment") or {}
+    if clock:
+        tz_details.append(f"clock check: {clock.get('declared_closed_bars')} bar(s) in closures at the declared "
+                          f"clock; shifts with none: {clock.get('zero_closed_shifts_hours')}")
+        if clock.get("declared_closed_bars") == 0 and not clock.get("unique"):
+            tz_limits.append("the exchange schedule does not pin the clock uniquely in this sample")
+    dim("timestamp_timezone", tz_limits, tz_details)
+    cal = m.get("calendar", {})
+    dim("session_calendar", [] if cal.get("verified_holidays") else
+        ["calendar has no VERIFIED holidays: holiday sessions cannot be distinguished from missing data"],
+        [f"calendar {cal.get('id')}@{cal.get('version')} ({cal.get('timezone')})"])
+    g = v.get("gate") or {}
+    dim("completeness", [] if ds.status != "INGESTED" else ["coverage gate not met (status INGESTED)"],
+        [f"active RTH missing fraction {g.get('active_rth_missing_fraction')}, longest missing RTH gap "
+         f"{g.get('longest_missing_rth_gap_minutes')} min"]
+        + [f"{c}: {x.get('bars')} bars, {x.get('trade_dates')} trade dates, {x.get('open_minutes_present')}/"
+           f"{x.get('open_minutes_expected')} open minutes present" for c, x in (v.get("coverage") or {}).items()])
+    if ds.status == "CROSS_SOURCE_VALIDATED":
+        ev = [h.get("evidence") for h in ds.status_history if h["status"] == "CROSS_SOURCE_VALIDATED"]
+        out["cross_source_validation"] = {"status": "PASS", "errors": [], "limitations": [], "details": [str(ev[-1])]}
+    else:
+        out["cross_source_validation"] = {
+            "status": "NOT_PERFORMED", "errors": [], "limitations": [
+                "no independent second source has been compared: single-provider errors would go unnoticed"],
+            "details": []}
+    fails = [k for k, d in out.items() if d["status"] == "FAIL"]
+    ready = [u for u, x in uses.items() if x["verdict"] != "NOT_READY"]
+    not_ready = {u: x["blocking"] for u, x in uses.items() if x["verdict"] == "NOT_READY"}
+    if fails or m.get("synthetic"):
+        verdict = "BLOCKED"
+    elif uses["walk_forward"]["verdict"] == "NOT_READY":
+        verdict = "NOT_READY_FOR_STRATEGY_RESEARCH"
+    elif any(d["status"] != "PASS" for d in out.values()) or len(ready) < len(uses):
+        verdict = "READY_WITH_LIMITATIONS"
+    else:
+        verdict = "READY"
+    out["overall_research_readiness"] = {
+        "status": verdict, "blocking_dimensions": fails, "supported_uses": ready, "unsupported_uses": not_ready,
+        "note": "describes the data only; a structurally valid dataset is not automatically suitable for research"}
+    return out
+
+
+__all__ = ["assess", "dimensions", "MIN_WF_TRADE_DATES", "MIN_OOS_TRADE_DATES"]

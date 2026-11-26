@@ -47,6 +47,7 @@ class ParsedFile:
     synthetic: bool = False
     rejected: list[dict[str, Any]] = field(default_factory=list)   # unparseable rows (never guessed)
     notes: list[str] = field(default_factory=list)
+    stats: dict[str, Any] = field(default_factory=dict)            # file-level parsing facts (provenance)
 
 
 class ProviderAdapter(ABC):
@@ -183,17 +184,72 @@ class NinjaTraderExportAdapter(ProviderAdapter):
             if not m:
                 raise ConfigError(f"{name or path.name}: contract not in the file name; pass `symbol`")
             sym = f"{m['root']} {m['mm']}-{m['yy']}"
-        raw = pd.read_csv(path, sep=";", header=None, dtype=str, comment="#",
-                          names=["timestamp", "open", "high", "low", "close", "volume"])
-        df = raw.copy()
+        label = name or path.name
+        df, rejected, stats, notes = self._read_lines(path, label)
         df["symbol"] = sym
-        rejected: list = []
-        df = _numeric(df, rejected, path.name)
+        df = _numeric(df, rejected, label)
         norm = normalize_to_utc(df["timestamp"], tz, fmt="%Y%m%d %H%M%S",
                                 ambiguous=self.params.get("ambiguous", "raise"),
                                 nonexistent=self.params.get("nonexistent", "raise"))
         res = pd.Timedelta(self.params.get("resolution", "1min"))
-        return _finish(df, norm.utc, "close", path, tz, rejected, self, step=res, name=name)
+        out = _finish(df, norm.utc, "close", path, tz, rejected, self, step=res, name=name)
+        stats["rejected_rows"] = len(out.rejected)
+        stats["accepted_rows"] = int(len(out.records))
+        out.stats, out.notes = stats, notes + out.notes
+        return out
+
+    _TS = re.compile(r"^\d{8} \d{6}$")
+
+    def _read_lines(self, path: Path, label: str) -> tuple[pd.DataFrame, list, dict[str, Any], list[str]]:
+        """Strict line-based reading: every line is a data row, blank, a ``#`` comment or (first line only) a
+        header. Anything else is REJECTED with its line number and reason; nothing is skipped silently.
+        The DataFrame index is the 1-based line number, so every rejection names the source line."""
+        data = path.read_bytes()
+        bom = data.startswith(b"\xef\xbb\xbf")
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"{label}: not ASCII / UTF-8 text ({exc}); refused, nothing guessed") from exc
+        lines = text.splitlines()
+        crlf, lf = data.count(b"\r\n"), data.count(b"\n")
+        stats: dict[str, Any] = {
+            "bytes": len(data), "encoding": "ascii" if data.isascii() else ("utf-8-sig" if bom else "utf-8"),
+            "bom": bom, "line_endings": "CRLF" if crlf and crlf == lf else ("LF" if not crlf else "mixed"),
+            "delimiter": ";", "lines": len(lines), "blank_lines": 0, "comment_lines": 0, "header_lines": 0,
+            "data_rows": 0}
+        rows: list[list[Any]] = []
+        rejected: list[dict[str, Any]] = []
+        notes: list[str] = []
+        for n, line in enumerate(lines, start=1):
+            s = line.strip()
+            if not s:
+                stats["blank_lines"] += 1
+                continue
+            if s.startswith("#"):
+                stats["comment_lines"] += 1
+                continue
+            parts = [p.strip() for p in s.split(";")]
+            if len(parts) != 6:
+                rejected.append({"row": n, "reason": f"expected 6 ';'-separated fields, got {len(parts)}",
+                                 "value": s[:120], "file": label})
+                continue
+            if not self._TS.match(parts[0]):
+                if not rows and not rejected and not stats["header_lines"] and \
+                        all(re.fullmatch(r"[A-Za-z][A-Za-z _.]*", p) for p in parts):
+                    stats["header_lines"] += 1
+                    notes.append(f"line {n}: header line skipped ({s[:80]})")
+                    continue
+                rejected.append({"row": n, "reason": "malformed timestamp (expected yyyyMMdd HHmmss)",
+                                 "value": s[:120], "file": label})
+                continue
+            rows.append([n] + parts)
+        stats["data_rows"] = len(rows)
+        if stats["blank_lines"]:
+            notes.append(f"{stats['blank_lines']} blank line(s) ignored")
+        cols = ["line", "timestamp", "open", "high", "low", "close", "volume"]
+        df = pd.DataFrame(rows, columns=cols).set_index("line")
+        df.index.name = None
+        return df, rejected, stats, notes
 
 
 def _finish(df: pd.DataFrame, ts: pd.Series, label: str, path: Path, tz: str, rejected: list,

@@ -6,3 +6,4 @@
 !.env.verify.example
 node_modules/
 .DS_Store
+/market-data-inbox/

@@ -199,10 +199,17 @@ class DatasetStore:
 
     def ingest(self, dataset_id: str, adapter: ProviderAdapter, files: list[Path], *, specs, calendar: Calendar,
                resolution: str = "1min", description: str = "", base: str | None = None,
-               allow_corrections: bool = False, bars_from_trades: bool | None = None) -> dict[str, Any]:
-        """Create a new version from provider files (or return the identical existing version)."""
+               allow_corrections: bool = False, bars_from_trades: bool | None = None,
+               provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Create a new version from provider files (or return the identical existing version).
+
+        ``provenance``: optional human-recorded facts about the source (e.g. how the source timezone was
+        established and its limitations). It is written verbatim into the manifest and the validation report.
+        It never changes parsing (the adapter parameters do) and is not part of the identity used for
+        idempotency: the same files with the same adapter return the existing version."""
         if not _ID.match(dataset_id or ""):
             raise DatasetError(f"invalid dataset id {dataset_id!r}")
+        provenance = _check_provenance(provenance)
         files = [Path(f) for f in files]
         base_ds = self.load(base) if base else None
         if base_ds is not None and base_ds.id != dataset_id:
@@ -219,15 +226,28 @@ class DatasetStore:
         hashes = [file_sha256(p) for p, _ in all_files]
         if len(set(hashes)) != len(hashes):
             raise DatasetError("the same source file was given twice")
+        changed: list[dict[str, Any]] = []
+        n_base = len(all_files) - len(files)
+        new_files = {name: sha for (_, name), sha in list(zip(all_files, hashes))[n_base:]}   # not carried base files
         for v in self.versions(dataset_id):
             ds = self.load(f"{dataset_id}@{v['version']}")
             if sorted(s["sha256"] for s in ds.manifest["source_files"]) == sorted(hashes) \
                     and ds.manifest["provider"] == adapter.identity():
                 return {"created": False, "ref": ds.ref, "status": ds.status, "reason": "identical source files"}
+            for s in ds.manifest["source_files"]:
+                if s["name"] in new_files and new_files[s["name"]] != s["sha256"]:
+                    changed.append({"name": s["name"], "previous_ref": ds.ref, "previous_sha256": s["sha256"],
+                                    "sha256": new_files[s["name"]]})
         trades_built = adapter.name == "databento_ohlcv_csv" if bars_from_trades is None else bars_from_trades
         st = self._stage()
         try:
             rep = Report()
+            if changed:
+                rep.add("warning", "SOURCE_FILE_CHANGED", "a source file with the same name but different content "
+                        "(SHA-256) was ingested before: this is a NEW version, the earlier one is unchanged",
+                        len(changed), [f"{c['name']}: {c['previous_ref']} {c['previous_sha256'][:12]} -> "
+                                       f"{c['sha256'][:12]}" for c in changed])
+            quarantine: list[dict[str, Any]] = []
             records, sources, synthetic = [], [], False
             for i, ((p, name), sha) in enumerate(zip(all_files, hashes)):
                 stored = f"raw/{sha[:16]}_{re.sub(r'[^A-Za-z0-9_.-]', '_', name)[:100]}"
@@ -237,12 +257,18 @@ class DatasetStore:
                 r = parsed.records.assign(source_file=i)
                 records.append(r)
                 if parsed.rejected:
-                    rep.add("error", "BAD_SOURCE_ROWS", f"{name}: rows that could not be parsed (excluded)",
+                    rep.add("error", "BAD_SOURCE_ROWS", f"{name}: rows that could not be parsed (excluded; every "
+                            "one is listed in rejected.csv)",
                             len(parsed.rejected), [x.get("value", x["reason"]) for x in parsed.rejected])
+                    quarantine += [{"source_file": i, "name": name, "row": x.get("row"), "reason": x["reason"],
+                                    "value": x.get("value", "")} for x in parsed.rejected]
+                first = parsed.records["source_ts"].iloc[0] if len(parsed.records) else None
+                last = parsed.records["source_ts"].iloc[-1] if len(parsed.records) else None
                 sources.append({"name": name, "stored_as": stored, "sha256": sha, "bytes": (st / stored).stat().st_size,
                                 "rows": int(len(parsed.records)), "rejected": len(parsed.rejected),
                                 "timestamp_semantics": parsed.timestamp_semantics,
                                 "source_timezone": parsed.source_timezone, "notes": parsed.notes,
+                                "parse_stats": parsed.stats, "first_source_ts": first, "last_source_ts": last,
                                 "from_base": base_ds is not None and i < len(base_ds.manifest["source_files"])})
             recs = pd.concat(records, ignore_index=True) if records else pd.DataFrame()
             if base_ds is not None:
@@ -253,9 +279,19 @@ class DatasetStore:
                 self._check_extension(base_ds, bars, allow_corrections, rep)
             body = validate(bars, specs, calendar, resolution=resolution, bars_from_trades=trades_built, report=rep,
                             synthetic=synthetic)
+            extra = {}
+            if quarantine:
+                pd.DataFrame(quarantine, columns=["source_file", "name", "row", "reason", "value"]).to_csv(
+                    st / "rejected.csv", index=False, lineterminator="\n")
+                extra["rejected.csv"] = file_sha256(st / "rejected.csv")
+            body["provenance"] = provenance
+            body["changed_sources"] = changed
             ver = self._next_version(dataset_id)
-            return self._write(st, dataset_id, ver, bars, body, sources, adapter, calendar, resolution, description,
-                               synthetic, base_ds, trades_built)
+            out = self._write(st, dataset_id, ver, bars, body, sources, adapter, calendar, resolution, description,
+                              synthetic, base_ds, trades_built, extra_files=extra, provenance=provenance)
+            out["rejected_rows"] = len(quarantine)
+            out["changed_sources"] = changed
+            return out
         except BaseException:
             shutil.rmtree(st, ignore_errors=True)
             raise
@@ -306,7 +342,8 @@ class DatasetStore:
     def _write(self, st: Path, did: str, ver: str, bars: pd.DataFrame, body: dict[str, Any], sources: list,
                adapter: ProviderAdapter, calendar: Calendar, resolution: str, description: str, synthetic: bool,
                base: Dataset | None, trades_built: bool, *, kind: str = "per_contract", adjustment: str = "none",
-               lineage: dict[str, Any] | None = None, extra_files: dict[str, str] | None = None) -> dict[str, Any]:
+               lineage: dict[str, Any] | None = None, extra_files: dict[str, str] | None = None,
+               provenance: dict[str, Any] | None = None) -> dict[str, Any]:
         files = {"bars.csv.gz": schema.write_bars(bars, st / "bars.csv.gz")}
         gaps = body.pop("gaps")
         gaps.to_csv(st / "gaps.csv", index=False)
@@ -333,6 +370,8 @@ class DatasetStore:
             "lineage": lineage or ({"base": base.ref, "base_manifest_sha256": base.manifest["manifest_sha256"]}
                                    if base is not None else None),
         }
+        if provenance is not None:
+            manifest["provenance"] = provenance
         sha = self._finalize(st, manifest, status)
         return {"created": True, "ref": f"{did}@{ver}", "status": status, "manifest_sha256": sha,
                 "errors": manifest["validation"]["errors"], "warnings": manifest["validation"]["warnings"]}
@@ -447,6 +486,36 @@ class _Derived:
 
     def identity(self) -> dict[str, Any]:
         return {"adapter": self.name, "params": dict(sorted(self.params.items()))}
+
+
+_SECRET_KEY = re.compile(r"pass(word)?|secret|token|api[_-]?key|credential|account[_-]?(id|number)|auth", re.I)
+
+
+def _check_provenance(prov: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Provenance is free-form but bounded, JSON-serialisable and free of credential-like keys (manifests and
+    reports are shareable; secrets never belong in them)."""
+    if prov is None:
+        return None
+    if not isinstance(prov, dict):
+        raise DatasetError("provenance must be a JSON object")
+    try:
+        text = json.dumps(prov, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise DatasetError(f"provenance is not JSON-serialisable: {exc}") from exc
+    if len(text) > 20000:
+        raise DatasetError("provenance is larger than 20000 characters")
+
+    def keys(o: Any) -> list[str]:
+        if isinstance(o, dict):
+            return [str(k) for k in o] + [x for v in o.values() for x in keys(v)]
+        if isinstance(o, list):
+            return [x for v in o for x in keys(v)]
+        return []
+
+    bad = [k for k in keys(prov) if _SECRET_KEY.search(k)]
+    if bad:
+        raise DatasetError(f"provenance contains credential-like keys {bad}: secrets never go into manifests")
+    return json.loads(text)
 
 
 def _read_only(path: Path) -> None:

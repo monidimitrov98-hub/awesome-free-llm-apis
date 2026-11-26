@@ -1,0 +1,33 @@
+{
+  "source": {
+    "platform": "NinjaTrader 8, Historical Data export (local installation)",
+    "files": ["MES 12-26.Last.txt", "MNQ 12-26.Last.txt"],
+    "contracts": {"MES 12-26.Last.txt": "MESZ26", "MNQ 12-26.Last.txt": "MNQZ26"},
+    "price_type": "Last (trade prices)",
+    "resolution": "1 minute",
+    "data_feed": "UNKNOWN: the NinjaTrader data connection used for the download was not recorded",
+    "export_range_note": "Export started on 2026-11-16 on purpose, to include the session that opens on Monday 2026-11-16 17:00 CT (Globex trade date 2026-11-17).",
+    "raw_files_location": "outside the repository (git-ignored inbox); byte copies are kept inside each dataset version"
+  },
+  "timezone": {
+    "value": "UTC",
+    "basis": "empirical_chart_export_comparison",
+    "explicit_export_setting": false,
+    "summary": "The export timestamps are UTC+00:00 (bar END). This was inferred from the data and confirmed by comparing a NinjaTrader chart with the export. It is NOT an explicitly configured NinjaTrader export timezone.",
+    "evidence": [
+      "User statement before import: NinjaTrader's timezone was set to (UTC+02:00) Helsinki, Kyiv, Riga, Sofia, Tallinn, Vilnius (Europe/Sofia). Windows reports FLE Standard Time; NinjaTrader Config.xml has an empty TimeZoneInfoSerializable (platform default = PC timezone).",
+      "Read as Europe/Sofia, the data puts the daily halt at 14:00-15:00 CT, the Sunday open at 15:00 CT and the Friday close at 14:00 CT: 420 bars per file fall in scheduled CME closures (pipeline result VALIDATION_FAILED, BAR_WHILE_MARKET_CLOSED).",
+      "Read as UTC with bar-end stamps, the halt is 16:00-17:00 CT, the Sunday open 17:00 CT and the Friday close 16:00 CT, exactly the CME schedule; no bar falls in a closure.",
+      "Volume spikes read as UTC fall on the 09:30 ET cash open (export 14:31), the 10:00 ET releases (export 15:01) and the 15:59 ET close (export 21:00).",
+      "Chart/export comparison by the user: the NinjaTrader 1-minute MES 12-26 chart (Europe/Sofia display) shows the 2026-11-23 cash-open spike at about 16:29-16:32; the export has it at 20261123 143100 (MES volume 10893, MNQ 12055, line 6451 in both files): a 2-hour difference.",
+      "The automated clock check of each dataset version (validation.json, clock_alignment) records which whole and half-hour shifts would leave no bar in a closure."
+    ],
+    "labelling": "bar END (close-stamped, NinjaTrader convention): the adapter shifts each timestamp back one minute to the bar open. Supported by the data: with end-stamps the first Sunday bar opens at 17:00 CT and the last Friday bar at 15:59 CT; open-stamps would put a bar at 16:00 CT, inside the halt.",
+    "limitations": [
+      "UTC, Europe/London, Europe/Lisbon and Atlantic/Reykjavik are all UTC+00:00 in November 2026, so this sample cannot tell them apart. UTC is recorded because it is what was observed. An export spanning a European DST change must be re-checked before it is ingested with this setting.",
+      "Why NinjaTrader wrote UTC while its display and the PC use Europe/Sofia is not established. Every future export must be checked the same way (the pipeline's closure and clock checks catch a 2-hour error automatically).",
+      "The original export timestamps are stored unchanged in source_ts; only the UTC bar-open column is derived."
+    ]
+  },
+  "cross_source_validation": "NOT PERFORMED: no independent second provider is available for these dates."
+}

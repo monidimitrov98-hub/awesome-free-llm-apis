@@ -1422,6 +1422,25 @@ python run_data.py readiness databento.mes.1m.cont@v1
 python run_research.py run --strategy vwap_mean_reversion --version V1-C2-SWING --dataset databento.mes.1m.cont@v1 ...
 ```
 
+## Sprint 12.1: First real NinjaTrader import (MES 12-26, MNQ 12-26)
+
+- **Datasets:** `ninjatrader.mes.1m@v1` and `ninjatrader.mnq.1m@v1` are VALIDATED, local and git-ignored.
+  Each holds 8,280 one-minute bars, covers 6 complete trade dates (2026-11-17 to 2026-11-24) and has no
+  rejected row.
+- **Timezone:** the exports are in UTC, not the Europe/Sofia display timezone. This was inferred
+  empirically and confirmed against the NinjaTrader chart, and recorded with its evidence and limitations
+  in each manifest (`config/datasets/ninjatrader_2026-11.provenance.json`).
+- **Import hardening:**
+  - a strict NinjaTrader line parser;
+  - a quarantine file of rejected rows (`rejected.csv`);
+  - changed-source detection;
+  - a clock-alignment check that names a wrong source timezone;
+  - eight separate readiness dimensions.
+- **Readiness:** NOT_READY_FOR_STRATEGY_RESEARCH. Six trade dates are far too few, and there is no
+  cross-source validation. No strategy was run.
+
+See `docs/sprint12_1_ninjatrader_import.md`.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.

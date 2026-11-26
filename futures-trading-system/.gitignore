@@ -13,3 +13,5 @@ models/
 !data/news/
 data/news/*
 !data/news/manual_calendar.json
+
+.venv312/
