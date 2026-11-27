@@ -81,6 +81,7 @@ class Dataset:
     status: str
     status_history: list[dict[str, Any]]
     conflict_state: dict[str, Any] | None = None
+    files_verified: bool = True              # False: metadata-only load (no data file was read)
 
     @property
     def ref(self) -> str:
@@ -91,10 +92,17 @@ class Dataset:
         why = usage_refusal(self.conflict_state)
         return f"{self.ref} is refused: {why}" if why else None
 
+    def _require_files(self) -> None:
+        if not self.files_verified:
+            raise DatasetError(f"{self.ref} was loaded from its manifest only: load() it (verifying every file) before "
+                               "reading its data")
+
     def bars(self) -> pd.DataFrame:
+        self._require_files()
         return schema.read_bars(self.path / "bars.csv.gz")
 
     def validation(self) -> dict[str, Any]:
+        self._require_files()
         return json.loads((self.path / "validation.json").read_text(encoding="utf-8"))
 
     def identity(self) -> dict[str, Any]:
@@ -136,6 +144,16 @@ class DatasetStore:
 
     # ------------------------------------------------------------------ load / verify
     def load(self, ref: str) -> Dataset:
+        """Load and verify a dataset: registry record, manifest self-hash and EVERY data file hash."""
+        return self._load(ref, files=True)
+
+    def load_manifest(self, ref: str) -> Dataset:
+        """METADATA-ONLY load (Sprint 13 P1.1): registry record, manifest self-hash and registry match, status and
+        conflict state. No data file is opened or hashed; the returned dataset refuses ``bars()`` and
+        ``validation()``. Used for decisions that must be taken before any data byte is read."""
+        return self._load(ref, files=False)
+
+    def _load(self, ref: str, *, files: bool) -> Dataset:
         did, ver = parse_ref(ref)
         recs = [r for r in self.records() if r["dataset_id"] == did and r["version"] == ver]
         res = [r for r in recs if r["kind"] == "reserved"]
@@ -147,7 +165,7 @@ class DatasetStore:
         if not (path / "manifest.json").is_file():
             raise DatasetError(f"dataset {ref} is registered but its folder is missing or incomplete "
                                "(run `run_data.py recover`, or restore it from backup)")
-        m = self._verify(path, res[0]["manifest_sha256"], did, ver)
+        m = self._verify(path, res[0]["manifest_sha256"], did, ver, verify_files=files)
         status = res[0]["status"]
         hist = [{"at": res[0]["at"], "status": status, "by": "ingestion", "evidence": None}]
         for r in recs:
@@ -158,9 +176,9 @@ class DatasetStore:
             conflict_state = self.conflicts.state(f"{did}@{ver}")
         except ConfigError as exc:                    # broken register or evidence: fail closed
             raise DatasetError(f"{did}@{ver}: conflict register integrity failure: {exc}") from exc
-        return Dataset(did, ver, path, m, status, hist, conflict_state)
+        return Dataset(did, ver, path, m, status, hist, conflict_state, files_verified=files)
 
-    def _verify(self, path: Path, expected_sha: str, did: str, ver: str) -> dict[str, Any]:
+    def _verify(self, path: Path, expected_sha: str, did: str, ver: str, *, verify_files: bool = True) -> dict[str, Any]:
         try:
             m = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -179,6 +197,8 @@ class DatasetStore:
         for name, sha in files.items():
             if not _FILE.match(name) or ".." in name:
                 raise DatasetError(f"{did}@{ver}: unsafe file name {name!r} in manifest")
+            if not verify_files:                      # metadata-only: no data file is opened, stat'ed or hashed
+                continue
             p = path / name
             if not p.is_file():
                 raise DatasetError(f"{did}@{ver}: file {name} is missing")

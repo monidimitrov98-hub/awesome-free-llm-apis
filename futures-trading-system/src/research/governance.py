@@ -148,6 +148,16 @@ def _evidence(target: str, strategy: str, version: str, sha: str, ev: dict[str, 
             raise GovernanceError("the ledger record of this reveal belongs to another configuration")
         if rec.get("results_fingerprint") != m.get("results_fingerprint"):
             raise GovernanceError("the run's results do not match the results recorded in the ledger at reveal time")
+        hold = (m.get("oos") or {}).get("holdout")
+        if hold:                             # Sprint 13 P1.1: a holdout result is valid only through its COMPLETED claim
+            from src.research.holdout import completed_record
+
+            if not resolve_ledger_path(ledger_path)[1]:
+                raise GovernanceError("a holdout result is checked against the canonical validation ledger only")
+            done = completed_record(hold.get("claim_id", ""))
+            if done is None or done["results"].get("results_fingerprint") != m.get("results_fingerprint") \
+                    or done["results"].get("run_manifest_sha256") != m["manifest_sha256"]:
+                raise GovernanceError("the holdout claim of this run is not COMPLETED with these exact results")
         label = rec.get("evidence")          # from the hash-chained ledger, never from an editable file
         if label != POSITIVE:
             raise GovernanceError(f"the OOS evidence is {label!r}: only {POSITIVE!r} can be called validated "
@@ -166,6 +176,15 @@ def _evidence(target: str, strategy: str, version: str, sha: str, ev: dict[str, 
             raise GovernanceError("the Monte Carlo report is not of this exact version")
         if (mc.get("run") or {}).get("manifest_sha256") != m["manifest_sha256"]:
             raise GovernanceError("the Monte Carlo report was not produced from this (verified) run")
+        hold = (m.get("oos") or {}).get("holdout")
+        if hold:                             # only the frozen, one-time final-evaluation Monte Carlo of the claim
+            from src.research.holdout import completed_record
+
+            done = completed_record(hold.get("claim_id", ""))
+            want = None if done is None else done["results"].get("monte_carlo_sha256")
+            if not want or file_sha256(Path(p)) != want:
+                raise GovernanceError("for a holdout run only the Monte Carlo report frozen in the plan and recorded in "
+                                      "its COMPLETED claim is accepted")
         cov = m.get("compliance_coverage")
         out.append({"type": "monte_carlo", "path": str(p), "sha256": file_sha256(Path(p)),
                     "mc_manifest_sha256": (mc.get("manifest") or {}).get("sha256")})

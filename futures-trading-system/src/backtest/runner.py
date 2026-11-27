@@ -71,13 +71,32 @@ def run_strategy(md: MarketData, app: AppConfig, bt: BacktestConfig, cfg: VwapPu
 
 
 def run_spec(md: MarketData, app: AppConfig, bt: BacktestConfig, spec, params, *, label: str,
-             period: Period | None = None, regime=None, explainer=None, news=None, prop_engine=None) -> StrategyRun:
+             period: Period | None = None, regime=None, explainer=None, news=None, prop_engine=None,
+             holdout_access=None) -> StrategyRun:
     """Backtest ANY registered strategy on the same event-driven engine, with the same costs, slippage,
-    NewsGuard, RiskManager, AccountGuard and (optionally) prop firm compliance engine."""
+    NewsGuard, RiskManager, AccountGuard and (optionally) prop firm compliance engine.
+
+    Holdout gate (Sprint 13 P1.1), BEFORE ``spec.prepare`` computes any feature:
+
+    * without ``holdout_access``: the market data must not contain a single bar of a reserved window (otherwise it
+      is refused, so reserved bars never reach indicators, features or the engine);
+    * with ``holdout_access`` (the one final evaluation, its claim already durably CONSUMED): the access must match
+      the ACTUAL market data - root, exact period and the verified dataset identity (reference, manifest hash,
+      bars-content hash).
+
+    After slicing, the dates actually simulated are checked again (:func:`check_simulation`)."""
+    from src.research.holdout import check_access, check_simulation, refuse_reserved_bars, simulated_span
     from src.research.registry import with_enforcement
 
     if md.contract.spec is None:
         raise ConfigError(f"No contract specification for {md.contract.root}")
+    if holdout_access is None:
+        refuse_reserved_bars(md.contract.root, md.base.index, "the backtest engine input")
+    else:
+        if period is None or period.start is None or period.end is None:
+            raise ConfigError("a final out-of-sample evaluation needs its exact claimed period")
+        check_access(holdout_access, root=md.contract.root, start=period.start, end=period.end,
+                     dataset_identity=getattr(md, "dataset_identity", None))
     prep = spec.prepare(md, app, params, regime)
     signal, execution, context = prep.signal, prep.execution, prep.context
     if period is not None:
@@ -85,6 +104,12 @@ def run_spec(md: MarketData, app: AppConfig, bt: BacktestConfig, spec, params, *
         context = {k: slice_frame(v, period) for k, v in context.items()}
         if signal.empty or execution.empty:
             raise ConfigError(f"No data inside period {period.to_dict()}")
+    spans = [s for s in (simulated_span(execution), simulated_span(signal)) if s is not None]
+    if spans:
+        sess = [s for s in (simulated_span(execution, sessions_only=True),
+                            simulated_span(signal, sessions_only=True)) if s is not None]
+        check_simulation(md.contract.root, min(s[0] for s in spans), max(s[1] for s in spans), holdout_access,
+                         session_first=min(s[0] for s in sess), session_last=max(s[1] for s in sess))
     strategy = spec.build(params, app, prep.session)
     gate = None
     regime_eff = with_enforcement(regime, prep.regime_enforcement)
@@ -127,7 +152,7 @@ def run_from_csv(csv_path: str | Path, app: AppConfig, bt: BacktestConfig, cfg: 
     Several R-multiples are run side by side for inspection only: nothing is ranked
     or selected automatically.
     """
-    md = build_market_data(csv_path, app)
+    md = build_market_data(csv_path, app, holdout_guard=True)
     values = list(r_multiples) if r_multiples else [cfg.target.r_multiple]
     runs = [run_strategy(md, app, bt, cfg.with_r_multiple(r)) for r in values]
     return md, runs

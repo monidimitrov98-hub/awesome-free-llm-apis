@@ -71,32 +71,48 @@ class ResearchEnv:
     store: Any = None                          # Sprint 12 DatasetStore (default location when None)
     _md: dict[str, Any] = field(default_factory=dict)
 
-    def market_data(self, csv: str | Path):
-        """A CSV path, or ``dataset:<id>@v<N>[#CONTRACT]`` (Sprint 12 dataset, verified on every load)."""
+    def market_data(self, csv: str | Path, *, final_access=None):
+        """A CSV path, or ``dataset:<id>@v<N>[#CONTRACT]`` (Sprint 12 dataset, verified on every load).
+
+        Holdout (Sprint 13 P1.1): for research a dataset whose MANIFEST reaches a reserved window is refused before any
+        data byte is read or hashed, and every bar set is checked for reserved bars before any indicator is computed.
+        Only the final OOS evaluation passes ``final_access`` (its claim already durably CONSUMED); it then loads the
+        bound dataset in full."""
         from src.pipeline import build_market_data
 
         if is_dataset(csv):
-            key = str(csv)
+            key = (str(csv), None if final_access is None else final_access.nonce)
             if key not in self._md:
-                ds, contract = self.dataset(csv)
+                meta, contract = self.dataset(csv)                 # manifest only
                 from src.histdata.market import market_data_from_dataset
+                from src.research import holdout as H
 
-                self._md[key] = (market_data_from_dataset(ds, self.app, contract=contract),
+                if final_access is None:
+                    H.check_dataset_meta(meta.manifest["roots"][0], meta.manifest, "research")
+                else:
+                    H.check_final_load(final_access, dataset_ref=meta.ref,
+                                       manifest_sha256=meta.manifest["manifest_sha256"])
+                ds = self.store.load(meta.ref)                     # every file verified: the first data read
+                self._md[key] = (market_data_from_dataset(ds, self.app, contract=contract,
+                                                          holdout_guard=final_access is None),
                                  ds.manifest["manifest_sha256"])
             return self._md[key]
+        if final_access is not None:
+            raise ResearchError("a final out-of-sample evaluation runs on a registered dataset, never on a CSV file")
         key = str(Path(csv).resolve())
         if key not in self._md:
-            self._md[key] = (build_market_data(csv, self.app), file_sha256(csv))
+            self._md[key] = (build_market_data(csv, self.app, holdout_guard=True), file_sha256(csv))
         return self._md[key]
 
     def dataset(self, source: str):
-        """(Dataset, contract) for a dataset source; refuses datasets that are not VALIDATED."""
+        """(Dataset, contract) for a dataset source from its MANIFEST only (no data file is read); refuses datasets
+        that are not VALIDATED or that are superseded / in an unresolved conflict."""
         from src.histdata.store import RANK, DatasetStore
 
         if self.store is None:
             self.store = DatasetStore()
         ref, _, contract = str(source)[len("dataset:"):].partition("#")
-        ds = self.store.load(ref)
+        ds = self.store.load_manifest(ref)
         if RANK[ds.status] < RANK["VALIDATED"]:
             raise ResearchError(f"dataset {ds.ref} is {ds.status}: research needs a VALIDATED dataset "
                                 "(see `run_data.py show`)")
@@ -184,7 +200,8 @@ def _trace(run) -> pd.DataFrame:
     return out
 
 
-def _execute(env: ResearchEnv, rs: Resolved, md, period: Period, *, prop_profile: str | None, bt=None):
+def _execute(env: ResearchEnv, rs: Resolved, md, period: Period, *, prop_profile: str | None, bt=None,
+             holdout_access=None):
     from src.ai.market_regime.performance import add_excursions
     from src.backtest.runner import run_spec
 
@@ -199,7 +216,7 @@ def _execute(env: ResearchEnv, rs: Resolved, md, period: Period, *, prop_profile
         prop = build_engine(bt=bt, specs={md.contract.root: md.contract.spec}, profile_id=pid, version=ver)
     run = run_spec(md, env.app, bt, rs.spec, rs.params, label=rs.label,
                    period=None if period.kind == "full" else period, regime=env.regime, news=env.news,
-                   prop_engine=prop)
+                   prop_engine=prop, holdout_access=holdout_access)
     trades = run.result.trades
     if run.regime is not None and len(run.regime.get("trades", [])):
         trades = run.regime["trades"]
@@ -267,7 +284,11 @@ def _family(env: ResearchEnv, strategy: str, instrument: str, attempt: str, p_ra
 
 
 def _refuse_revealed(env: ResearchEnv, root: str, p0: str, p1: str) -> None:
-    """Dates revealed out of sample (any configuration) can never be used for research again."""
+    """Dates revealed out of sample (any configuration) can never be used for research again, and dates inside
+    the holdout policy's blocked window (config/research/HOLDOUT.toml) are never used for research at all."""
+    from src.research.holdout import check_research
+
+    check_research(root, p0, p1, "research")
     _, records = env.ledger()
     burned = [r for r in records if r.get("type") == "oos_reveal" and r.get("instrument") == root
               and _overlap(p0, p1, r.get("start") or "1900-01-01", r.get("end") or "2262-01-01")]
@@ -307,7 +328,7 @@ def run_research(env: ResearchEnv, strategy_id: str, version: str, csv: str | Pa
     if purpose in ("oos", "oos_replay") and _oos is None:
         raise ResearchError("out-of-sample results are revealed only through reveal_oos()")
     rs = resolve(env, strategy_id, version, overrides, allow_unregistered)
-    md, data_sha = env.market_data(csv)
+    md, data_sha = env.market_data(csv, final_access=(_oos or {}).get("holdout_access"))
     if md.contract.spec is None:
         raise ResearchError(f"no contract specification for {md.contract.root}")
     root = instrument_key(md.contract.root, md.is_synthetic)
@@ -315,6 +336,15 @@ def run_research(env: ResearchEnv, strategy_id: str, version: str, csv: str | Pa
     p0, p1 = _span(period, md)
     if purpose not in ("oos", "oos_replay"):
         _refuse_revealed(env, root, p0, p1)
+    acc = (_oos or {}).get("holdout_access")
+    if acc is not None:                  # the claim's binding must match exactly what is about to run
+        from src.research.holdout import verify_binding
+
+        if purpose != "oos" or overrides or cost_sensitivity:
+            raise ResearchError("a holdout evaluation is one frozen configuration: no overrides, no extra runs")
+        verify_binding(acc, root=md.contract.root, start=p0, end=p1, strategy=strategy_id, version=rs.pv.version,
+                       version_sha256=rs.pv.sha256, params_sha256=rs.params_sha256, data_sha256=data_sha,
+                       fingerprint=(_oos or {}).get("fingerprint"))
     attempt = env.registry.start(strategy=strategy_id, version=rs.pv.version, version_sha256=rs.pv.sha256,
                                  registered=rs.pv.registered, params_sha256=rs.params_sha256, instrument=root,
                                  data_sha256=data_sha, period={"start": p0, "end": p1, "kind": period.kind,
@@ -323,7 +353,8 @@ def run_research(env: ResearchEnv, strategy_id: str, version: str, csv: str | Pa
                                  detail={"overrides": rs.overrides, "prop_profile": prop_profile,
                                          "dataset": str(csv)[len("dataset:"):] if is_dataset(csv) else None})
     try:
-        run, trades, prop = _execute(env, rs, md, period, prop_profile=prop_profile)
+        run, trades, prop = _execute(env, rs, md, period, prop_profile=prop_profile,
+                                     holdout_access=(_oos or {}).get("holdout_access"))
         dv = daily_pnl(trades).tolist()
         from src.research.stats import one_sided_p
 
@@ -669,7 +700,7 @@ def _check_plan(env: ResearchEnv, plan: str | None, strategy_id: str, version: s
     from src.histdata.store import DatasetStore
 
     p = load_plan(plan, env.app, env.store or DatasetStore())
-    mine = [d for d in p["datasets"] if d["key"] == root]
+    mine = [d for d in p["datasets"] if d["key"] == root and d.get("use", "all") in ("all", "oos")]
     if not mine:
         raise ResearchError(f"plan {plan} has no dataset for {root}")
     if not is_dataset(csv) or str(csv)[len("dataset:"):].split("#")[0] != mine[0]["ref"]:
@@ -693,10 +724,17 @@ def reveal_oos(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path
     if not code["trusted"]:
         raise ResearchError("refusing to reveal out-of-sample results from untrusted code: "
                             f"{', '.join(code['untrusted_reasons'])}. Commit your changes first.")
-    md, data_sha = env.market_data(csv)
-    root = instrument_key(md.contract.root, md.is_synthetic)
-    if is_dataset(csv) and env.dataset(csv)[0].manifest["synthetic"]:
-        raise ResearchError("a SYNTHETIC dataset is never revealed as out-of-sample evidence")
+    if is_dataset(csv):           # MANIFEST only: no data byte is read before a holdout claim is durably CONSUMED
+        meta, _ = env.dataset(csv)
+        if meta.manifest["synthetic"]:
+            raise ResearchError("a SYNTHETIC dataset is never revealed as out-of-sample evidence")
+        if len(meta.manifest["roots"]) != 1:
+            raise ResearchError(f"{meta.ref} holds roots {meta.manifest['roots']}: one root per reveal")
+        root = instrument_key(meta.manifest["roots"][0], False)
+        data_sha = meta.manifest["manifest_sha256"]
+    else:                         # a CSV file: read through the holdout guard (refused if it holds reserved bars)
+        md, data_sha = env.market_data(csv)
+        root = instrument_key(md.contract.root, md.is_synthetic)
     plan_info = _check_plan(env, plan, strategy_id, version, csv, root, start, end)
     period = _period("oos", start, end)
     led, records = env.ledger()
@@ -719,6 +757,12 @@ def reveal_oos(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path
     reveals = [r for r in records if r.get("type") == "oos_reveal" and r.get("instrument") == root
                and r.get("strategy") == strategy_id and r not in previous]
     fam = [r.get("p_raw") for r in reveals]
+    from src.research import holdout as H
+
+    if H.load_policy().touching(root, start, end):
+        return _reveal_holdout(env, rs, strategy_id, version, csv, start, end, data_sha=data_sha, root=root,
+                               plan=plan, plan_info=plan_info, period=period, led=led, records=records, fp=fp,
+                               fam=fam, code=code, prop_profile=prop_profile)
     if previous:
         rec = previous[-1]
         res = run_research(env, strategy_id, version, csv, purpose="oos_replay", start=start, end=end,
@@ -744,6 +788,94 @@ def reveal_oos(env: ResearchEnv, strategy_id: str, version: str, csv: str | Path
     return res
 
 
+def _reveal_holdout(env: ResearchEnv, rs: Resolved, strategy_id: str, version: str, csv, start: str, end: str, *,
+                    data_sha: str, root: str, plan: str | None, plan_info, period: Period, led, records, fp: str,
+                    fam: list, code: dict[str, Any], prop_profile: str | None) -> dict[str, Any]:
+    """The ONE final out-of-sample evaluation of reserved (holdout) data, through one claim of the canonical claim
+    ledger (src/research/holdout.py). Order (data-access flow):
+
+    1. metadata only: policy, plan (and its registration), dataset registry record and manifest, validation ledger
+       records, experiment attempts. No data file is opened, hashed or parsed;
+    2. claim: PREPARED, CLAIMED (anchor first, then the claim ledger, under the cross-process lock);
+    3. CONSUMED, written durably (fsync, write-through head) - BEFORE THE FIRST DATA BYTE IS READ;
+    4. the bound dataset is loaded and every file hash verified (the first read), then the strategy runs;
+    5. validation-ledger record -> run folder -> the plan-frozen Monte Carlo (once) -> COMPLETED.
+
+    A failure before step 3 aborts the claim (provably no data byte was read); from step 3 on, the claim stays
+    CONSUMED for good and the dates can never be evaluated again."""
+    from src.backtest.validation import resolve_ledger_path
+    from src.research import holdout as H
+    from src.research import holdout_ledger as HL
+
+    _, canonical = resolve_ledger_path(env.ledger_path)
+    if not canonical:
+        raise ResearchError("a holdout evaluation is recorded in the canonical validation ledger only: --ledger and "
+                            f"{'FTS_LEDGER_PATH'} cannot redirect it")
+    HL.record_validation_ledger(records[0]["record_hash"], created=False)   # bind / check its identity (anchor)
+    prior = [r for r in records if r.get("type") == "oos_reveal" and r.get("instrument") == root
+             and _overlap(start, end, r.get("start") or "1900-01-01", r.get("end") or "2262-01-01")]
+    if prior:                         # any earlier reveal of these dates: same plan, other plan, any configuration
+        raise ResearchError(f"{start}..{end} is holdout data and a final OOS evaluation of these dates was already "
+                            f"recorded (ledger seq {prior[-1].get('seq')}): the holdout is evaluated once and never "
+                            "re-run. Inspect the recorded run folder instead (run_research.py verify)")
+    if plan is None:
+        raise H.HoldoutError(f"{start}..{end} is reserved holdout data: it is revealed only by the final OOS evaluation "
+                             "of a REGISTERED plan (--plan), frozen before any result")
+    store = env.store
+    if store is None:
+        from src.histdata.store import DatasetStore
+
+        store = env.store = DatasetStore()
+    token = H.claim_final_oos(app=env.app, store=store, plan=plan, root=root, start=start, end=end,
+                              dataset_ref=plan_info["dataset"], data_sha256=data_sha, strategy=strategy_id,
+                              version=rs.pv.version, version_sha256=rs.pv.sha256, params_sha256=rs.params_sha256,
+                              fingerprint=fp)
+    try:
+        H.consume(token)                 # durable CONSUMED: from here on the reservation is used up for good
+        md, loaded = env.market_data(csv, final_access=token)       # the FIRST read of any data byte
+        if loaded != data_sha or (md.dataset_identity or {}).get("manifest_sha256") != token.get("dataset_manifest_sha256"):
+            raise H.HoldoutError("the loaded dataset is not the one bound by the claim")
+        res = run_research(env, strategy_id, version, csv, purpose="oos", start=start, end=end,
+                           prop_profile=prop_profile, write=False,
+                           _oos={"family_pvalues": fam, "holdout_access": token, "fingerprint": fp})
+        holdout_info = {"claim_id": token.claim_id, "reservation": token.get("reservation"), "plan": plan,
+                        "policy_sha256": token.get("policy_sha256"),
+                        "eval_config_sha256": token.get("eval_config_sha256")}
+        results_fp = results_fingerprint(res["run"].result.trades, res["run"].result.equity)
+        rec = led.append({"type": "oos_reveal", "source": "run_research", "instrument": root, **period.to_dict(),
+                          "data_sha256": data_sha, "fingerprint": fp, "strategy": strategy_id, "version": rs.pv.version,
+                          "version_sha256": rs.pv.sha256, "source_sha256": code["source_sha256"],
+                          "commit": code["commit"], "results_fingerprint": results_fp,
+                          "p_raw": res["evaluation"]["tests"]["p_raw"], "evidence": res["evaluation"]["evidence"],
+                          "experiments_registry": env.registry.identity(), "plan": plan_info, "holdout": holdout_info})
+        oos = {"ledger_record_hash": rec["record_hash"], "ledger_seq": rec["seq"], "replay": False, "fingerprint": fp,
+               "family_size": len(fam) + 1, "plan": plan_info, "holdout": holdout_info}
+        res["folder"] = _write(env, res, "oos", res["prop"], oos)
+        res["oos"] = oos
+        mc_sha, mc_path = None, None
+        from src.research.plans import load_plan
+
+        mc_cfg = (load_plan(plan, env.app, store).get("final_evaluation") or {}).get("monte_carlo")
+        if H.eval_config_sha256(mc_cfg) != token.get("eval_config_sha256"):
+            raise H.HoldoutError("the frozen evaluation configuration changed after the claim")
+        if mc_cfg:
+            from src.research.monte_carlo import run_report
+
+            mc_path = run_report(res["folder"], env.app, env.bt, filename="monte_carlo_final_oos.json",
+                                 final_evaluation={"token": token, "frozen": mc_cfg}, **mc_cfg)
+            mc_sha = file_sha256(mc_path)
+        manifest_sha = json.loads((res["folder"] / "manifest.json").read_text(encoding="utf-8"))["manifest_sha256"]
+        H.complete_claim(token, {"results_fingerprint": results_fp, "run_manifest_sha256": manifest_sha,
+                                 "validation_record_hash": rec["record_hash"], "monte_carlo_sha256": mc_sha,
+                                 "monte_carlo_file": None if mc_path is None else mc_path.name,
+                                 "evidence": res["evaluation"]["evidence"]})
+        res["monte_carlo"] = mc_path
+        return res
+    except BaseException as exc:
+        H.abort_unaccessed(token, f"{type(exc).__name__}: {exc}")
+        raise
+
+
 # ---------------------------------------------------------------------------------------------- comparison
 def compare(folders: list[str | Path]) -> dict[str, Any]:
     """Side-by-side comparison of runs on EQUIVALENT data (same data, instrument, period, configuration files);
@@ -754,6 +886,9 @@ def compare(folders: list[str | Path]) -> dict[str, Any]:
         v = verify_manifest(f)
         if not v["ok"]:
             raise ResearchError(f"{f}: {', '.join(v['problems'])}")
+        from src.research.holdout import check_run_record
+
+        check_run_record(v["manifest"]["instrument"], v["manifest"]["period"], "comparing a run")   # holdout results
         runs.append((Path(f), v["manifest"]))
     if len(runs) < 2:
         raise ResearchError("compare needs at least two runs")

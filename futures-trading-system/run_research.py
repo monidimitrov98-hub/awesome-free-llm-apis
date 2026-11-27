@@ -156,6 +156,20 @@ def parse_args(argv=None):
     pr.add_argument("--run", type=Path, default=None)
     pr.add_argument("--monte-carlo", type=Path, default=None)
     pr.add_argument("--shadow-report", type=Path, default=None)
+    # Sprint 13 P1.1: holdout claims (human procedures; none of them can reset a ledger or release a CONSUMED claim)
+    sub.add_parser("holdout-status", help="verify the claim ledger and its anchor; list every holdout claim")
+    hr = sub.add_parser("holdout-recover", help="HUMAN: abort a PREPARED/CLAIMED claim whose owner process is gone")
+    hr.add_argument("--claim", required=True)
+    hr.add_argument("--by", required=True)
+    hr.add_argument("--reason", required=True)
+    hp = sub.add_parser("holdout-repair", help="HUMAN: extend-only repair after an interrupted write or a rollback")
+    hp.add_argument("--by", required=True)
+    hp.add_argument("--reason", required=True)
+    hc = sub.add_parser("holdout-complete", help="HUMAN: complete a CONSUMED claim from its RECORDED run (no re-run)")
+    hc.add_argument("--claim", required=True)
+    hc.add_argument("--run", type=Path, required=True)
+    hc.add_argument("--by", required=True)
+    hc.add_argument("--reason", required=True)
     return p.parse_args(argv)
 
 
@@ -266,6 +280,8 @@ def main(argv=None) -> int:
             if a.cmd == "plan-register":
                 print(f"plan {a.plan_id} registered: its OOS segment is now reserved until the one-time reveal")
             return 0
+        if a.cmd.startswith("holdout-"):
+            return _holdout_cmd(a, app)
         if a.cmd == "compare":
             from src.research.runs import compare
 
@@ -346,38 +362,51 @@ def _write_json(out_dir: Path, name: str, obj) -> Path:
     return p
 
 
+def _holdout_cmd(a, app) -> int:
+    from src.research import holdout as H
+    from src.research import holdout_ledger as HL
+
+    if a.cmd == "holdout-status":
+        cl = HL.claims()                               # verifies both ledgers, or raises (fail-closed)
+        print(json.dumps({"claims": [{"claim_id": c["claim_id"], "state": c["state"],
+                                      "segment": [c["binding"]["root"], c["binding"]["start"], c["binding"]["end"]],
+                                      "plan": c["binding"]["plan"]} for c in cl.values()],
+                          "uncommitted": HL.uncommitted_reason()}, indent=2))
+        return 0
+    if a.cmd == "holdout-recover":
+        print(f"claim {a.claim}: {H.recover_claim(a.claim, by=a.by, reason=a.reason)}")
+        return 0
+    if a.cmd == "holdout-repair":
+        done = HL.repair(by=a.by, reason=a.reason)
+        print("\n".join(done) if done else "nothing to repair: both ledgers verify")
+        from src.backtest.validation import CANONICAL_LEDGER, ValidationLedger
+
+        if ValidationLedger(CANONICAL_LEDGER).exists():
+            for line in ValidationLedger(CANONICAL_LEDGER).recover_head():
+                print(f"canonical validation ledger: {line}")
+        return 0
+    if a.cmd == "holdout-complete":
+        from src.backtest.validation import CANONICAL_LEDGER, ValidationLedger
+
+        rec = H.complete_consumed_claim(a.claim, a.run, app=app, bt=load_backtest_config(a.backtest_config),
+                                        validation_records=ValidationLedger(CANONICAL_LEDGER).records(), by=a.by,
+                                        reason=a.reason)
+        print(f"claim {a.claim}: COMPLETED from its recorded run (record {rec['seq']})")
+        return 0
+    raise ConfigError(f"unknown holdout command {a.cmd}")
+
+
 def _monte_carlo(a, app) -> int:
-    import pandas as pd
+    from src.research.monte_carlo import run_report
 
-    from src.research.monte_carlo import METHODS, simulate
-    from src.research.runs import _jsonable, verify_manifest
-
-    v = verify_manifest(a.run)
-    if not v["ok"]:
-        raise ConfigError(f"run folder failed verification: {', '.join(v['problems'])}")
-    m = v["manifest"]
-    trades = pd.read_csv(a.run / "trades.csv")
-    root = m["instrument"].split(":")[0]
-    spec = app.contracts[root]
-    profile, operational = None, False
-    if m.get("prop"):
-        from src.risk.prop_firms.versions import Registry, operational_state
-
-        pid, _, ver = m["prop"]["profile"].partition("@")
-        profile = Registry().get(pid, ver)
-        if profile.sha256 != m["prop"]["sha256"]:
-            raise ConfigError("the run's prop profile file has changed since the run")
-        operational = bool(operational_state(profile)["operational"])
     bt = load_backtest_config(a.backtest_config)
-    rep = simulate(trades, capital=bt.initial_capital, tick_value=spec.tick_value,
-                   methods=tuple(a.methods) if a.methods else METHODS, n_paths=a.paths, seed=a.seed,
-                   ruin_loss=a.ruin_loss, drawdown_levels=tuple(a.drawdown_levels), block=a.block,
-                   profile=profile, profile_operational=operational)
-    rep["strategy"] = m["strategy"]
-    rep["run"] = {"folder": str(a.run), "manifest_sha256": json.loads((a.run / "manifest.json").read_text())["manifest_sha256"],
-                  "purpose": m["purpose"], "instrument": m["instrument"], "period": m["period"]}
-    out = a.run / f"monte_carlo_seed{a.seed}_paths{a.paths}.json"
-    out.write_text(json.dumps(_jsonable(rep), indent=2, default=str), encoding="utf-8")
+    try:
+        # standalone Monte Carlo: refused for any run touching the holdout (only the frozen final evaluation may)
+        out = run_report(a.run, app, bt, methods=a.methods, paths=a.paths, seed=a.seed, ruin_loss=a.ruin_loss,
+                         drawdown_levels=a.drawdown_levels, block=a.block)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    rep = json.loads(out.read_text(encoding="utf-8"))
     hist = rep.get("historical", {})
     print(f"Monte Carlo written to {out}")
     print(f"historical: final {hist.get('final_pnl')}, max DD {hist.get('max_drawdown')}")

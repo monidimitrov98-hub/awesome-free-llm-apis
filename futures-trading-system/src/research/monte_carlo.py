@@ -287,4 +287,107 @@ def simulate(trades: pd.DataFrame, *, capital: float, tick_value: float, methods
     return result
 
 
-__all__ = ["simulate", "CostScenario", "DEFAULT_SCENARIOS", "METHODS", "prop_rules", "trades_sha256", "repriced"]
+MC_CONFIG_KEYS = ("methods", "paths", "seed", "ruin_loss", "drawdown_levels", "block")
+
+
+def check_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Validate a frozen Monte Carlo configuration (plan ``[final_evaluation.monte_carlo]``); returns it normalised."""
+    if not isinstance(cfg, dict) or set(cfg) - set(MC_CONFIG_KEYS) or "seed" not in cfg or "paths" not in cfg:
+        raise ValueError(f"monte_carlo needs seed and paths and only the keys {MC_CONFIG_KEYS}")
+    out: dict[str, Any] = {}
+    methods = cfg.get("methods") or list(METHODS)
+    if not isinstance(methods, list) or not methods or any(m not in METHODS for m in methods):
+        raise ValueError(f"monte_carlo.methods must be a non-empty subset of {METHODS}")
+    out["methods"] = list(methods)
+    for k in ("paths", "seed"):
+        if not isinstance(cfg[k], int) or isinstance(cfg[k], bool):
+            raise ValueError(f"monte_carlo.{k} must be an integer")
+    if not 1 <= cfg["paths"] <= 200_000:
+        raise ValueError("monte_carlo.paths must be in [1, 200000]")
+    out["paths"], out["seed"] = cfg["paths"], cfg["seed"]
+    rl = cfg.get("ruin_loss")
+    if rl is not None and (not isinstance(rl, (int, float)) or isinstance(rl, bool) or rl <= 0):
+        raise ValueError("monte_carlo.ruin_loss must be a positive number")
+    out["ruin_loss"] = None if rl is None else float(rl)
+    dl = cfg.get("drawdown_levels") or []
+    if not isinstance(dl, list) or any(not isinstance(x, (int, float)) or isinstance(x, bool) or x <= 0 for x in dl):
+        raise ValueError("monte_carlo.drawdown_levels must be a list of positive numbers")
+    out["drawdown_levels"] = [float(x) for x in dl]
+    bl = cfg.get("block")
+    if bl is not None and (not isinstance(bl, int) or isinstance(bl, bool) or bl < 1):
+        raise ValueError("monte_carlo.block must be a positive integer")
+    out["block"] = bl
+    return out
+
+
+def run_report(folder, app, bt, *, methods=None, paths: int = 2000, seed: int = 20261125, ruin_loss=None,
+               drawdown_levels=(), block=None, filename: str | None = None, final_evaluation=None):
+    """Monte Carlo report of a verified research run folder, written into the folder; returns its path.
+
+    Holdout (Sprint 13 P1.1): a run whose period touches a reserved window is refused, EXCEPT as the frozen
+    component of its own final OOS evaluation: ``final_evaluation`` must then be the live final-OOS access of that
+    run's claim (CONSUMED, issued in this process), and the configuration must be the one frozen by the plan."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    from src.research.runs import _jsonable, verify_manifest
+
+    folder = _Path(folder)
+    v = verify_manifest(folder)
+    if not v["ok"]:
+        raise ValueError(f"run folder failed verification: {', '.join(v['problems'])}")
+    m = v["manifest"]
+    from src.research import holdout as H
+
+    if final_evaluation is None:
+        H.check_run_record(m["instrument"], m["period"], "Monte Carlo of a run")      # standalone: never on holdout
+        fe = None
+    else:
+        claim = ((m.get("oos") or {}).get("holdout") or {}).get("claim_id")
+        if final_evaluation.get("recovery") is H._RECOVERY:       # complete_consumed_claim only (owner gone, CONSUMED)
+            c = final_evaluation["claim"]
+            cid, cfg_sha = c["claim_id"], c["binding"]["eval_config_sha256"]
+            if c["state"] != "CONSUMED" or claim != cid:
+                raise H.HoldoutError("the recovery Monte Carlo belongs to its own CONSUMED claim only")
+        else:
+            tok = final_evaluation.get("token")
+            e = H._entry(tok)
+            if e["state"] != "consumed" or claim != tok.claim_id:
+                raise H.HoldoutError("the final-evaluation Monte Carlo belongs to its own open claim only")
+            cid, cfg_sha = tok.claim_id, tok.get("eval_config_sha256")
+        frozen = check_config(dict(final_evaluation.get("frozen") or {}))
+        asked = check_config({"methods": list(methods) if methods else list(METHODS), "paths": paths, "seed": seed,
+                              "ruin_loss": ruin_loss, "drawdown_levels": list(drawdown_levels), "block": block})
+        if frozen != asked or H.eval_config_sha256(final_evaluation.get("frozen")) != cfg_sha:
+            raise H.HoldoutError("the Monte Carlo configuration is not the one frozen before the reveal")
+        if final_evaluation.get("recovery") is not H._RECOVERY:
+            H.mark_monte_carlo(tok)                                  # at most once per claim
+        fe = {"claim_id": cid, "frozen_config": frozen, "eval_config_sha256": cfg_sha}
+    trades = pd.read_csv(folder / "trades.csv")
+    root = m["instrument"].split(":")[0]
+    spec = app.contracts[root]
+    profile, operational = None, False
+    if m.get("prop"):
+        from src.risk.prop_firms.versions import Registry, operational_state
+
+        pid, _, ver = m["prop"]["profile"].partition("@")
+        profile = Registry().get(pid, ver)
+        if profile.sha256 != m["prop"]["sha256"]:
+            raise ValueError("the run's prop profile file has changed since the run")
+        operational = bool(operational_state(profile)["operational"])
+    rep = simulate(trades, capital=bt.initial_capital, tick_value=spec.tick_value,
+                   methods=tuple(methods) if methods else METHODS, n_paths=paths, seed=seed, ruin_loss=ruin_loss,
+                   drawdown_levels=tuple(drawdown_levels), block=block, profile=profile,
+                   profile_operational=operational)
+    rep["strategy"] = m["strategy"]
+    rep["run"] = {"folder": str(folder), "manifest_sha256": _json.loads((folder / "manifest.json").read_text())["manifest_sha256"],
+                  "purpose": m["purpose"], "instrument": m["instrument"], "period": m["period"]}
+    if fe is not None:
+        rep["final_evaluation"] = fe
+    out = folder / (filename or f"monte_carlo_seed{seed}_paths{paths}.json")
+    out.write_text(_json.dumps(_jsonable(rep), indent=2, default=str), encoding="utf-8")
+    return out
+
+
+__all__ = ["simulate", "CostScenario", "DEFAULT_SCENARIOS", "METHODS", "prop_rules", "trades_sha256", "repriced",
+           "run_report", "check_config", "MC_CONFIG_KEYS"]

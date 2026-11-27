@@ -161,8 +161,10 @@ def test_monte_carlo_refuses_bad_parameters_and_handles_no_trades():
 # ============================================================================ research runs
 def test_every_attempt_is_recorded_including_failures(env):
     with pytest.raises(ConfigError):
-        R.run_research(env, "vwap_mean_reversion", "V1-C2-SWING", MNQ, purpose="train", start="2030-01-01",
-                       end="2030-01-31")                                  # no data in the period: fails AFTER start
+        R.run_research(env, "vwap_mean_reversion", "V1-C2-SWING", MNQ, purpose="train", start="2024-01-01",
+                       end="2024-01-31")                                  # no data in the period: fails AFTER start
+        # (Sprint 13 P1.1: the empty period moved from 2030 to 2024; 2030 is inside the MES/MNQ holdout, whose guard
+        # refuses the request BEFORE an attempt is recorded. The sample data covers 2025-03 only.)
     r = R.run_research(env, "vwap_mean_reversion", "V1-C2-SWING", MNQ, purpose="train", start="2025-03-10",
                        end="2025-03-14")
     att = env.registry.attempts()

@@ -164,11 +164,22 @@ def main(argv: list[str] | None = None) -> int:
         news = load_setup(news_cfg, args.news_calendar) if news_cfg.enabled else None
         texts = read_config_texts(Path(args.settings), Path(args.backtest_config), Path(args.strategy_config),
                                   Path(args.regime_config), news)
-        md = build_market_data(args.csv, app)
+        md = build_market_data(args.csv, app, holdout_guard=True)   # refused if the file holds reserved bars
         data_hash = file_sha256(args.csv)
         code = code_identity()
         r_values = args.r_multiples or [strat.target.r_multiple]
         periods = _plan(args, md.frames[strat.execution_timeframe])
+        # Holdout (Sprint 13 P1.1): refuse BEFORE anything runs or is written to the ledger. run_backtest.py never
+        # evaluates holdout data, not even as its legacy out-of-sample period: the one-time final evaluation of
+        # reserved data is `run_research.py reveal-oos --plan` only. (run_spec re-checks the simulated bars.)
+        from src.research.holdout import check_research, simulated_span
+
+        span = simulated_span(md.frames[strat.execution_timeframe])
+        if span is not None:
+            for p in periods:
+                d = p.to_dict()
+                check_research(md.contract.root, d["start"] or span[0], d["end"] or span[1],
+                               f"run_backtest.py period {p.label}")
         oos_periods = [p for p in periods if p.is_out_of_sample]
         if oos_periods and args.news_compare:
             raise ConfigError("--news-compare evaluates several configurations; use it in-sample only")

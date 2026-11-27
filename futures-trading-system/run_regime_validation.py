@@ -109,7 +109,13 @@ def main(argv=None) -> int:
     kw = dict(ema_fast=sc.ema_fast_col, ema_slow=sc.ema_slow_col, atr_col=sc.atr_col, rsi_col=sc.rsi_col)
     summary = {}
     for path, truth in inputs:
-        md = build_market_data(path, app)
+        from src.research.holdout import HoldoutError
+
+        try:     # generated SYNTHETIC regime data never contains market bars; any input file goes through the guard
+            md = build_market_data(path, app, holdout_guard=not args.synthetic_sessions)
+        except HoldoutError as exc:
+            print(f"Error: regime classifier development: {exc}", file=sys.stderr)
+            return 1
         sha = file_sha256(path)
         key = instrument_key(md.contract.root, md.is_synthetic)
         ident = model_identity(rc, {key: sha}, code["source_sha256"])

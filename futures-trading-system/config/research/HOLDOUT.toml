@@ -1,0 +1,34 @@
+# Final out-of-sample HOLDOUT policy (Sprint 13 P1.1). Git-tracked: every change is visible in history.
+#
+# Reserved data is never used for training, strategy development, parameter selection, repeated experiments,
+# sweeps, walk-forward, cross-validation, standalone Monte Carlo or comparisons. It is used ONCE, by the final
+# OOS evaluation of a registered (frozen) plan whose OOS segment lies entirely inside the reservation
+# (`run_research.py reveal-oos --plan`), through one claim of the canonical claim ledger
+# (config/research/holdout_ledger.jsonl): PREPARED -> CLAIMED -> CONSUMED -> COMPLETED, or ABORTED only before any
+# reserved data was read. A frozen Monte Carlo (plan [final_evaluation.monte_carlo]) may run inside that claim.
+# Data-quality work (ingestion, validation, remediation, conflict analysis, readiness) stays allowed: it computes
+# no strategy outcome.
+#
+# Embargo: `embargo_trade_dates` TRADING dates before `start` are blocked for training / validation too. Trading
+# dates are counted conservatively: weekends and every rule-based US holiday candidate count as CLOSED (no CME
+# holiday is officially verified in this project; treating a candidate as closed can only move the embargo earlier).
+# For start 2026-01-01 and 10 dates the blocked window starts 2025-12-17 (Christmas 2025-12-25 is not counted).
+#
+# Enforcement is fail-closed: if this file is missing, malformed or lists no reservation, every guarded research and
+# backtest operation is refused (src/research/holdout.py). FTS_HOLDOUT_EXTRA may only ADD reservations.
+#
+# Changing this file needs a new [policy] version and a recorded human decision.
+
+[policy]
+id = "final-oos-holdout"
+version = 2
+approved_on = "2026-11-27"
+approval = "Sprint 13 P1.1: reserve all MES and MNQ data from 2026-01-01 onward, open-ended; v2: embargo counted in trading dates (2025-12-17)"
+
+[[reservations]]
+id = "mes-mnq-2026"
+instruments = ["MES", "MNQ"]
+start = "2026-01-01"
+end = ""                         # open-ended
+embargo_trade_dates = 10         # trading dates before `start` that training / validation may not use either
+access = "final_oos_only"

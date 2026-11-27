@@ -1458,6 +1458,38 @@ See `docs/sprint12_1_ninjatrader_import.md`.
 
 See `docs/sprint13_p0_rollover_conflicts.md`.
 
+## Sprint 13 P1.1: Final out-of-sample holdout
+
+- `config/research/HOLDOUT.toml` (Git-tracked, version 2) reserves **all MES and MNQ data from 2026-01-01,
+  open-ended**. Training and validation are blocked from **2025-12-17** by a 10-trading-date embargo. Weekends
+  and every unverified holiday candidate count as closed.
+- **Refused:** training, development, sweeps, walk-forward, purged CV, standalone Monte Carlo, comparisons,
+  `run_backtest.py`, regime-classifier fitting and any plan whose research segments touch the window.
+  `run_spec` re-checks the bars actually simulated.
+- **Allowed once:** the final evaluation through `run_research.py reveal-oos --plan P`, where P is a registered
+  holdout plan. It runs through one claim of the canonical, Git-tracked claim ledger
+  (`config/research/holdout_ledger.jsonl`):
+  - the lifecycle is PREPARED → CLAIMED → CONSUMED → COMPLETED;
+  - everything before CONSUMED uses manifests and metadata only, and CONSUMED is durable **before the first data
+    byte is read**;
+  - a claim is ABORTED only before that point, and a crash afterwards never releases it;
+  - every transition is mirrored first to a git-ignored anchor (`validation_history/holdout_anchor.jsonl`), so a
+    Git checkout, restore, reset or stash of the claim ledger fails closed until `holdout-repair` replays it;
+  - new claims wait until the previous claim records are committed.
+- **Research never computes on reserved bars.** A dataset whose manifest reaches the window is refused before any
+  byte is read. CSV inputs with reserved bars are refused before any indicator, and `run_spec` refuses them before
+  `spec.prepare`.
+- **Access tokens** are single-use and bound to the plan, dataset hash, strategy version, policy hash, exact
+  segment and frozen evaluation configuration. The plan may freeze a one-time Monte Carlo
+  (`[final_evaluation.monte_carlo]`, seed included), whose report hash goes into the claim.
+- **Cross-process locks** guard every claim and ledger write.
+- **Fail-closed:** a missing or broken policy or claim ledger refuses every guarded operation.
+  `FTS_HOLDOUT_EXTRA` can only add reservations.
+- **Allowed:** data-quality work (ingestion, validation, readiness, conflicts).
+- **Not guarded:** paper and shadow replay (out of scope).
+
+See `docs/sprint13_p1_1_holdout.md`.
+
 ## Known limitations
 
 - No exchange holiday or early-close calendar. Missing whole sessions are not reported.

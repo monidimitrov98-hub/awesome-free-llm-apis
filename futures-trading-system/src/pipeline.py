@@ -29,6 +29,8 @@ class MarketData:
     report: DataQualityReport
     is_synthetic: bool = False
     notes: list[str] = field(default_factory=list)
+    # Sprint 13 P1.1: identity of the verified dataset the bars came from (None for a CSV file)
+    dataset_identity: dict | None = None
 
 
 def _is_synthetic_file(path: Path) -> bool:
@@ -45,7 +47,7 @@ def _is_synthetic_file(path: Path) -> bool:
     return False
 
 
-def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
+def build_market_data(csv_path: str | Path, config: AppConfig, *, holdout_guard: bool = False) -> MarketData:
     """Run the full market data pipeline on one CSV file.
 
     Steps: load -> UTC timestamps -> contract identification -> validation ->
@@ -62,6 +64,10 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
     Raises:
         DataValidationError: If validation finds errors and ``data.on_error == "raise"``.
         DataError: For unreadable files, unknown contracts or unusable data.
+
+    ``holdout_guard`` (Sprint 13 P1.1, research and backtest callers): after the file is read (a data-quality
+    read) and BEFORE validation, resampling or any indicator, a file containing bars of a reserved holdout
+    window is refused (src/research/holdout.py).
     """
     path = Path(csv_path)
     dcfg = config.data
@@ -105,13 +111,21 @@ def build_market_data(csv_path: str | Path, config: AppConfig) -> MarketData:
         )
 
     return build_market_data_from_bars(df, config, contract=contract, contract_source=source, report=report,
-                                       is_synthetic=is_synthetic, notes=notes)
+                                       is_synthetic=is_synthetic, notes=notes, holdout_guard=holdout_guard)
 
 
 def build_market_data_from_bars(df: pd.DataFrame, config: AppConfig, *, contract: ContractInfo, contract_source: str,
-                                report: DataQualityReport, is_synthetic: bool, notes: list[str]) -> MarketData:
+                                report: DataQualityReport, is_synthetic: bool, notes: list[str],
+                                holdout_guard: bool = False, dataset_identity: dict | None = None) -> MarketData:
     """Validation -> optional out-of-session removal -> resampling -> indicators, for bars that are already
-    loaded with a UTC index (a CSV via :func:`build_market_data`, or a Sprint 12 dataset)."""
+    loaded with a UTC index (a CSV via :func:`build_market_data`, or a Sprint 12 dataset).
+
+    ``holdout_guard``: refuse bars of a reserved holdout window FIRST, before any validation, resampling or
+    indicator computation (Sprint 13 P1.1)."""
+    if holdout_guard:
+        from src.research.holdout import refuse_reserved_bars
+
+        refuse_reserved_bars(contract.root, df.index, "the input")
     dcfg = config.data
     # Validation.
     session = config.session
@@ -166,6 +180,7 @@ def build_market_data_from_bars(df: pd.DataFrame, config: AppConfig, *, contract
         report=report,
         is_synthetic=is_synthetic,
         notes=notes,
+        dataset_identity=dataset_identity,
     )
 
 

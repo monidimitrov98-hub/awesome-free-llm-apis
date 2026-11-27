@@ -17,7 +17,10 @@ from src.histdata.store import Dataset
 from src.pipeline import MarketData, build_market_data_from_bars
 
 
-def market_data_from_dataset(ds: Dataset, app: AppConfig, *, contract: str | None = None) -> MarketData:
+def market_data_from_dataset(ds: Dataset, app: AppConfig, *, contract: str | None = None,
+                             holdout_guard: bool = True) -> MarketData:
+    """``holdout_guard`` (default on): bars of a reserved holdout window are refused before any computation. Only
+    the final OOS evaluation, after its claim is durably CONSUMED, loads with the guard off (src/research/runs.py)."""
     m = ds.manifest
     if m["adjustment"] != "none":
         raise ConfigError(f"{ds.ref} is {m['adjustment']}-adjusted: refused for simulation (fills, ticks and P&L "
@@ -53,8 +56,11 @@ def market_data_from_dataset(ds: Dataset, app: AppConfig, *, contract: str | Non
     if m["kind"] == "continuous":
         report.add("warning", "CONTINUOUS_UNADJUSTED", f"continuous unadjusted series: prices jump at the "
                    f"{m['lineage']['rolls']} roll(s) listed in rolls.csv; bars are real contract prices")
+    ident = {"ref": ds.ref, "manifest_sha256": m["manifest_sha256"], "bars_content_sha256": m["bars_content_sha256"],
+             "files_verified": ds.files_verified}
     return build_market_data_from_bars(df, app, contract=info, contract_source=source, report=report,
-                                       is_synthetic=bool(m["synthetic"]), notes=notes)
+                                       is_synthetic=bool(m["synthetic"]), notes=notes, holdout_guard=holdout_guard,
+                                       dataset_identity=ident)
 
 
 __all__ = ["market_data_from_dataset"]

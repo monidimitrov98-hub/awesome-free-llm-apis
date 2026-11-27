@@ -177,21 +177,94 @@ class ValidationLedger:
     def exists(self) -> bool:
         return self.path.exists() or self.head_path.exists()
 
+    @property
+    def lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
+    def is_canonical(self) -> bool:
+        return self.path.resolve() == Path(CANONICAL_LEDGER).resolve()
+
     def initialise(self, note: str = "") -> None:
-        if self.exists():
-            raise LedgerError(f"Ledger already exists at {self.path}; refusing to overwrite it")
+        """Create a NEW ledger. The CANONICAL ledger can be created once only (Sprint 13 P1.1): its identity is recorded
+        in the holdout anchor, and re-initialising it after a deletion (which would erase its audit history) is
+        refused - restore it from backup instead."""
+        from src.backtest.filelock import exclusive
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        genesis = {"seq": 0, "type": "genesis", "prev_hash": "0" * 64, "note": note,
-                   "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        genesis["record_hash"] = _record_hash(genesis)
-        with self.path.open("x", encoding="utf-8", newline="\n") as fh:
-            fh.write(_canonical_json(genesis) + "\n")
-        self._write_head(1, genesis["record_hash"])
+        with exclusive(self.lock_path):
+            if self.exists():
+                raise LedgerError(f"Ledger already exists at {self.path}; refusing to overwrite it")
+            anchored = False
+            if self.is_canonical():
+                from src.research import holdout_ledger as HL
+
+                anchored = HL.anchor_present()        # this machine's anchor is authoritative when it exists
+                if anchored:
+                    try:
+                        known = HL.validation_ledger_genesis()
+                    except HL.HoldoutLedgerError as exc:
+                        raise LedgerError(f"the canonical validation ledger cannot be created: {exc}") from exc
+                    if known is not None:
+                        raise LedgerError("the canonical validation ledger existed before (its identity is recorded in "
+                                          "the holdout anchor) and was deleted: it is never re-initialised. Restore it "
+                                          "from backup")
+            genesis = {"seq": 0, "type": "genesis", "prev_hash": "0" * 64, "note": note,
+                       "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            genesis["record_hash"] = _record_hash(genesis)
+            with self.path.open("x", encoding="utf-8", newline="\n") as fh:
+                fh.write(_canonical_json(genesis) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            self._write_head(1, genesis["record_hash"])
+            if anchored:
+                HL.record_validation_ledger(genesis["record_hash"], created=True)
 
     def _write_head(self, count: int, last_hash: str) -> None:
         tmp = self.head_path.with_name(self.head_path.name + ".tmp")
-        tmp.write_text(_canonical_json({"count": count, "last_hash": last_hash}), encoding="utf-8")
-        os.replace(tmp, self.head_path)
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(_canonical_json({"count": count, "last_hash": last_hash}))
+            fh.flush()
+            os.fsync(fh.fileno())
+        from src.backtest.filelock import durable_replace
+
+        durable_replace(tmp, self.head_path)
+
+    def recover_head(self) -> list[str]:
+        """HUMAN, extend-only recovery after an interrupted append (Sprint 13 P1.1): a head that lags a fully verified
+        chain is moved forward; an incomplete last line is moved to a side file (preserved). Anything that would need
+        a verified record to be discarded is refused. Never re-initialises."""
+        from src.backtest.filelock import exclusive
+
+        report: list[str] = []
+        with exclusive(self.lock_path):
+            if not self.path.exists() or not self.head_path.exists():
+                raise LedgerError(f"Ledger incomplete at {self.path}: restore it from backup (never re-initialised)")
+            data = self.path.read_bytes()
+            cut = data.rfind(b"\n") + 1
+            if cut < len(data):
+                keep = self.path.with_name(f"{self.path.name}.partial-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}")
+                keep.write_bytes(data[cut:])
+                with self.path.open("r+b") as fh:
+                    fh.truncate(cut)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                report.append(f"incomplete last line ({len(data) - cut} bytes) preserved in {keep.name}")
+            recs, prev = [], "0" * 64
+            for i, line in enumerate(self.path.read_text(encoding="utf-8").splitlines()):
+                rec = json.loads(line)
+                if rec.get("seq") != i or rec.get("prev_hash") != prev or rec.get("record_hash") != _record_hash(rec):
+                    raise LedgerError(f"Ledger {self.path} record {i} fails verification: not repairable, restore it")
+                prev = rec["record_hash"]
+                recs.append(rec)
+            head = json.loads(self.head_path.read_text(encoding="utf-8"))
+            n = head.get("count")
+            if not isinstance(n, int) or n < 1 or n > len(recs) or head.get("last_hash") != recs[n - 1]["record_hash"]:
+                raise LedgerError("the ledger head is not a prefix of its records: not repairable, restore from backup")
+            if n < len(recs):
+                self._write_head(len(recs), recs[-1]["record_hash"])
+                report.append(f"head moved forward from {n} to {len(recs)} verified records")
+        self.records()
+        return report
 
     def records(self) -> list[dict[str, Any]]:
         """Verify the whole ledger and return its records (raises LedgerError on any problem)."""
@@ -227,15 +300,20 @@ class ValidationLedger:
         return records
 
     def append(self, record: dict[str, Any]) -> dict[str, Any]:
-        records = self.records()  # verify before writing
-        rec = dict(record, seq=len(records), prev_hash=records[-1]["record_hash"],
-                   time=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-        rec["record_hash"] = _record_hash(rec)
-        with self.path.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(_canonical_json(rec) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        self._write_head(len(records) + 1, rec["record_hash"])
+        """Append under a cross-process lock (Sprint 13 P1.1): concurrent writers are serialised, and the whole
+        ledger is re-verified INSIDE the lock, so two processes can never write the same sequence number."""
+        from src.backtest.filelock import exclusive
+
+        with exclusive(self.lock_path):
+            records = self.records()  # verify before writing
+            rec = dict(record, seq=len(records), prev_hash=records[-1]["record_hash"],
+                       time=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            rec["record_hash"] = _record_hash(rec)
+            with self.path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(_canonical_json(rec) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            self._write_head(len(records) + 1, rec["record_hash"])
         return rec
 
 

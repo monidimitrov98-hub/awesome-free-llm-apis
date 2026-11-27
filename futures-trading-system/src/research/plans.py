@@ -24,6 +24,13 @@ Rules: segments are chronological and separated by at least the purge / embargo 
 is VALIDATED or better, unadjusted, and its manifest hash is pinned; every strategy version is registered
 and unmodified; registration is append-only. Once registered, the OOS segment of each instrument is
 RESERVED: no research attempt may touch it, and it can be revealed only through the plan, once.
+
+Holdout (Sprint 13 P1.1, ``config/research/HOLDOUT.toml``): for a reserved instrument the train and validation
+segments must end before the holdout's blocked window (reservation start minus its embargo). The OOS segment
+must lie either entirely before that window (an ordinary plan) or entirely inside the reservation (the final
+holdout plan); a partial overlap, or an OOS segment inside the embargo, is refused. A holdout plan may freeze its
+final evaluation's Monte Carlo settings (and seed) in ``[final_evaluation.monte_carlo]``; it then runs once, inside
+the holdout claim, on the revealed trades only (src/research/runs.py ``_reveal_holdout``).
 """
 
 from __future__ import annotations
@@ -98,8 +105,9 @@ def parse_plan(path: Path, app, store) -> dict[str, Any]:
         raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"cannot read plan {path}: {exc}") from exc
-    if set(raw) - {"plan", "datasets", "segments", "frozen"}:
-        raise ConfigError(f"unknown plan section(s) {sorted(set(raw) - {'plan', 'datasets', 'segments', 'frozen'})}")
+    sections = {"plan", "datasets", "segments", "frozen", "final_evaluation"}
+    if set(raw) - sections:
+        raise ConfigError(f"unknown plan section(s) {sorted(set(raw) - sections)}")
     pid = (raw.get("plan") or {}).get("id", "")
     if not _ID.match(pid) or Path(path).stem != pid:
         raise ConfigError("[plan] id must be a valid id equal to the file name")
@@ -116,7 +124,12 @@ def parse_plan(path: Path, app, store) -> dict[str, Any]:
         raise ConfigError(f"segment gaps ({gap1}, {gap2} trade dates) are smaller than purge {purge} / embargo {embargo}")
     datasets = []
     for d in raw.get("datasets") or []:
-        ds = store.load(d.get("ref", ""))
+        if not isinstance(d, dict) or set(d) - {"instrument", "ref", "manifest_sha256", "use"}:
+            raise ConfigError(f"malformed [[datasets]] entry {d!r}")
+        use = d.get("use", "all")
+        if use not in ("all", "research", "oos"):
+            raise ConfigError(f"[[datasets]] use must be all | research | oos, not {use!r}")
+        ds = store.load_manifest(d.get("ref", ""))     # metadata only: no data byte is read at plan time
         if ds.manifest["manifest_sha256"] != d.get("manifest_sha256"):
             raise ConfigError(f"{ds.ref}: manifest hash differs from the plan (dataset substituted)")
         if RANK[ds.status] < RANK["VALIDATED"]:
@@ -129,14 +142,46 @@ def parse_plan(path: Path, app, store) -> dict[str, Any]:
         if d.get("instrument") not in ds.manifest["roots"]:
             raise ConfigError(f"{ds.ref} does not contain {d.get('instrument')}")
         first, last = pd.Timestamp(ds.manifest["first_bar_utc"]), pd.Timestamp(ds.manifest["last_bar_utc"])
-        if first.tz_localize(None).normalize() > tr[0] or last.tz_localize(None).normalize() < oo[1]:
-            raise ConfigError(f"{ds.ref} ({first.date()}..{last.date()}) does not cover the plan "
-                              f"({tr[0].date()}..{oo[1].date()})")
+        need = {"all": (tr[0], oo[1]), "research": (tr[0], va[1]), "oos": (oo[0], oo[1])}[use]
+        if first.tz_localize(None).normalize() > need[0] or last.tz_localize(None).normalize() < need[1]:
+            raise ConfigError(f"{ds.ref} ({first.date()}..{last.date()}) does not cover the plan's {use} segments "
+                              f"({need[0].date()}..{need[1].date()})")
         datasets.append({"instrument": d["instrument"], "ref": ds.ref, "manifest_sha256": d["manifest_sha256"],
                          "key": instrument_key(d["instrument"], ds.manifest["synthetic"]),
-                         "synthetic": ds.manifest["synthetic"]})
+                         "synthetic": ds.manifest["synthetic"], "use": use, "manifest": ds.manifest})
     if not datasets:
         raise ConfigError("a plan needs at least one dataset")
+    for key in {x["key"] for x in datasets}:
+        mine = [x for x in datasets if x["key"] == key]
+        if sum(x["use"] in ("all", "research") for x in mine) != 1 or sum(x["use"] in ("all", "oos") for x in mine) != 1:
+            raise ConfigError(f"{key}: a plan needs exactly one dataset for the research segments and one for the OOS "
+                              "segment (use = all, or one research + one oos)")
+    from src.research.holdout import check_dataset_meta, check_plan
+
+    f0 = lambda t: str(t.date())  # noqa: E731
+    holdout = {}
+    for x in datasets:          # research segments before the blocked window; OOS before it or entirely inside
+        h = check_plan(x["instrument"], [f0(tr[0]), f0(tr[1])], [f0(va[0]), f0(va[1])], [f0(oo[0]), f0(oo[1])])
+        if h:
+            holdout[x["key"]] = h
+    for x in datasets:          # research must be able to read its dataset without touching reserved bars
+        if x["key"] in holdout and x["use"] != "oos":
+            check_dataset_meta(x["instrument"], x["manifest"], f"plan dataset {x['ref']} (use {x['use']})")
+    for x in datasets:
+        x.pop("manifest")
+    final: dict[str, Any] = {}
+    fe = raw.get("final_evaluation")
+    if fe is not None:                   # frozen with the plan (its SHA-256 covers it) BEFORE any result is seen
+        if not isinstance(fe, dict) or set(fe) - {"monte_carlo"}:
+            raise ConfigError("[final_evaluation] may only contain [final_evaluation.monte_carlo]")
+        if not holdout:
+            raise ConfigError("[final_evaluation] belongs to a holdout plan (OOS segment inside the reservation) only")
+        from src.research.monte_carlo import check_config
+
+        try:
+            final["monte_carlo"] = check_config(fe.get("monte_carlo"))
+        except ValueError as exc:
+            raise ConfigError(f"[final_evaluation.monte_carlo]: {exc}") from exc
     fr = raw.get("frozen") or {}
     strategies = list(fr.get("strategies") or [])
     if not strategies:
@@ -153,7 +198,8 @@ def parse_plan(path: Path, app, store) -> dict[str, Any]:
     return {"id": pid, "datasets": datasets, "train": [f(tr[0]), f(tr[1])], "validation": [f(va[0]), f(va[1])],
             "oos": [f(oo[0]), f(oo[1])], "purge_trade_dates": purge, "embargo_trade_dates": embargo,
             "strategies": strategies, "backtest_config_sha256": fr["backtest_config_sha256"],
-            "sha256": content_sha256(Path(path)), "description": (raw.get("plan") or {}).get("description", "")}
+            "sha256": content_sha256(Path(path)), "description": (raw.get("plan") or {}).get("description", ""),
+            "holdout": holdout, "final_evaluation": final}
 
 
 def register(plan_id: str, app, store, d: Path | None = None) -> dict[str, Any]:

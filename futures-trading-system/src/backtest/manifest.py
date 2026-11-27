@@ -307,7 +307,7 @@ def replay(manifest_path: str | Path, csv_override: str | Path | None = None) ->
         app = load_config(d / "settings.toml")
         bt = load_backtest_config(d / "backtest.toml")
         strat = load_strategy_config(d / "strategy.toml").with_r_multiple(m["strategy"]["target"]["r_multiple"])
-    md = build_market_data(csv, app)
+    md = build_market_data(csv, app, holdout_guard=True)          # Sprint 13 P1.1: never replays reserved bars
     p = m["period"]
     period = Period(p["label"], p["kind"], parse_date(p["start"]), parse_date(p["end"]), p["fold"])
     run = run_strategy(md, app, bt, strat, label=m["label"], period=period, regime=regime_cfg, news=news_setup)

@@ -15,6 +15,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = PROJECT_ROOT / "data" / "samples"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_holdout_ledgers(tmp_path_factory, monkeypatch):
+    """Sprint 13 P1.1 safety net: no test ever reads or writes the project's real holdout claim ledger, its anchor or
+    their locks (they are redirected to an empty temporary directory; tests that need ledgers create them there)."""
+    from src.research import holdout_ledger as HL
+
+    d = tmp_path_factory.mktemp("holdout_isolated")
+    monkeypatch.setattr(HL, "LEDGER_FILE", d / "holdout_ledger.jsonl")
+    monkeypatch.setattr(HL, "HEAD_FILE", d / "holdout_ledger.head.json")
+    monkeypatch.setattr(HL, "ANCHOR_FILE", d / "holdout_anchor.jsonl")
+    monkeypatch.setattr(HL, "ANCHOR_HEAD", d / "holdout_anchor.head.json")
+    monkeypatch.setattr(HL, "LOCK_DIR", d / "locks")
+
+
 @pytest.fixture(scope="session")
 def config() -> AppConfig:
     return load_config()
